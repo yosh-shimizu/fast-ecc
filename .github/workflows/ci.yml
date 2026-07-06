@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenCV
+        run: sudo apt-get update && sudo apt-get install -y libopencv-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Test (equivalence with cv::findTransformECC)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Benchmark
+        run: ./build/bench 512 10

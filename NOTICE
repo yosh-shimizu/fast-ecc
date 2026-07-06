@@ -1,0 +1,27 @@
+fast-ecc
+========
+
+This project is a faster, drop-in variant of cv::findTransformECC.
+
+It is DERIVED FROM and NOT AFFILIATED WITH OR ENDORSED BY OpenCV.
+
+Attribution
+-----------
+
+* Original source:
+  OpenCV, modules/video/src/ecc.cpp
+  https://github.com/opencv/opencv/blob/master/modules/video/src/ecc.cpp
+  Copyright (C) 2000, Intel Corporation. Licensed under the Intel License
+  Agreement (BSD-3-Clause). See LICENSE.
+
+* Algorithm:
+  G. D. Evangelidis and E. Z. Psarakis,
+  "Parametric Image Alignment Using Enhanced Correlation Coefficient
+   Maximization,"
+  IEEE Transactions on Pattern Analysis and Machine Intelligence (PAMI),
+  vol. 30, no. 10, pp. 1858-1865, 2008.
+
+* Modification (this repository):
+  Per-iteration warp-count reduction (3 image-content warps -> 1) by warping
+  only the image and reconstructing the gradients from the warped image via the
+  chain rule. Copyright (c) 2026, ysmz334.
