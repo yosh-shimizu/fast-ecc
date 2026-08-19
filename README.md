@@ -48,12 +48,14 @@ The key identity is the chain rule. For a warp with linear part `A`,
 ∂/∂x [ I(W(x; p)) ] = Aᵀ · (∇I)(W(x; p))
 ```
 
-So the finite-difference gradient of the **already-warped** image is the warped-image
-gradient pre-multiplied by `Aᵀ`. Re-combining it with the warp's linear part
-(`warp_gradients_*_ECC`) recovers the quantity the Jacobian assembly expects, **without
-warping the gradient images separately**. For translation/euclidean the linear part is
-orthonormal so the recombination introduces no directional distortion; for
-affine/homography it uses the warp's global linear part (a close approximation).
+So the finite-difference gradient of the **already-warped** image is the image-domain
+gradient pre-multiplied by `Aᵀ`. Multiplying it by `A⁻ᵀ` (`warp_gradients_*_ECC`) undoes
+that frame change and recovers exactly the quantity the Jacobian assembly expects,
+**without warping the gradient images separately**. For translation/euclidean the linear
+part is orthonormal, so `A⁻ᵀ = A` and the recombination is just a rotation of the gradient
+vectors; for affine it is the exact inverse frame change. For homography it remains an
+approximation: a projective warp's Jacobian varies per pixel and only its linear part is
+used.
 
 ### Not bit-identical to OpenCV — but just as accurate
 
@@ -77,8 +79,8 @@ Numbers are hardware-dependent — reproduce on your machine with `./build/bench
 |---|---:|---:|---:|---:|---:|
 | TRANSLATION |  18.3 |  16.4 | 1.12× | 0.667 | 0.172 |
 | EUCLIDEAN   |  38.6 |  35.1 | 1.10× | 0.710 | 0.169 |
-| AFFINE      |  55.8 |  44.6 | 1.25× | 0.921 | 0.293 |
-| HOMOGRAPHY  | 115.9 | 104.7 | 1.11× | 1.066 | 0.380 |
+| AFFINE      |  55.8 |  44.6 | 1.25× | 0.921 | 0.294 |
+| HOMOGRAPHY  | 115.9 | 104.7 | 1.11× | 1.066 | 0.379 |
 <!-- BENCH:END -->
 
 `errCv` / `errFast` are the corner RMS (in pixels) of the recovered warp against the
@@ -125,8 +127,10 @@ same `MOTION_*` types, same `warpMatrix` conventions).
 - The speed-up is largest where warps dominate the inner loop (i.e. plain ECC). If you
   add heavy per-iteration work on top (robust losses, extra parameters), the relative
   gain shrinks.
-- For affine/homography the gradient recombination is an approximation; if you need
-  bit-exact agreement with OpenCV for those motions, prefer the stock function.
+- For homography the gradient recombination is an approximation (only the linear part of
+  the per-pixel projective Jacobian is used); translation, euclidean and affine use the
+  exact inverse frame change. If you need bit-exact agreement with OpenCV for any motion
+  type, prefer the stock function.
 - Higher-order interpolation (`INTER_CUBIC` / `INTER_LANCZOS4`) in the warp does **not**
   improve registration accuracy in our benchmarks (corner RMS moves by less than the
   Monte-Carlo noise, and the iteration count is unchanged) while costing 1.4–2.6× per

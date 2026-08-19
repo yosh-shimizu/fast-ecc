@@ -45,7 +45,8 @@
 // Derived from OpenCV modules/video/src/ecc.cpp.  The only algorithmic change is
 // in the per-iteration loop: instead of warping the two precomputed gradient
 // images, we warp the image once, take finite-difference gradients of the WARPED
-// image, and recombine them with the warp's linear part (warp_gradients_*_ECC).
+// image, and map them back into the image frame with the inverse-transpose of the
+// warp's linear part (warp_gradients_*_ECC).
 // Not bit-identical to cv::findTransformECC (resampling and differentiation do
 // not commute), but equally accurate against ground truth — see README.md.
 
@@ -201,8 +202,24 @@ static void warp_gradients_affine_ECC(
     const float c = hptr[3];
     const float d = hptr[4];
 
-    addWeighted(gradientX, a, gradientY, b, 0., gradientXWarped);
-    addWeighted(gradientX, c, gradientY, d, 0., gradientYWarped);
+    // The finite-difference gradient of the warped image is g = A^T (grad I)(W(x)),
+    // so the image-domain gradient the Jacobian assembly expects is A^{-T} g.
+    // (For euclidean/translation A^{-T} == A, which is why those cases can use the
+    // linear part directly.)  For homography this is still an approximation: the
+    // true Jacobian of a projective warp varies per pixel; A is its linear part.
+    const float det = a*d - b*c;
+    if (std::fabs(det) > 1e-12f)
+    {
+        const float s = 1.f/det;
+        addWeighted(gradientX,  d*s, gradientY, -c*s, 0., gradientXWarped);
+        addWeighted(gradientX, -b*s, gradientY,  a*s, 0., gradientYWarped);
+    }
+    else
+    {
+        // degenerate linear part: fall back to A rather than blowing up
+        addWeighted(gradientX, a, gradientY, b, 0., gradientXWarped);
+        addWeighted(gradientX, c, gradientY, d, 0., gradientYWarped);
+    }
 }
 
 static void image_jacobian_affine_ECC(const Mat& src1, const Mat& src2,
