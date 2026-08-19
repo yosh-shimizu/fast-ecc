@@ -24,4 +24,4 @@ Attribution
 * Modification (this repository):
   Per-iteration warp-count reduction (3 image-content warps -> 1) by warping
   only the image and reconstructing the gradients from the warped image via the
-  chain rule. Copyright (c) 2026, ysmz334.
+  chain rule. Copyright (c) 2026, yosh-shimizu.

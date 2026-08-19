@@ -40,7 +40,7 @@
 //M*/
 //
 // Modifications (warp-count reduction via chain-rule gradient reconstruction)
-// Copyright (c) 2026, ysmz334. Distributed under the same BSD-3 terms above.
+// Copyright (c) 2026, yosh-shimizu. Distributed under the same BSD-3 terms above.
 //
 // Derived from OpenCV modules/video/src/ecc.cpp.  The only algorithmic change is
 // in the per-iteration loop: instead of warping the two precomputed gradient

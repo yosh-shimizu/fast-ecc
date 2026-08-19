@@ -89,7 +89,7 @@ motion type and how warp-bound your build is.
 ## Quick start
 
 ```bash
-git clone https://github.com/ysmz334/fast-ecc.git
+git clone https://github.com/yosh-shimizu/fast-ecc.git
 cd fast-ecc
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
@@ -127,6 +127,10 @@ same `MOTION_*` types, same `warpMatrix` conventions).
   gain shrinks.
 - For affine/homography the gradient recombination is an approximation; if you need
   bit-exact agreement with OpenCV for those motions, prefer the stock function.
+- Higher-order interpolation (`INTER_CUBIC` / `INTER_LANCZOS4`) in the warp does **not**
+  improve registration accuracy in our benchmarks (corner RMS moves by less than the
+  Monte-Carlo noise, and the iteration count is unchanged) while costing 1.4–2.6× per
+  iteration — so, like OpenCV, this code stays on bilinear.
 - Pairs well with a coarse-to-fine pyramid (align low-res first) to cut warped pixels.
 
 ## Citation
@@ -143,4 +147,4 @@ same `MOTION_*` types, same `warpMatrix` conventions).
 ## License
 
 BSD-3-Clause. Derived from OpenCV `ecc.cpp` (Copyright © 2000 Intel Corporation);
-modifications © 2026 [ysmz334](https://github.com/ysmz334). See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+modifications © 2026 [yosh-shimizu](https://github.com/yosh-shimizu). See [LICENSE](LICENSE) and [NOTICE](NOTICE).
