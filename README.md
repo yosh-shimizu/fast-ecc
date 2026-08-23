@@ -37,46 +37,81 @@ on all three.
 
 ## Status
 
-Early. The warp reduction described below is implemented; the rest of the roadmap is
-measured but not yet committed.
+Early, but the accuracy defect that made the old benchmark meaningless is fixed and
+the numbers below are taken against a corrected OpenCV baseline.
 
 | | state |
 |---|---|
 | Warp reduction (3 warps → 1 per iteration) | landed |
-| Gaussian pre-filter border fix | **known defect, fix pending** — see below |
-| Fused Gauss–Newton stage | measured, not committed |
-| Meaningful accuracy regression test | **known defect, fix pending** |
+| Gaussian pre-filter border fix | landed ([opencv#29775](https://github.com/opencv/opencv/pull/29775) ported) |
+| Accuracy test with a criterion that can fail | landed |
+| Fused Gauss–Newton stage | measured, not yet committed |
 
-### Known defect: the Gaussian pre-filter border
+### What was wrong, and how it is guarded now
 
 `findTransformECC` smooths the template with `GaussianBlur`, whose default
 `BORDER_REFLECT_101` fabricates a ring `gaussFiltSize/2` px wide by mirroring the
-interior. That ring is then used at full weight, which biases the estimated linear part
-toward a smaller scale. **This fork inherits the defect from `ecc.cpp` verbatim**: it
-masks the warped *input* border but never the *template's* fabricated ring.
+interior. Used at full weight, that ring biases the estimated linear part toward a
+smaller scale. This fork inherited the defect from `ecc.cpp` verbatim — it masked the
+warped *input* border but never the template's fabricated ring.
 
-Measured against an OpenCV build that has the fix (window 512, affine): OpenCV 0.027 px
-corner RMS, this fork 0.294 px. Porting the fix brings it to 0.019 px. It is not yet
-committed only because it is queued behind the upstream review.
-
-Until then, **do not use this fork where absolute accuracy matters**; the speed
-comparison is unaffected.
-
-### Known defect: the equivalence test proves little
-
-`test/test_equivalence.cpp` asserts `errFast <= errCv + 0.5px`. The estimator's own
-accuracy floor is around 0.01–0.03 px, so a **10× accuracy regression passes**. The same
-flaw was reported against OpenCV's own ECC tests
-([opencv#29776](https://github.com/opencv/opencv/issues/29776)); this fork has its own
-version of it and needs a criterion with a real threshold.
+It went unnoticed because the bundled test compared this fork only against a stock
+OpenCV that had the same defect, with a 0.5 px tolerance on an error of 0.01–0.03 px.
+Both are now fixed: the ring is dropped, and `test/test_equivalence.cpp` checks an
+absolute threshold, agreement with cv, and — the part that actually catches this
+class of bug — that **widening the pre-filter never makes the answer worse**. With the
+fix reverted the suite reports sixteen failures and names the cause.
 
 ## Results
 
-Populated as commits land. Every row states the operating point.
+Every row states its operating point, because in this code the same change
+measures 1.3x or 1.1x depending on it.
 
-*(none yet — the current benchmark compares against an OpenCV that has the border
-defect, which flatters this fork for the wrong reason. It will be re-measured against a
-fixed baseline once the fix above is committed.)*
+### Accuracy — equal to a fixed OpenCV
+
+Measured against an OpenCV that carries the border fix, on the analytic scene,
+affine, window 200, 200 trials, started **at** the ground truth so that any movement
+is bias:
+
+| | corner RMS | scale bias (t) |
+|---|---:|---:|
+| `cv::findTransformECC` (fixed) | 0.0017 px | +8.7e-07 (1.3) |
+| `fastecc::findTransformECC` | 0.0017 px | +8.7e-07 (1.3) |
+
+Statistically indistinguishable, and neither shows a systematic bias. Before the
+border fix this fork sat at 0.0287 px with a −1.8e−04 (t = −63.9) scale bias at
+`gaussFiltSize=9`.
+
+**Accuracy is equal, not better.** Which of the two resampling orders is closer to
+ground truth remains unsettled — see [Not bit-identical](#not-bit-identical-to-opencv).
+
+### Speed — the warp reduction
+
+Cost of one iteration, affine, analytic scene, best of 3 runs:
+
+| window | 4 threads | 1 thread |
+|---:|---:|---:|
+| 256 | **1.32×** | **1.32×** |
+| 512 | 1.14× | 1.28× |
+| 768 | 1.10× | 1.25× |
+
+On a single thread the gain is flat across the range. With a thread pool it decays,
+because OpenCV parallelises the `warpAffine` this change removes but not the
+`filter2D`/`addWeighted` that replace it. See
+[Why the warp reduction is faster](#why-the-warp-reduction-is-faster).
+
+The bundled `./build/bench` (512×512, default thread count) agrees, and shows the
+per-motion spread:
+
+| motion | cv | fast | speedup |
+|---|---:|---:|---:|
+| TRANSLATION | 22.5 ms | 14.7 ms | 1.53× |
+| EUCLIDEAN | 33.9 ms | 31.9 ms | 1.06× |
+| AFFINE | 44.4 ms | 39.9 ms | 1.11× |
+| HOMOGRAPHY | 114.9 ms | 93.3 ms | 1.23× |
+
+Measured on an Intel Core i7-8700K (6C/12T), Windows 11, MSVC, Release, against
+OpenCV 4.15.0-dev built with the border fix applied.
 
 ## Why the warp reduction is faster
 
@@ -145,7 +180,7 @@ git clone https://github.com/yosh-shimizu/fast-ecc.git
 cd fast-ecc
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure   # see the caveat above
+ctest --test-dir build --output-on-failure   # accuracy vs ground truth
 ./build/bench                                 # timing table
 ./build/align_pair template.png input.png aligned.png affine
 ```
