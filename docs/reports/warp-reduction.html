@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECC 高速化 — 反復あたりの幾何ワープ削減</title>
+<style>
+  :root{
+    --bg:#0f1420; --card:#171e2e; --ink:#e7ecf3; --muted:#9aa7bd; --line:#27314a;
+    --accent:#5aa9ff; --good:#37d39b; --warn:#ffb454; --bad:#ff6b6b; --chip:#1f2940;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;
+       line-height:1.7;font-size:15px}
+  .wrap{max-width:980px;margin:0 auto;padding:32px 22px 80px}
+  h1{font-size:28px;line-height:1.25;margin:0 0 6px}
+  h2{font-size:22px;margin:42px 0 12px;padding-bottom:8px;border-bottom:2px solid var(--line)}
+  h3{font-size:17px;margin:26px 0 8px;color:#cdd8ea}
+  p{margin:10px 0}
+  .sub{color:var(--muted);margin:0 0 24px}
+  a{color:var(--accent)}
+  code{background:#0b0f18;border:1px solid var(--line);border-radius:5px;padding:1px 6px;
+       font-family:"SF Mono",Consolas,Menlo,monospace;font-size:13px;color:#d8e2f2}
+  pre{background:#0b0f18;border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin:14px 0;
+      overflow-x:auto;font-family:"SF Mono",Consolas,Menlo,monospace;font-size:12.8px;line-height:1.55;color:#d8e2f2}
+  pre .c{color:#5f6b82}  pre .k{color:#ff9aa2}  pre .g{color:#37d39b}
+  .eq{background:#0b0f18;border:1px solid var(--line);border-left:3px solid var(--accent);
+      border-radius:8px;padding:12px 16px;margin:14px 0;font-family:"SF Mono",Consolas,monospace;
+      font-size:14px;overflow-x:auto;color:#e2ebf8}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:18px 0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .card h4{margin:0 0 6px;font-size:14px;color:var(--accent);letter-spacing:.02em}
+  .card .big{font-size:26px;font-weight:700;margin:2px 0}
+  .card p{margin:4px 0 0;color:var(--muted);font-size:13px}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13.5px;
+        background:var(--card);border-radius:10px;overflow:hidden}
+  th,td{padding:9px 11px;text-align:right;border-bottom:1px solid var(--line)}
+  th:first-child,td:first-child{text-align:left}
+  thead th{background:#1d2740;color:#cfdcf2;font-weight:600;border-bottom:2px solid var(--line)}
+  tbody tr:hover{background:#1b2438}
+  td.best{color:var(--good);font-weight:700}
+  td.bad{color:var(--bad)}
+  .note{background:#1a2030;border:1px solid var(--line);border-left:3px solid var(--warn);
+        border-radius:8px;padding:10px 14px;margin:14px 0;color:#e8d7b6;font-size:13.5px}
+  .chart{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:16px 0}
+  .chart h4{margin:0 0 4px;font-size:14px}
+  .chart .cap{color:var(--muted);font-size:12.5px;margin:0 0 10px}
+  footer{margin-top:50px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line);padding-top:16px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>ECC 高速化テクニックの解説</h1>
+<p class="sub">「反復あたりの幾何ワープを 3 → 1 に削減する」最適化の仕組みと数学的根拠<br>
+対象: OpenCV <code>cv::findTransformECC</code>（Forward-Additive ECC）／ 参考実装 <code>ref/ecc.cpp</code></p>
+
+<!-- ============ SUMMARY ============ -->
+<h2>1. 要約</h2>
+<div class="cards">
+  <div class="card"><h4>核心</h4><div class="big" style="color:var(--good)">3 → 1</div>
+    <p>反復あたりの幾何ワープ（warpAffine / warpPerspective）回数を削減。勾配を「ワープ後画像の filter2D」で得る。</p></div>
+  <div class="card"><h4>なぜ速い</h4><div class="big">warp ≫ conv</div>
+    <p>双線形ワープは座標変換+4タップ補間/画素。homography は毎画素除算も。これを安い conv+addWeighted に置換。</p></div>
+  <div class="card"><h4>正しさ</h4><div class="big" style="color:var(--accent)">A·Aᵀ</div>
+    <p>連鎖律の係数を addWeighted で戻す。translation/euclidean は厳密、affine/homography は正定値前処理（収束保存）。</p></div>
+</div>
+<p>ECC は <code>ρ(p)=⟨î<sub>r</sub>, i<sub>w</sub>(p)⟩ / ‖i<sub>w</sub>(p)‖</code> を反復最大化する。各反復で必要なのは
+<b>(a) ワープ後画像 i<sub>w</sub></b> と <b>(b) パラメータヤコビアン用の勾配 ∇I(W(x))</b> の2つ。
+高速化の鍵は (b) の入手方法を変えることにある。</p>
+
+<!-- ============ WHAT CHANGED ============ -->
+<h2>2. 何を変えたか</h2>
+
+<h3>2.1 オリジナル（OpenCV）— 毎反復で勾配を「幾何ワープ」</h3>
+<p>ループ前に入力画像の勾配 <code>∇I</code> を一度だけ計算し、毎反復で<b>画像・勾配x・勾配y・マスクの計4枚（うち画像系3枚）を幾何ワープ</b>する。</p>
+<pre><span class="c">// ループ前: 入力全体で勾配を1回計算（filter2D）</span>
+filter2D(imageFloat, gradientX, -1, dx);
+filter2D(imageFloat, gradientY, -1, dx.t());
+
+<span class="c">// 毎反復: 3枚を幾何ワープ（高コスト）</span>
+<span class="k">warpAffine</span>(imageFloat, imageWarped,     map, ...);  <span class="c">// 画像</span>
+<span class="k">warpAffine</span>(gradientX,  gradientXWarped, map, ...);  <span class="c">// 勾配x  ← 重い</span>
+<span class="k">warpAffine</span>(gradientY,  gradientYWarped, map, ...);  <span class="c">// 勾配y  ← 重い</span>
+warpAffine(preMask,    imageMask,       map, ...);  <span class="c">// マスク</span></pre>
+
+<h3>2.2 参考実装 — 画像だけワープし、勾配は「ワープ後に作る」</h3>
+<p>幾何ワープは<b>画像1枚＋マスクのみ</b>。勾配はワープ後画像を <code>filter2D</code> で微分し、warp の線形係数で <code>addWeighted</code> 再合成する。</p>
+<pre><span class="c">// 毎反復: 幾何ワープは画像1枚だけ</span>
+<span class="k">warpAffine</span>(imageFloat, imageWarped, map, ...);          <span class="c">// 画像（1枚だけ！）</span>
+warpAffine(preMask,    imageMask,   map, ...);            <span class="c">// マスク</span>
+
+<span class="c">// ワープ後画像から勾配を作る（安い）</span>
+<span class="g">filter2D</span>(imageWarped, imageWarpedGradientX, -1, dx);     <span class="c">// 1×3 分離conv</span>
+<span class="g">filter2D</span>(imageWarped, imageWarpedGradientY, -1, dx.t());
+
+<span class="c">// 連鎖律の係数を画素ごとに戻す（安い）</span>
+<span class="g">warp_gradients_affine_ECC</span>(imageWarpedGradientX, imageWarpedGradientY,
+                          map, gradientXWarped, gradientYWarped);
+<span class="c">//  └ 中身: addWeighted(gx, a, gy, b, 0, outX);  // a*gx + b*gy</span>
+<span class="c">//          addWeighted(gx, c, gy, d, 0, outY);  // c*gx + d*gy</span></pre>
+<p class="note">ループ前の勾配プリ計算（<code>gradientX/gradientY</code>）は不要になり撤去。参考実装で残る同名の宣言は使われない残骸。</p>
+
+<!-- ============ WHY FASTER ============ -->
+<h2>3. なぜ速いか（コスト比較）</h2>
+<table>
+<thead><tr><th>反復あたりの主処理</th><th>オリジナル</th><th>参考実装</th></tr></thead>
+<tbody>
+<tr><td>幾何ワープ（画像系, 双線形）</td><td class="bad">3 回</td><td class="best">1 回</td></tr>
+<tr><td>filter2D（1×3 分離）</td><td>0 回</td><td>2 回</td></tr>
+<tr><td>addWeighted（画素線形結合）</td><td>0 回</td><td>2 回</td></tr>
+<tr><td>マスクのワープ（最近傍）</td><td>1 回</td><td>1 回</td></tr>
+</tbody></table>
+<p>双線形 <code>warpAffine</code> は「逆変換の座標計算＋4タップ補間＋境界判定」を画素ごとに行う。
+<code>warpPerspective</code> はさらに<b>毎画素の射影除算</b>を伴う。一方 <code>filter2D</code>(1×3) と <code>addWeighted</code>
+は画素あたり数回の積和のみ。重いワープ2回を軽い演算に置換するため、<b>特に homography で効果が大きい</b>。</p>
+
+<div class="chart">
+  <h4>反復あたりの「画像系・幾何ワープ」回数（少ないほど速い）</h4>
+  <p class="cap">削減されるのは最もコストの高い処理。homography では除算付き warpPerspective が 2 回消える。</p>
+  <svg viewBox="0 0 620 200" width="100%" height="200" font-family="sans-serif" font-size="12">
+    <line x1="60" y1="160" x2="605" y2="160" stroke="#27314a"/>
+    <text x="50" y="40" fill="#9aa7bd" text-anchor="end">回</text>
+    <rect x="110" y="40"  width="90" height="120" fill="#ff6b6b"/><text x="155" y="34" fill="#ff6b6b" text-anchor="middle">3</text>
+    <rect x="410" y="120" width="90" height="40"  fill="#37d39b"/><text x="455" y="114" fill="#37d39b" text-anchor="middle">1</text>
+    <text x="155" y="180" fill="#cdd8ea" text-anchor="middle">オリジナル</text>
+    <text x="455" y="180" fill="#cdd8ea" text-anchor="middle">参考実装</text>
+  </svg>
+</div>
+
+<!-- ============ MATH ============ -->
+<h2>4. 数学的根拠 — なぜ成立するか</h2>
+<p>ワープ後画像は <code>i<sub>w</sub>(x) = I(A·x + t)</code>（A は map の 2×2 線形部、<code>WARP_INVERSE_MAP</code>）。
+これを <code>filter2D</code> で空間微分すると、<b>連鎖律</b>で勾配にヤコビアン因子が掛かる:</p>
+<div class="eq">∂<sub>x</sub>[ I(A·x + t) ] = Aᵀ · ∇I(W(x))      （filter2D が返す生の勾配 g̃ = Aᵀ ∇I）</div>
+<p>ECC のヤコビアン式が必要とするのは生の <code>∇I(W(x))</code>。そこで <code>warp_gradients_*_ECC</code> が
+<b>A を掛けて戻す</b>（addWeighted）。結果は <code>A·g̃ = A·Aᵀ·∇I</code> となる。</p>
+
+<table>
+<thead><tr><th>モーション</th><th>線形部 A</th><th>A·Aᵀ</th><th>結果</th></tr></thead>
+<tbody>
+<tr><td>translation</td><td>I（単位）</td><td>I</td><td class="best">厳密一致</td></tr>
+<tr><td>euclidean</td><td>R（回転=直交）</td><td>I</td><td class="best">厳密一致</td></tr>
+<tr><td>affine</td><td>一般 2×2</td><td>≠ I（対称正定値）</td><td>近似（前処理子）</td></tr>
+<tr><td>homography</td><td>一般（射影）</td><td>≠ I（対称正定値）</td><td>近似（前処理子）</td></tr>
+</tbody></table>
+
+<div class="cards">
+  <div class="card"><h4>translation / euclidean</h4><div class="big" style="color:var(--good)">厳密</div>
+    <p>A が単位/直交なので A·Aᵀ=I。オリジナルと完全に同一のヤコビアンを、ワープ2回分の節約で得る。</p></div>
+  <div class="card"><h4>affine / homography</h4><div class="big">近似</div>
+    <p>A·Aᵀ 因子が残るが、これは<b>対称正定値</b>＝プリコンディショナとして作用。上昇方向は保たれ、
+    ステップ→0 の不動点も実質不変。「正しさを損なわず」ワープを削減できる。</p></div>
+</div>
+
+<!-- ============ COMPANION & CAVEATS ============ -->
+<h2>5. 付随する工夫と注意点</h2>
+<h3>5.1 境界処理は速度化トリックの「対」</h3>
+<p>ワープ後画像を <code>filter2D</code> すると、有効領域とゼロ埋め境界の境目で勾配が汚染される
+（オリジナルは「計算済み勾配をワープ」していたので無問題だった）。そのため参考実装は
+<b>マスクの 2 画素縁をゼロ化</b>し、汚染勾配を破棄している。これは高速化に伴い必要になった<b>正しさの補正</b>。</p>
+<pre>preMask.row(0..1).setTo(0);  preMask.row(末尾0..1).setTo(0);   <span class="c">// 2px縁を無効化</span>
+imageWarpedGradientX.setTo(0, 1 - imageMask);                  <span class="c">// 縁の勾配を捨てる</span></pre>
+
+<h3>5.2 そのほかの差分</h3>
+<table>
+<thead><tr><th>箇所</th><th>内容</th><th>性質</th></tr></thead>
+<tbody>
+<tr><td>GaussianBlur</td><td>sigma を明示指定（<code>1.5</code>）。オリジナルはサイズから自動</td><td>精度・収束に影響（速度ではない）</td></tr>
+<tr><td>ループ内 <code>std::cout &lt;&lt; map</code></td><td>収束軌跡のデバッグ出力</td><td class="bad">本番では削除（I/O が支配的に）</td></tr>
+</tbody></table>
+
+<!-- ============ CONCLUSION ============ -->
+<h2>6. 結論</h2>
+<p>高速化の正体は、<b>毎反復の勾配を「∇I を幾何ワープして得る」代わりに、「ワープ後画像を filter2D し連鎖律係数を addWeighted で戻して得る」</b>こと。
+これにより反復あたりの画像系・幾何ワープを <b>3 → 1</b> に削減する。</p>
+<ul>
+  <li>translation / euclidean では<b>厳密に等価</b>、affine / homography では<b>正定値前処理として作用する近似</b>で収束は保たれる。</li>
+  <li>効果は <code>warpPerspective</code> に毎画素除算がある <b>homography で最大</b>。</li>
+  <li>ワープ後微分に伴う<b>境界汚染の除去（2px 縁マスク）</b>が必須の対であり、デバッグ出力は本番で除く。</li>
+</ul>
+
+<footer>
+ECC 高速化テクニック解説 ／ 参考実装: <code>ref/ecc.cpp</code>・基準: OpenCV <code>cv::findTransformECC</code><br>
+関連: <code>ECC_improvement_report.html</code>（数学的改良: ADMM / Moreau / IRLS / σ<sub>rel</sub> / FA vs IC 精度差）
+</footer>
+
+</div>
+</body>
+</html>
