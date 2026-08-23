@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECC のガウス・ニュートン段を融合する</title>
+<style>
+  :root{
+    --bg:#0f1420; --card:#171e2e; --ink:#e7ecf3; --muted:#9aa7bd; --line:#27314a;
+    --accent:#5aa9ff; --good:#37d39b; --warn:#ffb454; --bad:#ff6b6b;
+    --mathbg:#0b1018;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;
+       line-height:1.8;font-size:15px}
+  .wrap{max-width:1000px;margin:0 auto;padding:32px 22px 80px}
+  h1{font-size:28px;line-height:1.25;margin:0 0 6px}
+  h2{font-size:22px;margin:46px 0 12px;padding-bottom:8px;border-bottom:2px solid var(--line)}
+  h3{font-size:17px;margin:28px 0 8px;color:#cdd8ea}
+  h4{font-size:15px;margin:20px 0 6px;color:#b8c6dc}
+  p{margin:11px 0}
+  ul,ol{margin:11px 0;padding-left:22px}
+  li{margin:6px 0}
+  .sub{color:var(--muted);margin:0 0 24px}
+  a{color:var(--accent)}
+  code{background:#0b0f18;border:1px solid var(--line);border-radius:5px;padding:1px 6px;
+       font-family:"SF Mono",Consolas,Menlo,monospace;font-size:12.8px;color:#d8e2f2}
+
+  /* ---- math ------------------------------------------------------------ */
+  /* Inline symbols.  Serif italic so they read as mathematics and never get
+     confused with the monospace <code> spans, which are identifiers.        */
+  .m{font-family:"Cambria Math","STIX Two Math","Latin Modern Math",Georgia,
+                 "Times New Roman",serif;
+     font-style:italic;font-size:1.08em;color:#eaf1fa;letter-spacing:.01em}
+  .m.up{font-style:normal}
+  math{font-family:"Cambria Math","STIX Two Math","Latin Modern Math",Georgia,
+                   "Times New Roman",serif;
+       font-size:1.18em;color:#eaf1fa}
+  math[display="block"]{margin:2px 0}
+  .eq{background:var(--mathbg);border:1px solid var(--line);border-left:3px solid var(--accent);
+      border-radius:8px;padding:16px 22px;margin:18px 0;overflow-x:auto}
+  .eq .cm{display:block;margin-top:10px;padding-top:9px;border-top:1px dashed #232d44;
+          color:#8994ab;font-size:12.5px;line-height:1.65;
+          font-family:-apple-system,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;
+          font-style:normal}
+  .eq.tight{padding:12px 22px}
+
+  pre{background:#0b0f18;border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin:14px 0;
+      overflow-x:auto;font-family:"SF Mono",Consolas,Menlo,monospace;font-size:12.6px;line-height:1.6;color:#d8e2f2}
+  pre .c{color:#5f6b82}  pre .k{color:#ff9aa2}  pre .g{color:#37d39b}  pre .n{color:#ffb454}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:14px;margin:18px 0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .card h4{margin:0 0 6px;font-size:13.5px;color:var(--accent);letter-spacing:.02em}
+  .card .big{font-size:26px;font-weight:700;margin:2px 0;line-height:1.2}
+  .card p{margin:4px 0 0;color:var(--muted);font-size:13px;line-height:1.6}
+  .tw{overflow-x:auto;margin:14px 0}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;
+        background:var(--card);border-radius:10px;overflow:hidden}
+  th,td{padding:9px 11px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+  th:first-child,td:first-child{text-align:left}
+  thead th{background:#1d2740;color:#cfdcf2;font-weight:600;border-bottom:2px solid var(--line)}
+  tbody tr:hover{background:#1b2438}
+  td.best{color:var(--good);font-weight:700}
+  td.bad{color:var(--bad)}
+  td.dim{color:var(--muted)}
+  td.grp{color:var(--muted);font-weight:600}
+  table.nota td{white-space:normal}
+  table.nota td:first-child{width:130px;text-align:center;font-size:16px}
+  .note{background:#1a2030;border:1px solid var(--line);border-left:3px solid var(--warn);
+        border-radius:8px;padding:12px 16px;margin:15px 0;color:#e8d7b6;font-size:13.5px;line-height:1.75}
+  .good-note{background:#16241f;border:1px solid #24503f;border-left:3px solid var(--good);
+        border-radius:8px;padding:12px 16px;margin:15px 0;color:#bde8d6;font-size:13.5px;line-height:1.75}
+  .chart{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:18px 0}
+  .chart h4{margin:0 0 4px;font-size:14px;color:#cdd8ea}
+  .chart .cap{color:var(--muted);font-size:12.5px;margin:0 0 10px;line-height:1.65}
+  .chart svg{display:block;width:100%;height:auto}
+  .lgd{display:flex;flex-wrap:wrap;gap:14px;margin-top:8px;font-size:12.5px;color:var(--muted)}
+  .lgd i{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+  footer{margin-top:52px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line);padding-top:16px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>ECC のガウス・ニュートン段を融合する</h1>
+<p class="sub">ヤコビアンを実体化せず、ヘッセ行列と 3 本の射影を 1 パスで作る<br>
+対象: OpenCV <code>cv::findTransformECC</code> の <code>image_jacobian_*_ECC</code> と
+<code>project_onto_jacobian_ECC</code>（translation / euclidean / affine / homography）／
+実装 <code>eval/uni_ecc.cpp</code> の <code>fastGN</code> フラグ、計測 <code>eval/gnbench.cpp</code></p>
+
+<div class="cards">
+  <div class="card"><h4>メモリ往復</h4><div class="big" style="color:var(--good)">85 → 6</div>
+    <p>1 反復あたりの画像面パス数。ヤコビアンを作らないので、ほとんどが消える。</p></div>
+  <div class="card"><h4>累積の数</h4><div class="big">21 → 18</div>
+    <p>affine のヘッセ行列は一般の対称行列ではない。独立成分は 18 個しかない。
+    他の 3 種別は過不足なく一致する。</p></div>
+  <div class="card"><h4>この段だけで</h4><div class="big" style="color:var(--good)">最大 6.3×</div>
+    <p>窓 1024・12 スレッド。窓 768 で 4.8×、256 で 3.0×。</p></div>
+  <div class="card"><h4>ECC 全体で</h4><div class="big" style="color:var(--good)">最大 2.9×</div>
+    <p>homography・窓 512・4 スレッド、warp 削減と併用。4 スレッドでは窓・運動種別に
+    よらず 1.40〜2.89×。精度・収束半径は数値的に不変。</p></div>
+</div>
+
+<div class="note">
+これは<b>検証中</b>の最適化である。数値的な等価性（精度・バイアス・収束数の一致）は
+<b>4 種別すべてで</b>確認済みだが、上流への提出はしていない。
+</div>
+
+<h2>1. ECC の 1 反復が計算しているもの</h2>
+
+<h3>1.1 記号</h3>
+
+<div class="tw"><table class="nota">
+<thead><tr><th style="text-align:center">記号</th><th style="text-align:left">意味</th></tr></thead>
+<tbody>
+<tr><td><math><mi>N</mi></math></td><td style="text-align:left">テンプレート窓の画素数。窓 768 px なら <span class="m">N</span> = 589,824</td></tr>
+<tr><td><math><mi>P</mi></math></td><td style="text-align:left">パラメータ数。translation 2 / euclidean 3 / <b>affine 6</b> / homography 8</td></tr>
+<tr><td><math><mover accent="true"><mi>t</mi><mo>‾</mo></mover></math></td>
+    <td style="text-align:left">ゼロ平均化したテンプレート。長さ <span class="m">N</span> のベクトル</td></tr>
+<tr><td><math><mrow><mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo stretchy="false">(</mo><mi>p</mi><mo stretchy="false">)</mo></mrow></math></td>
+    <td style="text-align:left">パラメータ <span class="m">p</span> で warp した入力画像。ゼロ平均化済み</td></tr>
+<tr><td><math><mi>G</mi></math></td>
+    <td style="text-align:left">ヤコビアン <math><mrow><mo>∂</mo><mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo>/</mo><mo>∂</mo><mi>p</mi></mrow></math>。<span class="m">N</span> × <span class="m">P</span> 行列。コード上の <code>jacobian</code></td></tr>
+<tr><td><math><msub><mi>g</mi><mi>n</mi></msub></math></td>
+    <td style="text-align:left">画素 <span class="m">n</span> における warp 後画像の勾配 <math><mrow><mo>(</mo><msub><mi>g</mi><mi>x</mi></msub><mo>,</mo><msub><mi>g</mi><mi>y</mi></msub><mo>)</mo></mrow></math>。コード上の <code>gradientXWarped</code>, <code>gradientYWarped</code></td></tr>
+<tr><td><math><msub><mi>c</mi><mi>n</mi></msub></math></td>
+    <td style="text-align:left">画素 <span class="m">n</span> の窓座標を並べた <math><mrow><mo>(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo>,</mo><mn>1</mn><mo>)</mo></mrow></math>。コード上の <code>Xgrid</code>, <code>Ygrid</code></td></tr>
+</tbody></table></div>
+
+<h3>1.2 反復が解く式</h3>
+
+<p>ECC（Evangelidis &amp; Psarakis, PAMI 2008）は正規化相関を最大化する。</p>
+
+<div class="eq">
+<math display="block">
+  <mrow>
+    <mi>ρ</mi><mo stretchy="false">(</mo><mi>p</mi><mo stretchy="false">)</mo>
+    <mo>=</mo>
+    <mfrac>
+      <mrow>
+        <mo>⟨</mo>
+        <mover accent="true"><mi>t</mi><mo>‾</mo></mover>
+        <mo>,</mo>
+        <mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo stretchy="false">(</mo><mi>p</mi><mo stretchy="false">)</mo>
+        <mo>⟩</mo>
+      </mrow>
+      <mrow>
+        <mo>‖</mo><mover accent="true"><mi>t</mi><mo>‾</mo></mover><mo>‖</mo>
+        <mspace width="0.25em"/>
+        <mo>‖</mo><mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo stretchy="false">(</mo><mi>p</mi><mo stretchy="false">)</mo><mo>‖</mo>
+      </mrow>
+    </mfrac>
+  </mrow>
+</math>
+</div>
+
+<p>前進加算型のガウス・ニュートン反復で、各ステップはまず次の 3 つを作る。</p>
+
+<div class="eq">
+<math display="block">
+  <mtable columnalign="right center left" rowspacing="0.5em" columnspacing="0.3em">
+    <mtr>
+      <mtd><mi>H</mi></mtd><mtd><mo>=</mo></mtd>
+      <mtd><mrow><msup><mi>G</mi><mtext>T</mtext></msup><mi>G</mi></mrow></mtd>
+    </mtr>
+    <mtr>
+      <mtd><msub><mi>v</mi><mtext>i</mtext></msub></mtd><mtd><mo>=</mo></mtd>
+      <mtd><mrow><msup><mi>G</mi><mtext>T</mtext></msup><mover accent="true"><mi>i</mi><mo>‾</mo></mover></mrow></mtd>
+    </mtr>
+    <mtr>
+      <mtd><msub><mi>v</mi><mtext>t</mtext></msub></mtd><mtd><mo>=</mo></mtd>
+      <mtd><mrow><msup><mi>G</mi><mtext>T</mtext></msup><mover accent="true"><mi>t</mi><mo>‾</mo></mover></mrow></mtd>
+    </mtr>
+  </mtable>
+</math>
+<span class="cm"><span class="m">H</span> は <span class="m">P</span>×<span class="m">P</span> のヘッセ行列（グラム行列）。
+<span class="m">v</span><sub class="m">i</sub>, <span class="m">v</span><sub class="m">t</sub> は長さ <span class="m">P</span> のベクトル。</span>
+</div>
+
+<p>照明変化を吸収するスケール <span class="m">λ</span> を求め、</p>
+
+<div class="eq">
+<math display="block">
+  <mrow>
+    <mi>λ</mi><mo>=</mo>
+    <mfrac>
+      <mrow>
+        <msup><mrow><mo>‖</mo><mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo>‖</mo></mrow><mn>2</mn></msup>
+        <mo>−</mo>
+        <msubsup><mi>v</mi><mtext>i</mtext><mtext>T</mtext></msubsup>
+        <msup><mi>H</mi><mrow><mo>−</mo><mn>1</mn></mrow></msup>
+        <msub><mi>v</mi><mtext>i</mtext></msub>
+      </mrow>
+      <mrow>
+        <mo>⟨</mo><mover accent="true"><mi>t</mi><mo>‾</mo></mover><mo>,</mo>
+        <mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo>⟩</mo>
+        <mo>−</mo>
+        <msubsup><mi>v</mi><mtext>t</mtext><mtext>T</mtext></msubsup>
+        <msup><mi>H</mi><mrow><mo>−</mo><mn>1</mn></mrow></msup>
+        <msub><mi>v</mi><mtext>i</mtext></msub>
+      </mrow>
+    </mfrac>
+  </mrow>
+</math>
+</div>
+
+<p>パラメータ更新を得る。</p>
+
+<div class="eq">
+<math display="block">
+  <mrow>
+    <mi>Δ</mi><mi>p</mi><mo>=</mo>
+    <msup><mi>H</mi><mrow><mo>−</mo><mn>1</mn></mrow></msup>
+    <msup><mi>G</mi><mtext>T</mtext></msup>
+    <mrow><mo>(</mo>
+      <mi>λ</mi><mover accent="true"><mi>t</mi><mo>‾</mo></mover>
+      <mo>−</mo>
+      <mover accent="true"><mi>i</mi><mo>‾</mo></mover>
+    <mo>)</mo></mrow>
+  </mrow>
+</math>
+</div>
+
+<div class="note">
+ここで <b><math><msup><mi>G</mi><mtext>T</mtext></msup></math> を掛ける操作が 4 回</b>ある —
+<span class="m">H</span> で 1 回（自分自身と）、<span class="m">v</span><sub class="m">i</sub> と
+<span class="m">v</span><sub class="m">t</sub> で 1 回ずつ、そして <span class="m">Δp</span> で 1 回。
+OpenCV はこれを <code>project_onto_jacobian_ECC()</code> の 4 回の呼び出しで実装している。
+<b>本稿はこの 4 回を 0 回にする。</b>
+</div>
+
+<h2>2. 現状の実装とそのコスト</h2>
+
+<h3>2.1 ヤコビアンのレイアウト</h3>
+
+<p>OpenCV はヤコビアンを <b><code>hs × (ws*P)</code> の 1 枚の <code>Mat</code></b> として持つ。
+<span class="m">P</span> 個の「ブロック」が横に並んだ形である。</p>
+
+<pre><span class="c">// modules/video/src/ecc.cpp</span>
+<span class="k">static void</span> image_jacobian_affine_ECC(<span class="k">const</span> Mat&amp; src1, <span class="k">const</span> Mat&amp; src2,
+                                      <span class="k">const</span> Mat&amp; src3, <span class="k">const</span> Mat&amp; src4, Mat&amp; dst)
+{
+    <span class="k">const int</span> w = src1.cols;
+    dst.colRange(<span class="n">0</span>, w)     = src1.mul(src3);  <span class="c">// gx * x</span>
+    dst.colRange(w, <span class="n">2</span>*w)   = src2.mul(src3);  <span class="c">// gy * x</span>
+    dst.colRange(<span class="n">2</span>*w, <span class="n">3</span>*w) = src1.mul(src4);  <span class="c">// gx * y</span>
+    dst.colRange(<span class="n">3</span>*w, <span class="n">4</span>*w) = src2.mul(src4);  <span class="c">// gy * y</span>
+    src1.copyTo(dst.colRange(<span class="n">4</span>*w, <span class="n">5</span>*w));        <span class="c">// gx</span>
+    src2.copyTo(dst.colRange(<span class="n">5</span>*w, <span class="n">6</span>*w));        <span class="c">// gy</span>
+}</pre>
+
+<p>この横並びレイアウトのせいで、<b>各ブロックは連続メモリではなく、行ストライドが
+<code>ws*P</code> の飛び飛びのビュー</b>になる。</p>
+
+<h3>2.2 ヘッセ行列はブロックを <span class="m">P</span><sup class="m">2</sup> 回読み直す</h3>
+
+<pre><span class="k">static void</span> project_onto_jacobian_ECC(<span class="k">const</span> Mat&amp; src1, <span class="k">const</span> Mat&amp; src2, Mat&amp; dst)
+{
+    ...
+    <span class="k">else</span> {  <span class="c">// dst が正方 = ヘッセ行列</span>
+        w = src2.cols / dst.cols;
+        Mat mat;
+        <span class="k">for</span> (<span class="k">int</span> i = <span class="n">0</span>; i &lt; dst.rows; i++) {
+            mat = Mat(src1.colRange(i*w, (i+<span class="n">1</span>)*w));         <span class="c">// ブロック i</span>
+            dstPtr[i*(dst.rows+<span class="n">1</span>)] = pow(norm(mat), <span class="n">2</span>);    <span class="c">// 対角: 1 面読む</span>
+
+            <span class="k">for</span> (<span class="k">int</span> j = i+<span class="n">1</span>; j &lt; dst.cols; j++) {
+                dstPtr[i*dst.cols+j] =
+                    mat.dot(src2.colRange(j*w, (j+<span class="n">1</span>)*w));    <span class="c">// 2 面読む（i と j）</span>
+                dstPtr[j*dst.cols+i] = dstPtr[i*dst.cols+j];
+            }
+        }
+    }
+}</pre>
+
+<p><code>mat</code> は <code>i</code> のループを通して保持されているが、<b><code>Mat::dot</code> は毎回
+メモリから読み直す</b>。窓が L3 に収まらなければ、そのたびに DRAM まで行く。
+対角 6 面 ＋ 非対角 15 ペア × 2 面 = <b>36 面</b>。</p>
+
+<p>ベクトル射影も同じ形で、<code>src2</code>（画像）と各ブロックを <span class="m">P</span> 回ずつ読むので
+1 本あたり <b>12 面</b>。それが 3 本ある。</p>
+
+<h3>2.3 1 反復あたりの面パス数を数える</h3>
+
+<div class="tw"><table>
+<thead><tr><th style="text-align:left">段</th><th>読み</th><th>書き</th><th>計</th></tr></thead>
+<tbody>
+<tr><td>ヤコビアン構築（<code>gx</code>, <code>gy</code>, <code>x</code>, <code>y</code> → 6 ブロック）</td><td>4</td><td>6</td><td>10</td></tr>
+<tr><td><code>project(J, J)</code> — ヘッセ行列</td><td class="bad">36</td><td class="dim">—</td><td class="bad">36</td></tr>
+<tr><td><code>project(J, ī)</code> — 画像の射影</td><td>12</td><td class="dim">—</td><td>12</td></tr>
+<tr><td><code>project(J, t̄)</code> — テンプレートの射影</td><td>12</td><td class="dim">—</td><td>12</td></tr>
+<tr><td><code>error = λ·t̄ − ī</code> の生成</td><td>2</td><td>1</td><td>3</td></tr>
+<tr><td><code>project(J, error)</code> — 更新の射影</td><td>12</td><td class="dim">—</td><td>12</td></tr>
+<tr><td><b>合計</b></td><td></td><td></td><td class="bad"><b>85 面</b></td></tr>
+</tbody></table></div>
+
+<p>窓 768 px なら 1 面 = 590K × 4 B = 2.25 MB なので、<b>1 反復あたり 191 MB</b> のメモリ往復になる。
+しかも <code>Mat::dot</code> には <code>parallel_for_</code> が無いので、この 85 面すべてが単スレッドで流れる。</p>
+
+<div class="note">
+実測すると、<b>窓 768・12 スレッドでは 1 反復 16.0 ms のうち 8.8 ms（55%）がこの段</b>だった
+（この 8.8 ms は 85 面のうち 70 面ぶん — 4 本目の射影と <code>error</code> 生成は
+§6.1 の計測に含めていないので、実際の比率はもう少し高い）。
+warp 削減（fast-ecc）が対象にしていた 2 回の warp は、同じ条件で 1.12 ms（7%）にすぎない。
+</div>
+
+<h2>3. 最適化 1: 4 番目の射影は数式から消える</h2>
+
+<p>更新の射影を展開するだけでよい。</p>
+
+<div class="eq">
+<math display="block">
+  <mtable columnalign="right center left" rowspacing="0.45em" columnspacing="0.3em">
+    <mtr>
+      <mtd>
+        <mrow>
+          <msup><mi>G</mi><mtext>T</mtext></msup>
+          <mrow><mo>(</mo>
+            <mi>λ</mi><mover accent="true"><mi>t</mi><mo>‾</mo></mover>
+            <mo>−</mo><mover accent="true"><mi>i</mi><mo>‾</mo></mover>
+          <mo>)</mo></mrow>
+        </mrow>
+      </mtd>
+      <mtd><mo>=</mo></mtd>
+      <mtd>
+        <mrow>
+          <mi>λ</mi>
+          <mrow><mo>(</mo><msup><mi>G</mi><mtext>T</mtext></msup>
+            <mover accent="true"><mi>t</mi><mo>‾</mo></mover><mo>)</mo></mrow>
+          <mo>−</mo>
+          <mrow><mo>(</mo><msup><mi>G</mi><mtext>T</mtext></msup>
+            <mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo>)</mo></mrow>
+        </mrow>
+      </mtd>
+    </mtr>
+    <mtr>
+      <mtd></mtd><mtd><mo>=</mo></mtd>
+      <mtd>
+        <mrow>
+          <mi>λ</mi><msub><mi>v</mi><mtext>t</mtext></msub>
+          <mo>−</mo><msub><mi>v</mi><mtext>i</mtext></msub>
+        </mrow>
+      </mtd>
+    </mtr>
+  </mtable>
+</math>
+<span class="cm">線形性そのもの。<span class="m">v</span><sub class="m">t</sub> と
+<span class="m">v</span><sub class="m">i</sub> はすでに計算してある。</span>
+</div>
+
+<p><b>4 回目の <code>project_onto_jacobian_ECC</code>（12 面）も、その入力である
+<code>error</code> 行列の生成（3 面）も要らない。85 → 70 面。</b></p>
+
+<pre><span class="c">// before</span>
+error = lambda*templateZM - imageWarped;
+project_onto_jacobian_ECC(jacobian, error, errorProjection);
+
+<span class="c">// after</span>
+errorProjection = lambda*templateProjection - imageProjection;</pre>
+
+<div class="good-note">
+これは<b>構造を一切変えない 3 行の置き換え</b>で、レイアウトにもアルゴリズムにも触れない。
+精度も変わらない（浮動小数の丸めは変わるが、中間の <code>error</code> 行列を経ないぶん誤差要因はむしろ減る）。
+<b>単独で上流に提出でき、しかも全動作種別に効く。</b>
+</div>
+
+<h2>4. 最適化 2: affine のヘッセ行列は 18 自由度しかない</h2>
+
+<h3>4.1 ヤコビアンは面分割積である</h3>
+
+<p>affine warp は</p>
+
+<div class="eq tight">
+<math display="block">
+  <mtable columnalign="right center left" columnspacing="0.3em" rowspacing="0.35em">
+    <mtr>
+      <mtd><msup><mi>x</mi><mo>′</mo></msup></mtd><mtd><mo>=</mo></mtd>
+      <mtd><mrow><msub><mi>p</mi><mn>0</mn></msub><mi>x</mi><mo>+</mo>
+                 <msub><mi>p</mi><mn>2</mn></msub><mi>y</mi><mo>+</mo>
+                 <msub><mi>p</mi><mn>4</mn></msub></mrow></mtd>
+    </mtr>
+    <mtr>
+      <mtd><msup><mi>y</mi><mo>′</mo></msup></mtd><mtd><mo>=</mo></mtd>
+      <mtd><mrow><msub><mi>p</mi><mn>1</mn></msub><mi>x</mi><mo>+</mo>
+                 <msub><mi>p</mi><mn>3</mn></msub><mi>y</mi><mo>+</mo>
+                 <msub><mi>p</mi><mn>5</mn></msub></mrow></mtd>
+    </mtr>
+  </mtable>
+</math>
+</div>
+
+<p>なので、画素 <span class="m">n</span> における 6 本の偏微分は次のようになる。</p>
+
+<div class="eq">
+<math display="block">
+  <mrow>
+    <mfrac><mrow><mo>∂</mo><mover accent="true"><mi>i</mi><mo>‾</mo></mover></mrow>
+           <mrow><mo>∂</mo><mi>p</mi></mrow></mfrac>
+    <mo>=</mo>
+    <mrow><mo>[</mo>
+      <mtable columnspacing="1.1em"><mtr>
+        <mtd><mrow><msub><mi>g</mi><mi>x</mi></msub><mi>x</mi></mrow></mtd>
+        <mtd><mrow><msub><mi>g</mi><mi>y</mi></msub><mi>x</mi></mrow></mtd>
+        <mtd><mrow><msub><mi>g</mi><mi>x</mi></msub><mi>y</mi></mrow></mtd>
+        <mtd><mrow><msub><mi>g</mi><mi>y</mi></msub><mi>y</mi></mrow></mtd>
+        <mtd><msub><mi>g</mi><mi>x</mi></msub></mtd>
+        <mtd><msub><mi>g</mi><mi>y</mi></msub></mtd>
+      </mtr></mtable>
+    <mo>]</mo></mrow>
+  </mrow>
+</math>
+<span class="cm">左から <span class="m">p</span><sub class="m">0</sub> … <span class="m">p</span><sub class="m">5</sub> に対応。
+末尾 2 本は平行移動なので座標が掛からない（= 1 が掛かる）。</span>
+</div>
+
+<p>これは <b>2 要素ベクトル <math><msub><mi>g</mi><mi>n</mi></msub></math> と
+3 要素ベクトル <math><msub><mi>c</mi><mi>n</mi></msub></math> のクロネッカー積</b>にほかならない。</p>
+
+<div class="eq">
+<math display="block">
+  <mrow>
+    <mtext>G の第 n 行</mtext>
+    <mo>=</mo>
+    <msub><mi>g</mi><mi>n</mi></msub>
+    <mo>⊗</mo>
+    <msub><mi>c</mi><mi>n</mi></msub>
+    <mo>,</mo>
+    <mspace width="1.4em"/>
+    <msub><mi>g</mi><mi>n</mi></msub><mo>=</mo>
+    <mrow><mo>(</mo><msub><mi>g</mi><mi>x</mi></msub><mo>,</mo><msub><mi>g</mi><mi>y</mi></msub><mo>)</mo></mrow>
+    <mo>,</mo>
+    <mspace width="0.8em"/>
+    <msub><mi>c</mi><mi>n</mi></msub><mo>=</mo>
+    <mrow><mo>(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo>,</mo><mn>1</mn><mo>)</mo></mrow>
+  </mrow>
+</math>
+<span class="cm">6 = 2 × 3。<span class="m">G</span> は勾配行列と座標行列の<b>面分割積</b>（行ごとのクロネッカー積）である。</span>
+</div>
+
+<p>したがってヘッセ行列は次の形になる。</p>
+
+<div class="eq">
+<math display="block">
+  <mrow>
+    <mi>H</mi><mo>=</mo>
+    <msup><mi>G</mi><mtext>T</mtext></msup><mi>G</mi>
+    <mo>=</mo>
+    <munder><mo>∑</mo><mi>n</mi></munder>
+    <mrow><mo>(</mo><msub><mi>g</mi><mi>n</mi></msub>
+      <msubsup><mi>g</mi><mi>n</mi><mtext>T</mtext></msubsup><mo>)</mo></mrow>
+    <mo>⊗</mo>
+    <mrow><mo>(</mo><msub><mi>c</mi><mi>n</mi></msub>
+      <msubsup><mi>c</mi><mi>n</mi><mtext>T</mtext></msubsup><mo>)</mo></mrow>
+  </mrow>
+</math>
+<span class="cm"><math><mrow><mo>(</mo><mi>a</mi><mo>⊗</mo><mi>b</mi><mo>)</mo></mrow><msup><mrow><mo>(</mo><mi>a</mi><mo>⊗</mo><mi>b</mi><mo>)</mo></mrow><mtext>T</mtext></msup>
+<mo>=</mo><mrow><mo>(</mo><mi>a</mi><msup><mi>a</mi><mtext>T</mtext></msup><mo>)</mo></mrow><mo>⊗</mo><mrow><mo>(</mo><mi>b</mi><msup><mi>b</mi><mtext>T</mtext></msup><mo>)</mo></mrow></math>
+を各画素に適用して和を取っただけ。</span>
+</div>
+
+<p><math><mrow><msub><mi>g</mi><mi>n</mi></msub><msubsup><mi>g</mi><mi>n</mi><mtext>T</mtext></msubsup></mrow></math>
+は 2×2 対称で独立成分 3 個
+（<math><msubsup><mi>g</mi><mi>x</mi><mn>2</mn></msubsup></math>,
+<math><mrow><msub><mi>g</mi><mi>x</mi></msub><msub><mi>g</mi><mi>y</mi></msub></mrow></math>,
+<math><msubsup><mi>g</mi><mi>y</mi><mn>2</mn></msubsup></math>)、
+<math><mrow><msub><mi>c</mi><mi>n</mi></msub><msubsup><mi>c</mi><mi>n</mi><mtext>T</mtext></msubsup></mrow></math>
+は 3×3 対称で独立成分 6 個
+（<math><msup><mi>x</mi><mn>2</mn></msup></math>,
+<math><mrow><mi>x</mi><mi>y</mi></mrow></math>,
+<math><msup><mi>y</mi><mn>2</mn></msup></math>,
+<math><mi>x</mi></math>, <math><mi>y</mi></math>, <math><mn>1</mn></math>）。よって:</p>
+
+<div class="good-note">
+<b>6×6 ヘッセ行列の上三角 21 成分は、3 × 6 = 18 個の和だけで書ける。</b>
+残り 3 個は重複である（<span class="m">H</span><sub class="m">12</sub> = <span class="m">H</span><sub class="m">03</sub>、
+<span class="m">H</span><sub class="m">14</sub> = <span class="m">H</span><sub class="m">05</sub>、
+<span class="m">H</span><sub class="m">34</sub> = <span class="m">H</span><sub class="m">25</sub> — いずれも
+<math><mrow><msub><mi>g</mi><mi>x</mi></msub><msub><mi>g</mi><mi>y</mi></msub></mrow></math> 側の重複）。
+affine の ECC ヘッセ行列は一般の対称行列ではない。
+</div>
+
+<h3>4.2 対応表</h3>
+
+<p>行が <math><mrow><msub><mi>g</mi><mi>n</mi></msub><msubsup><mi>g</mi><mi>n</mi><mtext>T</mtext></msubsup></mrow></math> の 3 成分、
+列が <math><mrow><msub><mi>c</mi><mi>n</mi></msub><msubsup><mi>c</mi><mi>n</mi><mtext>T</mtext></msubsup></mrow></math> の 6 成分。
+セルがヘッセ行列のどの成分になるかを示す。</p>
+
+<div class="tw"><table>
+<thead><tr><th style="text-align:left"></th>
+<th><math><msup><mi>x</mi><mn>2</mn></msup></math></th>
+<th><math><mrow><mi>x</mi><mi>y</mi></mrow></math></th>
+<th><math><msup><mi>y</mi><mn>2</mn></msup></math></th>
+<th><math><mi>x</mi></math></th>
+<th><math><mi>y</mi></math></th>
+<th><math><mn>1</mn></math></th></tr></thead>
+<tbody>
+<tr><td class="grp"><math><msubsup><mi>g</mi><mi>x</mi><mn>2</mn></msubsup></math></td>
+    <td>H₀₀</td><td>H₀₂</td><td>H₂₂</td><td>H₀₄</td><td>H₂₄</td><td>H₄₄</td></tr>
+<tr><td class="grp"><math><mrow><msub><mi>g</mi><mi>x</mi></msub><msub><mi>g</mi><mi>y</mi></msub></mrow></math></td>
+    <td>H₀₁</td><td class="best">H₀₃ = H₁₂</td><td>H₂₃</td><td class="best">H₀₅ = H₁₄</td><td class="best">H₂₅ = H₃₄</td><td>H₄₅</td></tr>
+<tr><td class="grp"><math><msubsup><mi>g</mi><mi>y</mi><mn>2</mn></msubsup></math></td>
+    <td>H₁₁</td><td>H₁₃</td><td>H₃₃</td><td>H₁₅</td><td>H₃₅</td><td>H₅₅</td></tr>
+</tbody></table></div>
+
+<p>射影のほうも同じ構造で、<math><mrow><msup><mi>G</mi><mtext>T</mtext></msup><mi>v</mi></mrow></math> の
+第 <math><mrow><mo>(</mo><mi>g</mi><mo>,</mo><mi>c</mi><mo>)</mo></mrow></math> 成分は
+<math><mrow><munder><mo>∑</mo><mi>n</mi></munder><mi>g</mi><mi>c</mi><mi>v</mi></mrow></math>。
+重複は無く 6 個ずつ、2 本で 12 個。
+<b>合計 30 個のスカラを累積すれば、この段はすべて終わる。</b></p>
+
+<h3>4.3 四つの運動種別すべてが同じ形をしている</h3>
+
+<p>この構造は affine 固有ではない。<b>ECC のヤコビアンは、どの運動種別でも
+「勾配側のベクトル <span class="m">u</span> と座標側のベクトル <span class="m">w</span> の
+面分割積のうち、いくつかの列を取り出したもの」</b>として書ける。違うのは
+<span class="m">u</span> と <span class="m">w</span> の中身と、取り出す列だけである。</p>
+
+<div class="tw"><table>
+<thead><tr><th>運動種別</th><th><span class="m">P</span></th>
+<th><span class="m">u</span>（勾配側）</th><th><span class="m">w</span>（座標側）</th>
+<th>列</th><th><span class="m">H</span> の成分数</th><th>累積するスカラ</th></tr></thead>
+<tbody>
+<tr><td>translation</td><td>2</td>
+    <td><math><mrow><mo>(</mo><msub><mi>g</mi><mi>x</mi></msub><mo>,</mo><msub><mi>g</mi><mi>y</mi></msub><mo>)</mo></mrow></math></td>
+    <td><math><mrow><mo>(</mo><mn>1</mn><mo>)</mo></mrow></math></td>
+    <td>2 = 2×1（全部）</td><td>3</td><td>3</td></tr>
+<tr><td>euclidean</td><td>3</td>
+    <td><math><mrow><mo>(</mo><msub><mi>g</mi><mi>r</mi></msub><mo>,</mo><msub><mi>g</mi><mi>x</mi></msub><mo>,</mo><msub><mi>g</mi><mi>y</mi></msub><mo>)</mo></mrow></math></td>
+    <td><math><mrow><mo>(</mo><mn>1</mn><mo>)</mo></mrow></math></td>
+    <td>3 = 3×1（全部）</td><td>6</td><td>6</td></tr>
+<tr><td><b>affine</b></td><td>6</td>
+    <td><math><mrow><mo>(</mo><msub><mi>g</mi><mi>x</mi></msub><mo>,</mo><msub><mi>g</mi><mi>y</mi></msub><mo>)</mo></mrow></math></td>
+    <td><math><mrow><mo>(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo>,</mo><mn>1</mn><mo>)</mo></mrow></math></td>
+    <td>6 = 2×3（全部）</td><td>21</td><td class="best">18</td></tr>
+<tr><td>homography</td><td>8</td>
+    <td><math><mrow><mo>(</mo><msub><mi>g</mi><mi>x</mi></msub><mo>,</mo><msub><mi>g</mi><mi>y</mi></msub><mo>,</mo><msub><mi>g</mi><mi>p</mi></msub><mo>)</mo></mrow></math></td>
+    <td><math><mrow><mo>(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo>,</mo><mn>1</mn><mo>)</mo></mrow></math></td>
+    <td>8 = 3×3 − 1</td><td>36</td><td>36</td></tr>
+</tbody></table></div>
+
+<p>累積するスカラの数は必ず
+<math><mrow><mi>tri</mi><mo>(</mo><mi>K</mi><mo>)</mo><mo>·</mo><mi>tri</mi><mo>(</mo><mi>L</mi><mo>)</mo></mrow></math>
+（<math><mrow><mi>tri</mi><mo>(</mo><mi>n</mi><mo>)</mo><mo>=</mo><mi>n</mi><mo>(</mo><mi>n</mi><mo>+</mo><mn>1</mn><mo>)</mo><mo>/</mo><mn>2</mn></mrow></math>）になる。
+<b>affine だけが 18 &lt; 21 と真に得をしている</b>のは、6 = 2×3 が
+<math><mrow><mi>K</mi><mo>,</mo><mi>L</mi><mo>&gt;</mo><mn>1</mn></mrow></math> でかつ
+列を全部使う唯一のケースだからである。他は過不足なく一致する。</p>
+
+<div class="good-note">
+ただし<b>本当の利得は成分数の削減ではなく、ヤコビアンを実体化しないこと</b>にある。
+それは <span class="m">P</span> によらず 1 パスで済むので、<b>節約は
+<span class="m">P</span> とともに増える</b>。§6 の実測はまさにその通りになる
+（窓 768・4 スレッドで translation 1.27× → homography 2.47×）。
+</div>
+
+<h4>homography の <math><msub><mi>g</mi><mi>p</mi></msub></math> は何か</h4>
+
+<p>射影 warp のヤコビアンには画素ごとの除算
+<math><mrow><mi>d</mi><mo>=</mo><msub><mi>h</mi><mn>6</mn></msub><mi>x</mi><mo>+</mo>
+<msub><mi>h</mi><mn>7</mn></msub><mi>y</mi><mo>+</mo><mn>1</mn></mrow></math> が入る。
+一見これで面分割積の形が壊れそうに見えるが、壊れない。除算を<b>勾配側に畳み込めばよい</b>。
+OpenCV の <code>image_jacobian_homo_ECC</code> は実際そうしている:</p>
+
+<div class="eq tight">
+<math display="block"><mrow>
+  <msub><mi>g</mi><mi>x</mi></msub><mo>=</mo><msub><mi>I</mi><mi>x</mi></msub><mo>/</mo><mi>d</mi>
+  <mo>,</mo><mspace width="1.2em"/>
+  <msub><mi>g</mi><mi>y</mi></msub><mo>=</mo><msub><mi>I</mi><mi>y</mi></msub><mo>/</mo><mi>d</mi>
+  <mo>,</mo><mspace width="1.2em"/>
+  <msub><mi>g</mi><mi>p</mi></msub><mo>=</mo>
+  <mo>−</mo><msup><mi>x</mi><mo>′</mo></msup><msub><mi>g</mi><mi>x</mi></msub>
+  <mo>−</mo><msup><mi>y</mi><mo>′</mo></msup><msub><mi>g</mi><mi>y</mi></msub>
+</mrow></math>
+<span class="cm"><math><mrow><msup><mi>x</mi><mo>′</mo></msup><mo>,</mo><msup><mi>y</mi><mo>′</mo></msup></mrow></math>
+は射影後の座標。<code>hatX_</code> / <code>hatY_</code> がこれにあたる。</span>
+</div>
+
+<p>この 3 本を <math><mrow><mo>(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo>,</mo><mn>1</mn><mo>)</mo></mrow></math>
+に掛けた 9 通りのうち
+<math><mrow><msub><mi>g</mi><mi>p</mi></msub><mo>·</mo><mn>1</mn></mrow></math> を除く 8 通りが、
+そのまま 8 本の列である。<b>homography は例外どころか、最も伸びしろの大きいケースだった。</b></p>
+
+<h2>5. 最適化 3: ヤコビアンを作らず、1 パスで、並列に</h2>
+
+<p>30 個のスカラを作るのに必要な入力は
+<code>gx</code>, <code>gy</code>, <code>x</code>, <code>y</code>, <code>ī</code>, <code>t̄</code> の
+<b>6 面だけ</b>。ヤコビアンを書き出す必要も、読み直す必要もない。</p>
+
+<div class="chart">
+  <h4>データフローの比較（1 反復）</h4>
+  <p class="cap">左: 現状。ヤコビアンを実体化し、4 回の射影で読み直す。右: 融合。6 面を 1 回読むだけ。</p>
+  <svg viewBox="0 0 940 300" role="img" aria-label="現状と融合のデータフロー比較">
+    <text x="16" y="20" fill="#ff6b6b" font-size="14" font-weight="700">現状 — 85 面</text>
+    <rect x="16" y="34" width="86" height="86" rx="6" fill="#1d2740" stroke="#3a4763"/>
+    <text x="59" y="70" fill="#cdd8ea" font-size="11.5" text-anchor="middle">gx gy</text>
+    <text x="59" y="88" fill="#cdd8ea" font-size="11.5" text-anchor="middle">x  y</text>
+    <text x="59" y="106" fill="#9aa7bd" font-size="10.5" text-anchor="middle">4 面</text>
+    <path d="M106 77 L142 77" stroke="#5aa9ff" stroke-width="2" marker-end="url(#ah)"/>
+    <text x="124" y="70" fill="#9aa7bd" font-size="10" text-anchor="middle">構築</text>
+    <g>
+      <rect x="146" y="34" width="30" height="86" rx="3" fill="#243050" stroke="#3a4763"/>
+      <rect x="180" y="34" width="30" height="86" rx="3" fill="#243050" stroke="#3a4763"/>
+      <rect x="214" y="34" width="30" height="86" rx="3" fill="#243050" stroke="#3a4763"/>
+      <rect x="248" y="34" width="30" height="86" rx="3" fill="#243050" stroke="#3a4763"/>
+      <rect x="282" y="34" width="30" height="86" rx="3" fill="#243050" stroke="#3a4763"/>
+      <rect x="316" y="34" width="30" height="86" rx="3" fill="#243050" stroke="#3a4763"/>
+    </g>
+    <text x="246" y="136" fill="#cdd8ea" font-size="11.5" text-anchor="middle">ヤコビアン hs × (ws·6)　書き 6 面</text>
+    <text x="246" y="152" fill="#9aa7bd" font-size="10.5" text-anchor="middle">各ブロックは行ストライド ws·6 の飛び飛びビュー</text>
+    <path d="M246 160 L246 186" stroke="#ff6b6b" stroke-width="2" marker-end="url(#ar)"/>
+    <rect x="120" y="190" width="252" height="86" rx="8" fill="#241a1e" stroke="#57343a"/>
+    <text x="246" y="211" fill="#ff9aa2" font-size="12" text-anchor="middle">project_onto_jacobian_ECC × 4</text>
+    <text x="246" y="231" fill="#e7ecf3" font-size="11.5" text-anchor="middle">ヘッセ 36 面 ＋ 射影 12×3 面</text>
+    <text x="246" y="250" fill="#ff6b6b" font-size="11.5" font-weight="700" text-anchor="middle">読み直し 72 面</text>
+    <text x="246" y="268" fill="#9aa7bd" font-size="10.5" text-anchor="middle">Mat::dot は並列化されない</text>
+
+    <line x1="410" y1="24" x2="410" y2="284" stroke="#27314a" stroke-width="1" stroke-dasharray="5 5"/>
+
+    <text x="446" y="20" fill="#37d39b" font-size="14" font-weight="700">融合 — 6 面</text>
+    <rect x="446" y="34" width="120" height="120" rx="6" fill="#1d2740" stroke="#3a4763"/>
+    <text x="506" y="62" fill="#cdd8ea" font-size="11.5" text-anchor="middle">gx  gy</text>
+    <text x="506" y="82" fill="#cdd8ea" font-size="11.5" text-anchor="middle">x   y</text>
+    <text x="506" y="102" fill="#cdd8ea" font-size="11.5" text-anchor="middle">ī    t̄</text>
+    <text x="506" y="126" fill="#37d39b" font-size="11" text-anchor="middle">読み 6 面のみ</text>
+    <text x="506" y="144" fill="#9aa7bd" font-size="10.5" text-anchor="middle">ヤコビアンは作らない</text>
+    <path d="M570 94 L610 94" stroke="#37d39b" stroke-width="2" marker-end="url(#ag)"/>
+    <rect x="614" y="46" width="180" height="96" rx="8" fill="#16241f" stroke="#24503f"/>
+    <text x="704" y="70" fill="#37d39b" font-size="12" text-anchor="middle">1 パス・行ストライプ並列</text>
+    <text x="704" y="92" fill="#e7ecf3" font-size="11.5" text-anchor="middle">30 個のスカラを累積</text>
+    <text x="704" y="112" fill="#9aa7bd" font-size="10.5" text-anchor="middle">Gram 18 ＋ 射影 6×2</text>
+    <text x="704" y="131" fill="#9aa7bd" font-size="10.5" text-anchor="middle">parallel_for_(Range(0, hs))</text>
+    <path d="M704 146 L704 186" stroke="#37d39b" stroke-width="2" marker-end="url(#ag)"/>
+    <rect x="602" y="190" width="204" height="86" rx="8" fill="#1d2740" stroke="#3a4763"/>
+    <text x="704" y="217" fill="#e7ecf3" font-size="12" text-anchor="middle">H (6×6),  v_i,  v_t</text>
+    <text x="704" y="240" fill="#9aa7bd" font-size="11" text-anchor="middle">更新の射影は λ·v_t − v_i</text>
+    <text x="704" y="260" fill="#9aa7bd" font-size="11" text-anchor="middle">（追加パス不要）</text>
+
+    <defs>
+      <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0 0 L8 4 L0 8 z" fill="#5aa9ff"/></marker>
+      <marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0 0 L8 4 L0 8 z" fill="#ff6b6b"/></marker>
+      <marker id="ag" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0 0 L8 4 L0 8 z" fill="#37d39b"/></marker>
+    </defs>
+  </svg>
+</div>
+
+<h3>5.1 内側ループ</h3>
+
+<p>行ごとに <code>float</code> で累積し、行末で <code>double</code> に昇格する。
+straight-line なのでコンパイラがベクトル化でき、行末の昇格で精度も保てる。</p>
+
+<pre><span class="k">for</span> (<span class="k">int</span> x = <span class="n">0</span>; x &lt; w; ++x) {
+    <span class="k">const float</span> a = pgx[x], b = pgy[x], u = pX[x], v = pY[x];
+    <span class="k">const float</span> aa = a*a, ab = a*b, bb = b*b;   <span class="c">// g gᵀ の 3 成分</span>
+    <span class="k">const float</span> uu = u*u, uv = u*v, vv = v*v;   <span class="c">// c cᵀ の 6 成分（u, v, 1 は自明）</span>
+
+    g00 += aa*uu;  g01 += aa*uv;  g02 += aa*vv;   <span class="c">// gx² 行</span>
+    g03 += aa*u;   g04 += aa*v;   g05 += aa;
+    g10 += ab*uu;  g11 += ab*uv;  g12 += ab*vv;   <span class="c">// gxgy 行</span>
+    g13 += ab*u;   g14 += ab*v;   g15 += ab;
+    g20 += bb*uu;  g21 += bb*uv;  g22 += bb*vv;   <span class="c">// gy² 行</span>
+    g23 += bb*u;   g24 += bb*v;   g25 += bb;
+
+    <span class="k">const float</span> ii = pim[x], tt = ptm[x];
+    <span class="k">const float</span> ai = a*ii, bi = b*ii, at = a*tt, bt = b*tt;
+    pi0 += ai*u; pi1 += bi*u; pi2 += ai*v; pi3 += bi*v; pi4 += ai; pi5 += bi;
+    pt0 += at*u; pt1 += bt*u; pt2 += at*v; pt3 += bt*v; pt4 += at; pt5 += bt;
+}</pre>
+
+<p>1 画素あたり 6 乗算 ＋ 18 FMA ＋ 4 乗算 ＋ 12 FMA ≒ <b>40 演算</b>。
+素朴に 21 個の <code>j[p]*j[q]</code> を <code>double</code> で回すと 72 演算になるうえ、
+<code>k++</code> を伴う二重ループはベクトル化されない（実測で 2.4〜2.8 倍遅い）。</p>
+
+<h3>5.2 並列化と縮約</h3>
+
+<pre><span class="k">class</span> GNBody : <span class="k">public</span> ParallelLoopBody {
+    <span class="k">void</span> operator()(<span class="k">const</span> Range&amp; r) <span class="k">const</span> CV_OVERRIDE {
+        GNSums s;
+        gnRows(gx_, gy_, X_, Y_, im_, tm_, r.start, r.end, s);  <span class="c">// 行ストライプ</span>
+        AutoLock lk(mtx_);
+        out_.push_back(s);                                       <span class="c">// 30 スカラだけ持ち帰る</span>
+    }
+};</pre>
+
+<p>スレッド間で共有するのは 30 個の <code>double</code> だけなので、縮約は事実上ただである。
+これが効くのは <code>Mat::dot</code> が並列化されていないためで、
+<b>この段は現状 12 コアのうち 1 コアしか使っていない</b>。</p>
+
+<h2>6. 実測</h2>
+
+<h3>6.1 この段だけ（<code>gnbench</code>）</h3>
+
+<p>affine、中央値 7 回。「現状」はヤコビアン構築 ＋ ヘッセ ＋ 射影 2 本
+（4 本目は最適化 1 で消えるので除外してある。含めればさらに差が開く）。</p>
+
+<div class="tw"><table>
+<thead><tr><th>窓</th><th>ヘッセ</th><th>射影×2</th><th>現状 計</th><th>素朴融合(1T)</th><th>因数分解(1T)</th><th>因数分解(並列)</th><th>対現状</th></tr></thead>
+<tbody>
+<tr><td>256</td><td>0.333</td><td>0.198</td><td>0.606</td><td class="bad">1.415</td><td>0.599</td><td class="best">0.203</td><td class="best">2.98×</td></tr>
+<tr><td>384</td><td>0.645</td><td>0.359</td><td>1.167</td><td class="bad">3.195</td><td>1.326</td><td class="best">0.435</td><td class="best">2.68×</td></tr>
+<tr><td>512</td><td>1.108</td><td>0.647</td><td>2.066</td><td class="bad">5.720</td><td>2.440</td><td class="best">1.024</td><td class="best">2.02×</td></tr>
+<tr><td>768</td><td>4.609</td><td>2.217</td><td>8.764</td><td class="bad">13.061</td><td>5.581</td><td class="best">1.826</td><td class="best">4.80×</td></tr>
+<tr><td>1024</td><td>7.440</td><td>4.600</td><td>15.387</td><td class="bad">27.375</td><td>9.690</td><td class="best">2.455</td><td class="best">6.27×</td></tr>
+</tbody></table></div>
+
+<p>単スレッドに固定しても、因数分解版は大窓で現状より速い（窓 1024 で 15.47 → 9.74 ms、1.59×）。
+並列化はそのうえに乗る。</p>
+
+<h3>6.2 ECC 全体（<code>eval</code>、1 反復コスト、3 反復の中央値）</h3>
+
+<p><code>ufix</code> = <a href="https://github.com/opencv/opencv/pull/29775">opencv#29775</a>（境界修正）。
+<code>uboth</code> = そこに fast-ecc の warp 削減。<code>ugn</code> = 融合 GN のみ。<code>uall</code> = 両方。</p>
+
+<div class="chart">
+  <h4>ECC 全体の高速化（<code>uall</code> / <code>ufix</code>）</h4>
+  <p class="cap">warp 削減が無力になる大窓ほど、融合 GN が効く（affine、12 スレッド。4 スレッドの数値は下表）。</p>
+  <svg viewBox="0 0 720 250" role="img" aria-label="窓サイズ別の全体高速化">
+    <line x1="70" y1="200" x2="690" y2="200" stroke="#3a4763" stroke-width="1"/>
+    <line x1="70" y1="160" x2="690" y2="160" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="120" x2="690" y2="120" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="80"  x2="690" y2="80"  stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="40"  x2="690" y2="40"  stroke="#27314a" stroke-width="1"/>
+    <text x="60" y="204" fill="#9aa7bd" font-size="11" text-anchor="end">1.0×</text>
+    <text x="60" y="164" fill="#9aa7bd" font-size="11" text-anchor="end">1.5×</text>
+    <text x="60" y="124" fill="#9aa7bd" font-size="11" text-anchor="end">2.0×</text>
+    <text x="60" y="84"  fill="#9aa7bd" font-size="11" text-anchor="end">2.5×</text>
+    <text x="60" y="44"  fill="#9aa7bd" font-size="11" text-anchor="end">3.0×</text>
+    <polyline points="70,159.2 276,156.0 483,144.8 690,143.2" fill="none" stroke="#5aa9ff" stroke-width="2.5"/>
+    <polyline points="70,150.4 276,139.2 483,100.8 690,79.2" fill="none" stroke="#37d39b" stroke-width="2.5"/>
+    <polyline points="70,174.4 276,190.4 483,198.4 690,200.0" fill="none" stroke="#ff6b6b" stroke-width="2.5" stroke-dasharray="5 4"/>
+    <circle cx="70" cy="159.2" r="4" fill="#5aa9ff"/><circle cx="276" cy="156.0" r="4" fill="#5aa9ff"/>
+    <circle cx="483" cy="144.8" r="4" fill="#5aa9ff"/><circle cx="690" cy="143.2" r="4" fill="#5aa9ff"/>
+    <circle cx="70" cy="150.4" r="4" fill="#37d39b"/><circle cx="276" cy="139.2" r="4" fill="#37d39b"/>
+    <circle cx="483" cy="100.8" r="4" fill="#37d39b"/><circle cx="690" cy="79.2" r="4" fill="#37d39b"/>
+    <circle cx="70" cy="174.4" r="4" fill="#ff6b6b"/><circle cx="276" cy="190.4" r="4" fill="#ff6b6b"/>
+    <circle cx="483" cy="198.4" r="4" fill="#ff6b6b"/><circle cx="690" cy="200.0" r="4" fill="#ff6b6b"/>
+    <text x="70"  y="223" fill="#cdd8ea" font-size="12" text-anchor="middle">256</text>
+    <text x="276" y="223" fill="#cdd8ea" font-size="12" text-anchor="middle">512</text>
+    <text x="483" y="223" fill="#cdd8ea" font-size="12" text-anchor="middle">768</text>
+    <text x="690" y="223" fill="#cdd8ea" font-size="12" text-anchor="middle">1024</text>
+    <text x="380" y="242" fill="#9aa7bd" font-size="11.5" text-anchor="middle">窓サイズ (px)</text>
+  </svg>
+  <div class="lgd">
+    <span><i style="background:#37d39b"></i><code>uall</code>/<code>ufix</code>（affine, 12 スレッド）</span>
+    <span><i style="background:#5aa9ff"></i><code>uall</code>/<code>ufix</code>（1 スレッド）</span>
+    <span><i style="background:#ff6b6b"></i><code>uboth</code>/<code>ufix</code>（affine, warp 削減のみ、12 スレッド）</span>
+  </div>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>スレッド</th><th>運動種別</th><th>窓</th><th><code>ufix</code> ms</th><th>warp 削減のみ</th><th>融合 GN のみ</th><th>両方</th></tr></thead>
+<tbody>
+<tr><td class="grp" rowspan="12">4</td><td class="grp" rowspan="3">translation</td><td>256</td><td>30.4</td><td>1.52×</td><td>1.05×</td><td class="best">1.65×</td></tr>
+<tr><td>512</td><td>96.1</td><td>1.19×</td><td>1.10×</td><td class="best">1.40×</td></tr>
+<tr><td>768</td><td>201.4</td><td>1.17×</td><td>1.27×</td><td class="best">1.45×</td></tr>
+<tr><td class="grp" rowspan="3">euclidean</td><td>256</td><td>48.3</td><td>1.34×</td><td>1.51×</td><td class="best">2.28×</td></tr>
+<tr><td>512</td><td>149.5</td><td>1.14×</td><td>1.58×</td><td class="best">1.99×</td></tr>
+<tr><td>768</td><td>311.9</td><td class="bad">1.04×</td><td class="best">1.88×</td><td class="best">2.03×</td></tr>
+<tr><td class="grp" rowspan="3">affine</td><td>256</td><td>44.0</td><td>1.26×</td><td>1.30×</td><td class="best">1.87×</td></tr>
+<tr><td>512</td><td>163.5</td><td>1.12×</td><td>1.52×</td><td class="best">1.87×</td></tr>
+<tr><td>768</td><td>383.9</td><td class="bad">1.05×</td><td class="best">2.00×</td><td class="best">2.12×</td></tr>
+<tr><td class="grp" rowspan="3">homography</td><td>256</td><td>87.5</td><td>1.28×</td><td>1.69×</td><td class="best">2.55×</td></tr>
+<tr><td>512</td><td>299.4</td><td>1.16×</td><td class="best">2.07×</td><td class="best">2.88×</td></tr>
+<tr><td>768</td><td>634.0</td><td class="bad">1.06×</td><td class="best">2.47×</td><td class="best">2.89×</td></tr>
+<tr><td class="grp" rowspan="12">1</td><td class="grp" rowspan="3">translation</td><td>256</td><td>29.8</td><td>1.53×</td><td>1.07×</td><td class="best">1.64×</td></tr>
+<tr><td>512</td><td>124.8</td><td>1.48×</td><td>1.09×</td><td class="best">1.61×</td></tr>
+<tr><td>768</td><td>289.3</td><td>1.43×</td><td>1.10×</td><td class="best">1.60×</td></tr>
+<tr><td class="grp" rowspan="3">euclidean</td><td>256</td><td>41.0</td><td>1.33×</td><td>1.35×</td><td class="best">1.97×</td></tr>
+<tr><td>512</td><td>169.9</td><td>1.31×</td><td>1.32×</td><td class="best">1.93×</td></tr>
+<tr><td>768</td><td>390.1</td><td>1.28×</td><td>1.33×</td><td class="best">1.89×</td></tr>
+<tr><td class="grp" rowspan="3">affine</td><td>256</td><td>43.4</td><td>1.34×</td><td>1.09×</td><td class="best">1.47×</td></tr>
+<tr><td>512</td><td>186.2</td><td>1.29×</td><td>1.17×</td><td class="best">1.52×</td></tr>
+<tr><td>768</td><td>491.1</td><td>1.20×</td><td>1.26×</td><td class="best">1.66×</td></tr>
+<tr><td class="grp" rowspan="3">homography</td><td>256</td><td>89.2</td><td>1.28×</td><td>1.21×</td><td class="best">1.65×</td></tr>
+<tr><td>512</td><td>353.4</td><td>1.23×</td><td>1.25×</td><td class="best">1.61×</td></tr>
+<tr><td>768</td><td>872.0</td><td>1.22×</td><td>1.43×</td><td class="best">1.87×</td></tr>
+</tbody></table></div>
+
+<p>比はすべて <code>ufix</code>（<a href="https://github.com/opencv/opencv/pull/29775">opencv#29775</a> 相当の境界修正のみ）に対する
+1 反復コストの比、3 反復の最小値。<b>4 スレッドを常用の動作点とする</b>
+（このマシンは 6C/12T だが、12 並列は実利用の想定から外れる)。</p>
+
+<div class="good-note">
+<b>二つの最適化は互いの弱点をちょうど埋めている。</b>
+warp 削減は小窓で強く（窓 256 で 1.26〜1.52×）大窓で消える（窓 768 で 1.04〜1.17×）。
+融合 GN はその逆で、大窓ほど、そして <span class="m">P</span> が大きいほど効く
+（窓 768 で translation 1.27× → homography 2.47×）。
+両方入れると <b>4 スレッドで窓・運動種別によらず 1.40〜2.89×</b> に収まる。
+</div>
+
+<p>単スレッドでは様相が変わる。warp 削減は窓によらず 1.20〜1.53× で平坦、
+融合 GN は 1.07〜1.43× にとどまる。<b>融合 GN の利得の大半は並列化由来</b>であり
+（<code>Mat::dot</code> は <code>parallel_for_</code> を持たない）、
+代数の削減そのものが効くのは大窓・大 <span class="m">P</span> に限られる。</p>
+
+<h3>6.3 数値的な等価性</h3>
+
+<div class="tw"><table>
+<thead><tr><th style="text-align:left">検証</th><th style="text-align:left">結果</th></tr></thead>
+<tbody>
+<tr><td><code>fixedpoint</code> 4 種別 × 200 試行</td><td style="text-align:left"><code>ugn</code> は <code>ufix</code> と cornMed / バイアス / dScale / rho が<b>印字桁すべて一致</b>（translation・euclidean・affine・homography）</td></tr>
+<tr><td><code>accuracy</code> 4 種別 × 200 試行</td><td style="text-align:left">同上。例: affine 0.0017 / 0.0017、homography 0.0026 / 0.0026</td></tr>
+<tr><td><code>basin</code> affine, 150 試行</td><td style="text-align:left">×0.25〜×4 の 5 段階すべてで<b>収束数まで完全一致</b>（150 / 148 / 104 / 39 / 6）</td></tr>
+</tbody></table></div>
+
+<h3>6.4 要素ごとの寄与（4 スレッド）</h3>
+
+<p>§3〜§5 を個別に有効化して測ったもの。段階的に取り込むときに、
+どれが実際に効いているかを見るための表である。</p>
+
+<div class="tw"><table>
+<thead><tr><th>運動種別</th><th>窓</th>
+<th>§3 射影の恒等式</th><th>§4 対角の <code>dot</code></th><th>§5 射影の並列化</th>
+<th>融合 GN（全部）</th></tr></thead>
+<tbody>
+<tr><td class="grp" rowspan="3">translation</td><td>256</td><td>1.07×</td><td class="bad">1.02×</td><td>1.03×</td><td class="best">1.07×</td></tr>
+<tr><td>512</td><td>1.06×</td><td class="bad">1.03×</td><td>1.10×</td><td class="best">1.24×</td></tr>
+<tr><td>768</td><td>1.09×</td><td class="bad">1.00×</td><td>1.08×</td><td class="best">1.27×</td></tr>
+<tr><td class="grp" rowspan="3">euclidean</td><td>256</td><td>1.01×</td><td class="bad">0.97×</td><td>1.05×</td><td class="best">1.44×</td></tr>
+<tr><td>512</td><td>1.04×</td><td class="bad">1.03×</td><td>1.08×</td><td class="best">1.71×</td></tr>
+<tr><td>768</td><td>1.06×</td><td class="bad">1.02×</td><td>1.10×</td><td class="best">1.89×</td></tr>
+<tr><td class="grp" rowspan="3">affine</td><td>256</td><td>1.06×</td><td class="bad">1.00×</td><td class="best">1.22×</td><td class="best">1.35×</td></tr>
+<tr><td>512</td><td>1.09×</td><td class="bad">0.99×</td><td class="best">1.27×</td><td class="best">1.49×</td></tr>
+<tr><td>768</td><td>1.10×</td><td class="bad">0.96×</td><td class="best">1.29×</td><td class="best">1.91×</td></tr>
+<tr><td class="grp" rowspan="3">homography</td><td>256</td><td>1.04×</td><td class="bad">1.01×</td><td class="best">1.20×</td><td class="best">1.64×</td></tr>
+<tr><td>512</td><td>1.06×</td><td class="bad">1.01×</td><td class="best">1.21×</td><td class="best">1.87×</td></tr>
+<tr><td>768</td><td>1.10×</td><td class="bad">1.04×</td><td class="best">1.23×</td><td class="best">2.50×</td></tr>
+</tbody></table></div>
+
+<div class="note">
+<b>読みどころが三つある。</b>
+<ul>
+<li><b>§3 の恒等式は安いが小さい。</b>どの種別・どの窓でも 1.01〜1.10× で、
+3 行の変更にしては素直に効く。単スレッドでも同じだけ効く（並列化と無関係）。</li>
+<li><b>§4 の「対角は <code>dot</code> で足りる」は無価値だった。</b>0.96〜1.04×
+——測定誤差の範囲で、<b>マイナスに振れることすらある</b>。複雑さだけを持ち込むので採用しない。</li>
+<li><b>§5 の並列化は <span class="m">P</span> が大きいときだけ効く。</b>
+affine / homography で 1.20〜1.29×、translation / euclidean では 1.03〜1.10×。
+<math><mrow><mi>w</mi><mo>=</mo><mo>(</mo><mn>1</mn><mo>)</mo></mrow></math> の 2 種別は
+そもそも射影の仕事量が小さい。単スレッドではすべて 0.96〜1.04× に落ちる（当然）。</li>
+</ul>
+部分の積（<code>C1+C2+C3</code> は実測 1.05〜1.44×）は全体（1.07〜2.50×）に届かない。
+<b>融合の利得の大半は、要素の足し合わせではなくヤコビアンを実体化しないこと自体から来ている。</b>
+</div>
+
+<h2>7. 試して駄目だったこと</h2>
+
+<h3>7.1 <code>gemm</code> は逆効果</h3>
+
+<p>「ヤコビアンを <span class="m">P</span>×<span class="m">N</span> の連続レイアウトにして
+<code>gemm</code> で <math><mrow><msup><mi>G</mi><mtext>T</mtext></msup><mi>G</mi></mrow></math> を取れば、
+ブロックの読み直しが消える」という素直な案は、<b>現状の 2〜3 倍遅い</b>。</p>
+
+<div class="tw"><table>
+<thead><tr><th>窓</th><th>現状</th><th>gemm ×3</th><th>gemm ×1（拡大版）</th><th>因数分解(並列)</th></tr></thead>
+<tbody>
+<tr><td>512</td><td>2.066</td><td class="bad">10.099</td><td class="bad">13.307</td><td class="best">1.024</td></tr>
+<tr><td>1024</td><td>15.387</td><td class="bad">41.740</td><td class="bad">53.297</td><td class="best">2.455</td></tr>
+</tbody></table></div>
+
+<p>OpenCV 4.1.0 の <code>gemm</code> は <span class="m">P</span>×<span class="m">N</span> と
+<span class="m">N</span>×<span class="m">P</span> のような極端に縦長／横長のケースに最適化されていない。
+<math><mrow><mo>[</mo><mi>G</mi><mo>;</mo><mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo>;</mo>
+<mover accent="true"><mi>t</mi><mo>‾</mo></mover><mo>]</mo></mrow></math> を積んで
+<math><mrow><mi>A</mi><msup><mi>A</mi><mtext>T</mtext></msup></mrow></math> 一発で全部出す案
+（数学的には最も美しい）も同様に遅かった。</p>
+
+<h3>7.2 素朴な融合は単スレッドで遅い</h3>
+
+<p><code>j[6]</code> を作って 21 個の <code>j[p]*j[q]</code> を <code>double</code> で二重ループする実装は、
+現状より 2.3〜1.8 倍<b>遅い</b>。因数分解して straight-line にすることが本質で、
+「融合すれば速い」わけではない。</p>
+
+<h2>8. 残っている余地と制約</h2>
+
+<ul>
+<li><b>座標 <span class="m">x</span>, <span class="m">y</span> は読む必要がない。</b>
+それぞれ列番号・行番号なのでその場で生成できる。6 面 → 4 面になり、
+さらに 3 割ほど流量が減るはず（未実装・未計測）。</li>
+<li><b>SIMD 明示。</b>現在はコンパイラの自動ベクトル化に任せている。30 個のアキュムレータは
+YMM レジスタ 16 本に収まらないので L1 に溢れている。ブロック分割すれば改善余地がある。</li>
+<li><b>homography は実装済み。最も効いた。</b>初版はここで「画素ごとの除算が入るので
+そのままでは面分割積の形にならない」と書いたが、これは誤りだった。除算は勾配側に畳み込めばよく
+（§4.3）、OpenCV 自身の <code>image_jacobian_homo_ECC</code> が既にその形になっている。
+<span class="m">P</span> = 8 は最も伸びしろが大きく、実測でも窓 768・4 スレッドで
+<b>2.47×</b>（全 4 種別の最高値）。</li>
+<li><b>translation / euclidean も実装済みだが利得は小さい。</b>
+<math><mrow><mi>w</mi><mo>=</mo><mo>(</mo><mn>1</mn><mo>)</mo></mrow></math> なので
+ヘッセが 3 / 6 成分しかなく、この段の比重が小さい。窓 768・4 スレッドで 1.27× / 1.88×。
+それでも euclidean が affine（2.00×）に近いのは、
+<math><msub><mi>g</mi><mi>r</mi></msub></math> の生成が 1 パスに畳まれるため。</li>
+<li><b>上流提出は最適化 1 から。</b>§3 の一次結合は 3 行で、レイアウトにもアルゴリズムにも
+触れず、すべての動作種別に効く。§4〜5 は新しいカーネルを持ち込むので別件にすべきである。</li>
+</ul>
+
+<h2>9. まとめ</h2>
+
+<ol>
+<li><b>更新の射影は数式から消える。</b>
+<math><mrow><msup><mi>G</mi><mtext>T</mtext></msup><mo>(</mo><mi>λ</mi>
+<mover accent="true"><mi>t</mi><mo>‾</mo></mover><mo>−</mo>
+<mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo>)</mo><mo>=</mo>
+<mi>λ</mi><msub><mi>v</mi><mtext>t</mtext></msub><mo>−</mo>
+<msub><mi>v</mi><mtext>i</mtext></msub></mrow></math>。
+3 行の置き換えで 15 面が浮く。</li>
+<li><b>四つの運動種別すべてでヤコビアンは面分割積の列部分集合。</b>
+translation / euclidean / affine / homography の違いは
+<span class="m">u</span>, <span class="m">w</span> の中身と取り出す列だけで、
+累積するスカラは常に
+<math><mrow><mi>tri</mi><mo>(</mo><mi>K</mi><mo>)</mo><mo>·</mo><mi>tri</mi><mo>(</mo><mi>L</mi><mo>)</mo></mrow></math>。
+affine ではそれが 21 ではなく 18 になる。
+<math><mrow><mi>H</mi><mo>=</mo><munder><mo>∑</mo><mi>n</mi></munder>
+<mo>(</mo><msub><mi>g</mi><mi>n</mi></msub><msubsup><mi>g</mi><mi>n</mi><mtext>T</mtext></msubsup><mo>)</mo>
+<mo>⊗</mo>
+<mo>(</mo><msub><mi>c</mi><mi>n</mi></msub><msubsup><mi>c</mi><mi>n</mi><mtext>T</mtext></msubsup><mo>)</mo></mrow></math>
+という形から直ちに従う。</li>
+<li><b>ヤコビアンを実体化しなければ、1 反復の 85 面が 6 面になる。</b>
+30 個のスカラを 1 パスで累積すれば済む。</li>
+<li><b>この段は現状 1 コアしか使っていない</b>（<code>Mat::dot</code> に <code>parallel_for_</code> が無い）。
+行ストライプ並列は縮約が 30 スカラなので事実上ただ。</li>
+<li><b>節約は <span class="m">P</span> とともに増える。</b>ヤコビアンを実体化しない利得は
+1 パスで済むことなので、パラメータが多いほど得をする。窓 768・4 スレッドで
+translation 1.27× / euclidean 1.88× / affine 2.00× / <b>homography 2.47×</b>。
+初版が「homography は面分割積にならないので未実装」と書いたのは誤りで、
+実際には最も効く相手だった。</li>
+<li><b>warp 削減と組み合わせると穴が無くなる。</b>warp 削減は小窓（256 で 1.26〜1.52×）、
+融合 GN は大窓で効くので、両方入れると 4 スレッドで
+<b>窓・運動種別によらず 1.40〜2.89×</b>。この段だけを取り出せば最大 6.3×。
+精度・バイアス・収束半径はいずれも数値的に不変。</li>
+</ol>
+
+<footer>
+測定環境: Windows 11 / MSVC / OpenCV 4.1.0 プリビルド（<code>opencv_world410</code>）/
+Intel Core i7-8700K（6C/12T、L2 1.5 MB、L3 12 MB）。<br>
+実装: <code>eval/uni_ecc.cpp</code>（<code>fastGN</code> フラグ、4 種別のカーネルは<code>scratchpad/genkern.py</code> が生成）、<code>eval/gnbench.cpp</code>。
+生データ: <code>eval/results/</code>。<br>
+数式は MathML で組んでいる（外部スクリプト無し）。<br>
+関連: <code>ECC_warp_gauss_revisit.html</code>（warp 削減 × 境界修正、gaussFiltSize 再最適化）、
+<code>ECC_speedup_warp_reduction.html</code>（warp 削減の解説）。
+</footer>
+
+</div>
+</body>
+</html>
