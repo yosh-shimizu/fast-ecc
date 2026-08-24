@@ -59,65 +59,6 @@ using namespace cv;
 
 namespace {
 
-static void image_jacobian_homo_ECC(const Mat& src1, const Mat& src2,
-                                    const Mat& src3, const Mat& src4,
-                                    const Mat& src5, Mat& dst)
-{
-    CV_Assert(src1.size() == src2.size());
-    CV_Assert(src1.size() == src3.size());
-    CV_Assert(src1.size() == src4.size());
-
-    CV_Assert(src1.rows == dst.rows);
-    CV_Assert(dst.cols == (src1.cols*8));
-    CV_Assert(dst.type() == CV_32FC1);
-
-    CV_Assert(src5.isContinuous());
-
-    const float* hptr = src5.ptr<float>(0);
-
-    const float h0_ = hptr[0];
-    const float h1_ = hptr[3];
-    const float h2_ = hptr[6];
-    const float h3_ = hptr[1];
-    const float h4_ = hptr[4];
-    const float h5_ = hptr[7];
-    const float h6_ = hptr[2];
-    const float h7_ = hptr[5];
-
-    const int w = src1.cols;
-
-    //create denominator for all points as a block
-    Mat den_ = src3*h2_ + src4*h5_ + 1.0;
-
-    //create projected points
-    Mat hatX_ = -src3*h0_ - src4*h3_ - h6_;
-    divide(hatX_, den_, hatX_);
-    Mat hatY_ = -src3*h1_ - src4*h4_ - h7_;
-    divide(hatY_, den_, hatY_);
-
-    //instead of dividing each block with den, pre-divide the gradients (more efficient)
-    Mat src1Divided_;
-    Mat src2Divided_;
-    divide(src1, den_, src1Divided_);
-    divide(src2, den_, src2Divided_);
-
-    //compute Jacobian blocks (8 blocks)
-    dst.colRange(0, w) = src1Divided_.mul(src3);//1
-    dst.colRange(w,2*w) = src2Divided_.mul(src3);//2
-
-    Mat temp_ = (hatX_.mul(src1Divided_)+hatY_.mul(src2Divided_));
-    dst.colRange(2*w,3*w) = temp_.mul(src3);//3
-
-    hatX_.release();
-    hatY_.release();
-
-    dst.colRange(3*w, 4*w) = src1Divided_.mul(src4);//4
-    dst.colRange(4*w, 5*w) = src2Divided_.mul(src4);//5
-    dst.colRange(5*w, 6*w) = temp_.mul(src4);//6
-    src1Divided_.copyTo(dst.colRange(6*w, 7*w));//7
-    src2Divided_.copyTo(dst.colRange(7*w, 8*w));//8
-}
-
 static void warp_gradients_euclidean_ECC(
     const Mat& gradientX, const Mat& gradientY,
     const Mat& map,
@@ -143,39 +84,6 @@ static void warp_gradients_euclidean_ECC(
     // image's gradients with it is exact (R^{-T} == R).
     addWeighted(gradientX, h0, gradientY, -h1, 0., gradientXWarped);
     addWeighted(gradientX, h1, gradientY,  h0, 0., gradientYWarped);
-}
-
-static void image_jacobian_euclidean_ECC(const Mat& src1, const Mat& src2,
-                                         const Mat& src3, const Mat& src4,
-                                         const Mat& src5, Mat& dst)
-{
-    CV_Assert( src1.size()==src2.size());
-    CV_Assert( src1.size()==src3.size());
-    CV_Assert( src1.size()==src4.size());
-
-    CV_Assert( src1.rows == dst.rows);
-    CV_Assert(dst.cols == (src1.cols*3));
-    CV_Assert(dst.type() == CV_32FC1);
-
-    CV_Assert(src5.isContinuous());
-
-    const float* hptr = src5.ptr<float>(0);
-
-    const float h0 = hptr[0];//cos(theta)
-    const float h1 = hptr[3];//sin(theta)
-
-    const int w = src1.cols;
-
-    //create -sin(theta)*X -cos(theta)*Y for all points as a block -> hatX
-    Mat hatX = -(src3*h1) - (src4*h0);
-
-    //create cos(theta)*X -sin(theta)*Y for all points as a block -> hatY
-    Mat hatY = (src3*h0) - (src4*h1);
-
-    //compute Jacobian blocks (3 blocks)
-    dst.colRange(0, w) = (src1.mul(hatX))+(src2.mul(hatY));//1
-    src1.copyTo(dst.colRange(w, 2*w));//2
-    src2.copyTo(dst.colRange(2*w, 3*w));//3
 }
 
 static void warp_gradients_affine_ECC(
@@ -224,29 +132,6 @@ static void warp_gradients_affine_ECC(
 
 #include "gn_fused.inc"
 
-static void image_jacobian_affine_ECC(const Mat& src1, const Mat& src2,
-                                      const Mat& src3, const Mat& src4,
-                                      Mat& dst)
-{
-    CV_Assert(src1.size() == src2.size());
-    CV_Assert(src1.size() == src3.size());
-    CV_Assert(src1.size() == src4.size());
-
-    CV_Assert(src1.rows == dst.rows);
-    CV_Assert(dst.cols == (6*src1.cols));
-    CV_Assert(dst.type() == CV_32FC1);
-
-    const int w = src1.cols;
-
-    //compute Jacobian blocks (6 blocks)
-    dst.colRange(0,w) = src1.mul(src3);//1
-    dst.colRange(w,2*w) = src2.mul(src3);//2
-    dst.colRange(2*w,3*w) = src1.mul(src4);//3
-    dst.colRange(3*w,4*w) = src2.mul(src4);//4
-    src1.copyTo(dst.colRange(4*w,5*w));//5
-    src2.copyTo(dst.colRange(5*w,6*w));//6
-}
-
 static void warp_gradients_translation_ECC(
     const Mat& gradientX, const Mat& gradientY,
     Mat& gradientXWarped, Mat& gradientYWarped)
@@ -262,57 +147,6 @@ static void warp_gradients_translation_ECC(
 
     gradientX.copyTo(gradientXWarped);
     gradientY.copyTo(gradientYWarped);
-}
-
-static void image_jacobian_translation_ECC(const Mat& src1, const Mat& src2, Mat& dst)
-{
-    CV_Assert( src1.size()==src2.size());
-
-    CV_Assert( src1.rows == dst.rows);
-    CV_Assert(dst.cols == (src1.cols*2));
-    CV_Assert(dst.type() == CV_32FC1);
-
-    const int w = src1.cols;
-
-    //compute Jacobian blocks (2 blocks)
-    src1.copyTo(dst.colRange(0, w));
-    src2.copyTo(dst.colRange(w, 2*w));
-}
-
-static void project_onto_jacobian_ECC(const Mat& src1, const Mat& src2, Mat& dst)
-{
-    /* If src1.cols == src2.cols it does a blockwise (outer-product-like)
-       multiplication of the blocks in src1 and src2 -> dst is
-       (number_of_blocks x number_of_blocks); otherwise dst is a
-       (number_of_blocks x 1) vector (src2 dotted with each block of src1).
-       number_of_blocks = number of parameters (translation:2, euclidean:3,
-       affine:6, homography:8). */
-    CV_Assert(src1.rows == src2.rows);
-    CV_Assert((src1.cols % src2.cols) == 0);
-    int w;
-
-    float* dstPtr = dst.ptr<float>(0);
-
-    if (src1.cols != src2.cols){//dst.cols==1
-        w = src2.cols;
-        for (int i=0; i<dst.rows; i++){
-            dstPtr[i] = (float) src2.dot(src1.colRange(i*w,(i+1)*w));
-        }
-    }
-    else {
-        CV_Assert(dst.cols == dst.rows); //dst is square (and symmetric)
-        w = src2.cols/dst.cols;
-        Mat mat;
-        for (int i=0; i<dst.rows; i++){
-            mat = Mat(src1.colRange(i*w, (i+1)*w));
-            dstPtr[i*(dst.rows+1)] = (float) pow(norm(mat),2); //diagonal elements
-
-            for (int j=i+1; j<dst.cols; j++){ //j starts from i+1
-                dstPtr[i*dst.cols+j] = (float) mat.dot(src2.colRange(j*w, (j+1)*w));
-                dstPtr[j*dst.cols+i] = dstPtr[i*dst.cols+j]; //due to symmetry
-            }
-        }
-    }
 }
 
 static void update_warping_matrix_ECC(Mat& map_matrix, const Mat& update, const int motionType)
@@ -447,25 +281,6 @@ double findTransformECC(InputArray templateImage,
     const int wd = dst.cols;
     const int hd = dst.rows;
 
-    Mat Xcoord = Mat(1, ws, CV_32F);
-    Mat Ycoord = Mat(hs, 1, CV_32F);
-    Mat Xgrid = Mat(hs, ws, CV_32F);
-    Mat Ygrid = Mat(hs, ws, CV_32F);
-
-    float* XcoPtr = Xcoord.ptr<float>(0);
-    float* YcoPtr = Ycoord.ptr<float>(0);
-    int j;
-    for (j=0; j<ws; j++)
-        XcoPtr[j] = (float) j;
-    for (j=0; j<hs; j++)
-        YcoPtr[j] = (float) j;
-
-    repeat(Xcoord, hs, 1, Xgrid);
-    repeat(Ycoord, 1, ws, Ygrid);
-
-    Xcoord.release();
-    Ycoord.release();
-
     Mat templateZM    = Mat(hs, ws, CV_32F);// to store the (smoothed) zero-mean version of template
     Mat templateFloat = Mat(hs, ws, CV_32F);// to store the (smoothed) template
     Mat imageFloat    = Mat(hd, wd, CV_32F);// to store the (smoothed) input image
@@ -509,7 +324,6 @@ double findTransformECC(InputArray templateImage,
     Matx13f dx(-0.5f, 0.0f, 0.5f);
 
     // matrices needed for solving linear equation system for maximizing ECC
-    Mat jacobian                = Mat(hs, ws*numberOfParameters, CV_32F);
     Mat hessian                 = Mat(numberOfParameters, numberOfParameters, CV_32F);
     Mat hessianInv              = Mat(numberOfParameters, numberOfParameters, CV_32F);
     Mat imageProjection         = Mat(numberOfParameters, 1, CV_32F);
@@ -575,32 +389,19 @@ double findTransformECC(InputArray templateImage,
         const double tmpNorm = std::sqrt(countNonZero(imageMask)*(tmpStd.val[0])*(tmpStd.val[0]));
         const double imgNorm = std::sqrt(countNonZero(imageMask)*(imgStd.val[0])*(imgStd.val[0]));
 
-        // The fused path needs only the recombined gradients; building the
-        // jacobian is exactly the work it exists to avoid.
-        const bool fused = true;   // every motion type has a kernel now
-
-        // recombine warped-image gradients into image-domain gradients, then
-        // assemble the Jacobian of the image wrt the warp parameters
+        // recombine the warped-image gradients into image-domain gradients.
+        // Nothing further is assembled: the fused stage below consumes these
+        // four planes directly.
         switch (motionType){
             case MOTION_AFFINE:
-                warp_gradients_affine_ECC(imageWarpedGradientX, imageWarpedGradientY, map, gradientXWarped, gradientYWarped);
-                if (!fused)
-                    image_jacobian_affine_ECC(gradientXWarped, gradientYWarped, Xgrid, Ygrid, jacobian);
-                break;
             case MOTION_HOMOGRAPHY:
                 warp_gradients_affine_ECC(imageWarpedGradientX, imageWarpedGradientY, map, gradientXWarped, gradientYWarped);
-                if (!fused)
-                    image_jacobian_homo_ECC(gradientXWarped, gradientYWarped, Xgrid, Ygrid, map, jacobian);
                 break;
             case MOTION_TRANSLATION:
                 warp_gradients_translation_ECC(imageWarpedGradientX, imageWarpedGradientY, gradientXWarped, gradientYWarped);
-                if (!fused)
-                    image_jacobian_translation_ECC(gradientXWarped, gradientYWarped, jacobian);
                 break;
             case MOTION_EUCLIDEAN:
                 warp_gradients_euclidean_ECC(imageWarpedGradientX, imageWarpedGradientY, map, gradientXWarped, gradientYWarped);
-                if (!fused)
-                    image_jacobian_euclidean_ECC(gradientXWarped, gradientYWarped, Xgrid, Ygrid, map, jacobian);
                 break;
         }
 
@@ -639,10 +440,6 @@ double findTransformECC(InputArray templateImage,
             runFusedGN(acc, gradientXWarped, gradientYWarped, imageWarped, templateZM,
                        hessian, imageProjection, templateProjection);
         }
-        else
-        {
-            project_onto_jacobian_ECC(jacobian, jacobian, hessian);
-        }
         hessianInv = hessian.inv();
 
         const double correlation = templateZM.dot(imageWarped);
@@ -654,12 +451,6 @@ double findTransformECC(InputArray templateImage,
           CV_Error(Error::StsNoConv, "NaN encountered.");
         }
 
-        // project images into jacobian
-        if (!fused)
-        {
-            project_onto_jacobian_ECC( jacobian, imageWarped, imageProjection);
-            project_onto_jacobian_ECC(jacobian, templateZM, templateProjection);
-        }
 
         // calculate the parameter lambda to account for illumination variation
         imageProjectionHessian = hessianInv*imageProjection;
