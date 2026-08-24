@@ -32,9 +32,120 @@
 // pays indexed loads and stores (measured 0.67x against 1.11x for affine at
 // window 256, single thread).  They are generated, not hand-written.
 //
-// Affine and homography are here; translation and euclidean still go down the
-// jacobian path.
+// All four are here.  translation and euclidean gain least: with w = (1) their
+// Hessians have only 3 and 6 entries, so this stage is a small share of their
+// work to begin with.
 
+
+struct GNTranslation {
+    enum { P = 2 };
+
+    double H[3], VI[2], VT[2];
+    GNTranslation() { std::fill(H, H + 3, 0.0); std::fill(VI, VI + 2, 0.0); std::fill(VT, VT + 2, 0.0); }
+    void add(const GNTranslation& o) {
+        for (int i = 0; i < 3; ++i) H[i] += o.H[i];
+        for (int i = 0; i < 2; ++i) { VI[i] += o.VI[i]; VT[i] += o.VT[i]; }
+    }
+
+    void rows(const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,
+              int y0, int y1) {
+        const int w = gx.cols;
+        double t_m0_0 = 0, t_m1_0 = 0, t_m2_0 = 0;
+        double t_pi0 = 0, t_pi1 = 0, t_pt0 = 0, t_pt1 = 0;
+
+        for (int y = y0; y < y1; ++y) {
+            const float* pgx = gx.ptr<float>(y);
+            const float* pgy = gy.ptr<float>(y);
+            const float* pim = im.ptr<float>(y);
+            const float* ptm = tm.ptr<float>(y);
+            const float fy = (float)y;
+            float m0_0 = 0, m1_0 = 0, m2_0 = 0;
+            float pi0 = 0, pi1 = 0, pt0 = 0, pt1 = 0;
+
+            for (int x = 0; x < w; ++x) {
+                const float a = pgx[x], b = pgy[x];
+                const float uu0 = a * a, uu1 = a * b, uu2 = b * b;
+                m0_0 += uu0;
+                m1_0 += uu1;
+                m2_0 += uu2;
+                const float ii = pim[x], tt = ptm[x];
+                const float j0 = a;
+                const float j1 = b;
+                pi0 += j0 * ii;  pi1 += j1 * ii;
+                pt0 += j0 * tt;  pt1 += j1 * tt;
+            }
+
+            t_m0_0 += m0_0;  t_m1_0 += m1_0;  t_m2_0 += m2_0;
+            t_pi0 += pi0;  t_pi1 += pi1;  t_pt0 += pt0;  t_pt1 += pt1;
+        }
+
+        int n = 0;
+        H[n++] += t_m0_0;  H[n++] += t_m1_0;
+        H[n++] += t_m2_0;
+        VI[0] += t_pi0;  VI[1] += t_pi1;
+        VT[0] += t_pt0;  VT[1] += t_pt1;
+    }
+};
+
+struct GNEuclidean {
+    enum { P = 3 };
+    float h0, h1;
+    double H[6], VI[3], VT[3];
+    GNEuclidean() { std::fill(H, H + 6, 0.0); std::fill(VI, VI + 3, 0.0); std::fill(VT, VT + 3, 0.0); }
+    void add(const GNEuclidean& o) {
+        for (int i = 0; i < 6; ++i) H[i] += o.H[i];
+        for (int i = 0; i < 3; ++i) { VI[i] += o.VI[i]; VT[i] += o.VT[i]; }
+    }
+
+    void rows(const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,
+              int y0, int y1) {
+        const int w = gx.cols;
+        double t_m0_0 = 0, t_m1_0 = 0, t_m2_0 = 0, t_m3_0 = 0, t_m4_0 = 0, t_m5_0 = 0;
+        double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0;
+
+        for (int y = y0; y < y1; ++y) {
+            const float* pgx = gx.ptr<float>(y);
+            const float* pgy = gy.ptr<float>(y);
+            const float* pim = im.ptr<float>(y);
+            const float* ptm = tm.ptr<float>(y);
+            const float fy = (float)y;
+            // hatX, hatY are affine in (x, y): step them along the row
+            float hatX = -(0.f * h1) - (fy * h0);
+            float hatY =  (0.f * h0) - (fy * h1);
+            float m0_0 = 0, m1_0 = 0, m2_0 = 0, m3_0 = 0, m4_0 = 0, m5_0 = 0;
+            float pi0 = 0, pi1 = 0, pi2 = 0, pt0 = 0, pt1 = 0, pt2 = 0;
+
+            for (int x = 0; x < w; ++x) {
+                const float a = pgx[x], b = pgy[x];
+                const float r = a * hatX + b * hatY;
+                const float uu0 = r * r, uu1 = r * a, uu2 = r * b, uu3 = a * a, uu4 = a * b, uu5 = b * b;
+                m0_0 += uu0;
+                m1_0 += uu1;
+                m2_0 += uu2;
+                m3_0 += uu3;
+                m4_0 += uu4;
+                m5_0 += uu5;
+                const float ii = pim[x], tt = ptm[x];
+                const float j0 = r;
+                const float j1 = a;
+                const float j2 = b;
+                pi0 += j0 * ii;  pi1 += j1 * ii;  pi2 += j2 * ii;
+                pt0 += j0 * tt;  pt1 += j1 * tt;  pt2 += j2 * tt;
+                hatX -= h1;  hatY += h0;
+            }
+
+            t_m0_0 += m0_0;  t_m1_0 += m1_0;  t_m2_0 += m2_0;  t_m3_0 += m3_0;  t_m4_0 += m4_0;  t_m5_0 += m5_0;
+            t_pi0 += pi0;  t_pi1 += pi1;  t_pi2 += pi2;  t_pt0 += pt0;  t_pt1 += pt1;  t_pt2 += pt2;
+        }
+
+        int n = 0;
+        H[n++] += t_m0_0;  H[n++] += t_m1_0;  H[n++] += t_m2_0;
+        H[n++] += t_m3_0;  H[n++] += t_m4_0;
+        H[n++] += t_m5_0;
+        VI[0] += t_pi0;  VI[1] += t_pi1;  VI[2] += t_pi2;
+        VT[0] += t_pt0;  VT[1] += t_pt1;  VT[2] += t_pt2;
+    }
+};
 
 // ---- affine: K=2 L=3 P=6, 18 Gram sums + 12 projection sums ----
 struct GNAffine {
