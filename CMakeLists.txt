@@ -15,7 +15,10 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc video)
 set(FASTECC_CV opencv_core opencv_imgproc opencv_video)
 
 if(MSVC)
-  add_compile_options(/utf-8)   # sources are UTF-8 (avoids C4819 on Japanese locales)
+  add_compile_options(/utf-8)
+  if(FASTECC_VEC_REPORT)
+    add_compile_options(/Qvec-report:2)
+  endif()   # sources are UTF-8 (avoids C4819 on Japanese locales)
 endif()
 
 # --- the library -----------------------------------------------------------
