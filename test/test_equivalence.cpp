@@ -20,6 +20,14 @@
 //      default width and the sweep is checked for trend instead.)
 //   3. SEVERAL sub-pixel phases per case, averaged.  One alignment is one draw
 //      from a distribution whose spread is comparable to the quantity measured.
+//   4. a MARGIN of real data around the template.  The input is rendered from a
+//      source larger than the template, so the template's support in the input
+//      is surrounded by kMargin px of genuine content.  Without that, an input
+//      made by warping the template onto itself carries a zero-filled strip
+//      along two edges, the pre-filter smears it inward by gaussFiltSize/2, and
+//      the sweep ends up measuring how far each width's mask ring happens to
+//      sit from that strip rather than the estimator (affine at gauss 3 read
+//      0.23 px that way, 0.002 px with a margin).
 //
 // The tolerances below are roughly 3x the measured capability.  They are meant
 // to catch a real regression, not to be decoration: a 3x accuracy loss fails.
@@ -36,7 +44,8 @@ using namespace cv;
 
 namespace {
 
-const int    kSize       = 256;  // side of the square test image
+const int    kSize       = 256;  // side of the square template
+const int    kMargin     = 16;   // px of real data around the template's support
 const int    kPhases     = 8;    // sub-pixel phases averaged per case
 const int    kDefaultGauss = 5;  // where the absolute tolerance applies
 const double kVsCvSlack  = 1.6;  // fastecc may be this much worse than cv...
@@ -92,11 +101,14 @@ struct MotionCase {
     double      tolerancePx;  // absolute, against ground truth
 };
 
+// template coords -> input coords.  The nominal placement is the margin
+// translation; the motion to recover on top of it is (3, -2) px plus the
+// sub-pixel phase, and the linear part below.
 Mat groundTruth(int motion, double shiftX, double shiftY) {
     const int rows = (motion == MOTION_HOMOGRAPHY) ? 3 : 2;
     Mat W = Mat::eye(rows, 3, CV_32F);
-    W.at<float>(0, 2) = (float)(3.0 + shiftX);
-    W.at<float>(1, 2) = (float)(-2.0 + shiftY);
+    W.at<float>(0, 2) = (float)(kMargin + 3.0 + shiftX);
+    W.at<float>(1, 2) = (float)(kMargin - 2.0 + shiftY);
     if (motion == MOTION_EUCLIDEAN) {
         const double th = 0.4 * CV_PI / 180.0;
         W.at<float>(0,0) =  (float)std::cos(th); W.at<float>(0,1) = -(float)std::sin(th);
@@ -116,14 +128,18 @@ Mat groundTruth(int motion, double shiftX, double shiftY) {
 }  // namespace
 
 int main() {
-    const Mat templ = syntheticImage(kSize);
+    const Mat source = syntheticImage(kSize + 2 * kMargin);
+    const Mat templ  = source(Rect(kMargin, kMargin, kSize, kSize)).clone();
     const TermCriteria crit(TermCriteria::COUNT + TermCriteria::EPS, 100, 1e-6);
 
     const MotionCase cases[] = {
+        // ~3x what the margin test measures (0.016 / 0.002 / 0.0036 / 0.005 px
+        // at gauss 5; translation sits on the 1/32 px coordinate quantisation
+        // of OpenCV's bilinear warp, the others below it)
         {MOTION_TRANSLATION, "TRANSLATION", 0.05},
-        {MOTION_EUCLIDEAN,   "EUCLIDEAN",   0.05},
-        {MOTION_AFFINE,      "AFFINE",      0.12},
-        {MOTION_HOMOGRAPHY,  "HOMOGRAPHY",  0.15},
+        {MOTION_EUCLIDEAN,   "EUCLIDEAN",   0.006},
+        {MOTION_AFFINE,      "AFFINE",      0.012},
+        {MOTION_HOMOGRAPHY,  "HOMOGRAPHY",  0.015},
     };
     const int gaussSizes[] = {3, 5, 9};
     const int kNGauss = 3;
@@ -147,16 +163,28 @@ int main() {
                 const double sx = rng.uniform(-0.5, 0.5), sy = rng.uniform(-0.5, 0.5);
                 const Mat Wgt = groundTruth(c.motion, sx, sy);
 
+                // I(p) = S(W^-1 p + margin), so that I(W x) = S(x + margin) = T(x)
+                Mat W3 = Mat::eye(3, 3, CV_64F);
+                Wgt.convertTo(W3.rowRange(0, Wgt.rows), CV_64F);
+                Mat shift = Mat::eye(3, 3, CV_64F);
+                shift.at<double>(0, 2) = kMargin;
+                shift.at<double>(1, 2) = kMargin;
+                Mat M = shift * W3.inv();
                 Mat input;
                 if (c.motion != MOTION_HOMOGRAPHY) {
-                    warpAffine(templ, input, Wgt, templ.size(), INTER_LINEAR);
+                    warpAffine(source, input, M.rowRange(0, 2), source.size(),
+                               INTER_LINEAR + WARP_INVERSE_MAP);
                 } else {
-                    warpPerspective(templ, input, Wgt, templ.size(), INTER_LINEAR);
+                    warpPerspective(source, input, M, source.size(),
+                                    INTER_LINEAR + WARP_INVERSE_MAP);
                 }
 
+                // start from the nominal placement: the margin translation only
                 const int rows = (c.motion == MOTION_HOMOGRAPHY) ? 3 : 2;
                 Mat Wcv   = Mat::eye(rows, 3, CV_32F);
-                Mat Wfast = Mat::eye(rows, 3, CV_32F);
+                Wcv.at<float>(0, 2) = kMargin;
+                Wcv.at<float>(1, 2) = kMargin;
+                Mat Wfast = Wcv.clone();
                 double rho = 0;
                 try {
                     cv::findTransformECC(templ, input, Wcv, c.motion, crit, noArray(), gauss);
