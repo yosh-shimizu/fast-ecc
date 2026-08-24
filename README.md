@@ -116,12 +116,14 @@ OpenCV 4.15.0-dev built with the border fix applied.
 ## Reports
 
 The measurements behind each change, in more depth than the table above, are in
-[`docs/reports/`](docs/reports/index.html) (written in Japanese):
+[`docs/reports/`](docs/reports/index.html):
 
-- **warp 削減の解説** — how the three warps become one
-- **warp 削減 × 境界修正** — why the speed-up decays at large windows with a thread
-  pool, and the `gaussFiltSize` re-optimisation
-- **ガウス・ニュートン段の融合** — the next change, measured but not yet committed
+- **Reducing the warps per iteration** — how three warps become one, and why it is
+  allowed
+- **The warp reduction against the border fix** — why the speed-up decays at large
+  windows with a thread pool, and the `gaussFiltSize` re-tuning
+- **Fusing the Gauss–Newton stage** — the change queued next, measured but not yet
+  committed
 
 ## Why the warp reduction is faster
 
