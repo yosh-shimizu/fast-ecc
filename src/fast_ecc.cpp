@@ -57,6 +57,7 @@
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 using namespace cv;
 
@@ -145,6 +146,64 @@ static void recombination(const Mat& map, int motionType, float r[4])
         r[0] = a; r[1] = b;
         r[2] = c; r[3] = d;
     }
+}
+
+// Under an empty input mask, preMask is the rectangle [2, wd-3] x [2, hd-3]
+// and its nearest-neighbour warp is the set of template pixels whose rounded
+// warped coordinate lands in that rectangle.  Along a row that set is an
+// interval, for an affine warp and for a projective one with a positive
+// denominator alike, so it can be solved for instead of resampled: two
+// bounds per constraint, four constraints, per row.  The ring of the
+// template border is applied at the same time.  Returns false when the
+// projective denominator changes sign along some row, in which case the
+// caller falls back to the warp.
+static bool analyticMask(Mat& mask, const Mat& map, int motionType, int wd, int hd, int ring)
+{
+    CV_Assert(mask.type() == CV_8UC1 && map.isContinuous());
+    const int hs = mask.rows, ws = mask.cols;
+    const bool homography = motionType == MOTION_HOMOGRAPHY;
+    const float* m = map.ptr<float>(0);
+    const double a0 = m[0], a1 = m[1], a2 = m[2];
+    const double a3 = m[3], a4 = m[4], a5 = m[5];
+    const double a6 = homography ? m[6] : 0.0;
+    const double a7 = homography ? m[7] : 0.0;
+    const double a8 = homography ? m[8] : 1.0;
+    // round(x') in [2, wd-3]  <=>  1.5 <= x' < wd-2.5, and the same for y'
+    const double xlo = 1.5, xhi = wd - 2.5, ylo = 1.5, yhi = hd - 2.5;
+    const double eps = 1e-12;
+
+    for (int y = 0; y < hs; ++y) {
+        uchar* row = mask.ptr<uchar>(y);
+        if (y < ring || y >= hs - ring) { std::memset(row, 0, ws); continue; }
+        const double bx = a1 * y + a2, by = a4 * y + a5, dy = a7 * y + a8;
+        // each constraint is  p*x + q >= 0  (or > 0); keep [lo, hi)
+        double lo = ring, hi = ws - ring;
+        bool empty = false;
+        const double P[5] = { a0 - xlo * a6, -(a0 - xhi * a6), a3 - ylo * a6, -(a3 - yhi * a6), a6 };
+        const double Q[5] = { bx - xlo * dy, -(bx - xhi * dy), by - ylo * dy, -(by - yhi * dy), dy };
+        if (homography) {
+            // the denominator must stay positive across the row we keep
+            const double d0 = a6 * lo + dy, d1 = a6 * (hi - 1) + dy;
+            if (d0 <= 0.0 || d1 <= 0.0) {
+                if (d0 <= 0.0 && d1 <= 0.0) { std::memset(row, 0, ws); continue; }
+                return false;
+            }
+        }
+        for (int k = 0; k < (homography ? 5 : 4); ++k) {
+            const double pk = P[k], qk = Q[k];
+            if (pk > eps)       lo = std::max(lo, -qk / pk);
+            else if (pk < -eps) hi = std::min(hi, -qk / pk);
+            else if (qk < 0.0)  { empty = true; break; }
+        }
+        int x0 = empty ? ws : (int)std::ceil(lo - 1e-9);
+        int x1 = empty ? ws : (int)std::ceil(hi - 1e-9);
+        x0 = std::max(ring, std::min(ws - ring, x0));
+        x1 = std::max(x0, std::min(ws - ring, x1));
+        std::memset(row, 0, x0);
+        std::memset(row + x0, 1, x1 - x0);
+        std::memset(row + x1, 0, ws - x1);
+    }
+    return true;
 }
 
 #include "gn_fused.inc"
@@ -338,35 +397,37 @@ double findTransformECC(InputArray templateImage,
     double last_rho = - termination_eps;
     for (int i = 1; (i <= numberOfIterations) && (fabs(rho-last_rho)>= termination_eps); i++)
     {
-        // Warp-back ONLY the image (and the mask).  The gradient images are NOT
-        // warped: we take gradients of the warped image and recombine them with
-        // the warp's linear part inside the fused pass.  This removes two warps
-        // per iteration.
+        // Warp-back ONLY the image.  The gradient images are NOT warped: we
+        // take gradients of the warped image and recombine them with the
+        // warp's linear part inside the fused pass.  This removes two warps
+        // per iteration; the mask below removes a third when it can be solved
+        // for instead.
         if (motionType != MOTION_HOMOGRAPHY)
-        {
             warpAffine(imageFloat, imageWarped, map, imageWarped.size(), imageFlags);
-            warpAffine(preMask,    imageMask,   map, imageMask.size(),   maskFlags);
-        }
         else
-        {
             warpPerspective(imageFloat, imageWarped, map, imageWarped.size(), imageFlags);
-            warpPerspective(preMask,    imageMask,   map, imageMask.size(),   maskFlags);
-        }
-        imageMask.row(0).setTo(0); imageMask.row(imageMask.rows - 1).setTo(0);
-        imageMask.col(0).setTo(0); imageMask.col(imageMask.cols - 1).setTo(0);
 
         // The Gaussian pre-filter above extrapolated the template border
         // (BORDER_REFLECT_101), so a ring of gaussFiltSize/2 px of
         // templateFloat is fabricated rather than measured.  Used at full
         // weight it biases the estimated linear part toward a smaller scale.
-        // Drop it, the same way opencv#29775 does in ecc.cpp.  The single
-        // row/column above already covers a ring of 1.
-        const int blurRing = gaussFiltSize / 2;
-        if (blurRing > 1 && imageMask.rows > 2*blurRing && imageMask.cols > 2*blurRing) {
-            imageMask.rowRange(0, blurRing).setTo(0);
-            imageMask.rowRange(imageMask.rows - blurRing, imageMask.rows).setTo(0);
-            imageMask.colRange(0, blurRing).setTo(0);
-            imageMask.colRange(imageMask.cols - blurRing, imageMask.cols).setTo(0);
+        // Drop it, the same way opencv#29775 does in ecc.cpp; a ring of 1
+        // (the border row/column) is dropped in any case.
+        const int ring = (imageMask.rows > gaussFiltSize && imageMask.cols > gaussFiltSize)
+                         ? std::max(1, gaussFiltSize / 2) : 1;
+
+        // The mask: solved for when there is no user mask (see analyticMask),
+        // warped like the image otherwise.
+        if (!(inputMask.empty() && analyticMask(imageMask, map, motionType, wd, hd, ring)))
+        {
+            if (motionType != MOTION_HOMOGRAPHY)
+                warpAffine(preMask, imageMask, map, imageMask.size(), maskFlags);
+            else
+                warpPerspective(preMask, imageMask, map, imageMask.size(), maskFlags);
+            imageMask.rowRange(0, ring).setTo(0);
+            imageMask.rowRange(imageMask.rows - ring, imageMask.rows).setTo(0);
+            imageMask.colRange(0, ring).setTo(0);
+            imageMask.colRange(imageMask.cols - ring, imageMask.cols).setTo(0);
         }
 
         // gradients of the WARPED image (chain rule: d/dx[I(W(x))] = J_W^T grad(I)).
