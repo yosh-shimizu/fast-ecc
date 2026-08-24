@@ -50,11 +50,12 @@
 </a>
 
 <a class="card" href="gauss-newton-fusion.html">
-  <h2>Fusing the Gauss–Newton stage<span class="tag plan">measured, not yet committed</span></h2>
+  <h2>Fusing the Gauss–Newton stage<span class="tag">landed</span></h2>
   <p>Building the Hessian and the projections in one pass, without ever materialising
   the Jacobian. Shows that all four motion types are a column subset of the same
   face-splitting product <code>u ⊗ w</code>, and that the saving grows with the
-  parameter count — 2.47× for homography at window 768 on four threads.</p>
+  parameter count. In this repository it took homography from 1.21× to 3.19× against
+  a border-fixed OpenCV.</p>
 </a>
 
 <p class="note">

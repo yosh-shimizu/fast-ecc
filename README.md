@@ -45,7 +45,7 @@ the numbers below are taken against a corrected OpenCV baseline.
 | Warp reduction (3 warps → 1 per iteration) | landed |
 | Gaussian pre-filter border fix | landed ([opencv#29775](https://github.com/opencv/opencv/pull/29775) ported) |
 | Accuracy test with a criterion that can fail | landed |
-| Fused Gauss–Newton stage | measured, not yet committed |
+| Fused Gauss–Newton stage, all four motion types | landed |
 
 ### What was wrong, and how it is guarded now
 
@@ -78,6 +78,11 @@ is bias:
 | `cv::findTransformECC` (fixed) | 0.0017 px | +8.7e-07 (1.3) |
 | `fastecc::findTransformECC` | 0.0017 px | +8.7e-07 (1.3) |
 
+The fused Gauss–Newton stage does not move these: it is the same algebra evaluated in
+a different order. Convergence counts over 150 trials at five deformation steps match
+`cv` exactly for translation and affine, and differ by one or two borderline trials
+out of 150 for euclidean and homography.
+
 Statistically indistinguishable, and neither shows a systematic bias. Before the
 border fix this fork sat at 0.0287 px with a −1.8e−04 (t = −63.9) scale bias at
 `gaussFiltSize=9`.
@@ -85,30 +90,37 @@ border fix this fork sat at 0.0287 px with a −1.8e−04 (t = −63.9) scale bi
 **Accuracy is equal, not better.** Which of the two resampling orders is closer to
 ground truth remains unsettled — see [Not bit-identical](#not-bit-identical-to-opencv).
 
-### Speed — the warp reduction
+### Speed
 
-Cost of one iteration, affine, analytic scene, best of 3 runs:
+Cost of one iteration, affine, analytic scene, best of 3 runs, against a
+border-fixed OpenCV:
 
 | window | 4 threads | 1 thread |
 |---:|---:|---:|
-| 256 | **1.32×** | **1.32×** |
-| 512 | 1.14× | 1.28× |
-| 768 | 1.10× | 1.25× |
+| 256 | **1.80×** | 1.35× |
+| 512 | 1.68× | 1.38× |
+| 768 | **1.90×** | 1.56× |
 
-On a single thread the gain is flat across the range. With a thread pool it decays,
-because OpenCV parallelises the `warpAffine` this change removes but not the
-`filter2D`/`addWeighted` that replace it. See
-[Why the warp reduction is faster](#why-the-warp-reduction-is-faster).
+Two changes contribute, and they cover each other. The **warp reduction** takes the
+three bilinear warps per iteration down to one; it pays most at small windows and
+decays to nothing at large ones with a thread pool, because OpenCV parallelises the
+`warpAffine` it removes but not the `filter2D`/`addWeighted` that replace it. The
+**fused Gauss–Newton stage** does the opposite: it builds the Hessian and both
+projections in one pass without materialising the Jacobian, and the saving grows with
+the parameter count, so it is largest exactly where the warp reduction has given up.
 
-The bundled `./build/bench` (512×512, default thread count) agrees, and shows the
-per-motion spread:
+The bundled `./build/bench` (512×512, default thread count) shows the per-motion
+spread, and how much of it is the fused stage:
 
-| motion | cv | fast | speedup |
-|---|---:|---:|---:|
-| TRANSLATION | 22.5 ms | 14.7 ms | 1.53× |
-| EUCLIDEAN | 33.9 ms | 31.9 ms | 1.06× |
-| AFFINE | 44.4 ms | 39.9 ms | 1.11× |
-| HOMOGRAPHY | 114.9 ms | 93.3 ms | 1.23× |
+| motion | cv | fast | speedup | before fusion |
+|---|---:|---:|---:|---:|
+| TRANSLATION | 24.3 ms | 15.2 ms | 1.62× | 1.09× |
+| EUCLIDEAN | 38.2 ms | 20.6 ms | 1.92× | 1.06× |
+| AFFINE | 47.9 ms | 24.8 ms | 1.93× | 1.11× |
+| HOMOGRAPHY | 130.5 ms | 41.5 ms | **3.15×** | 1.21× |
+
+Homography gains most because the Jacobian path re-reads its blocks P² times for the
+Gram matrix, and P = 8.
 
 Measured on an Intel Core i7-8700K (6C/12T), Windows 11, MSVC, Release, against
 OpenCV 4.15.0-dev built with the border fix applied.
@@ -122,8 +134,8 @@ The measurements behind each change, in more depth than the table above, are in
   allowed
 - **The warp reduction against the border fix** — why the speed-up decays at large
   windows with a thread pool, and the `gaussFiltSize` re-tuning
-- **Fusing the Gauss–Newton stage** — the change queued next, measured but not yet
-  committed
+- **Fusing the Gauss–Newton stage** — why all four motion types are the same
+  face-splitting product, and why the saving grows with the parameter count
 
 ## Why the warp reduction is faster
 
@@ -141,10 +153,12 @@ gradient warps per iteration disappear.
 | `cv::findTransformECC` | 1 | 2 | 1 |
 | `fastecc::findTransformECC` | 1 | **0** (filter2D + addWeighted) | 1 |
 
-The gain is **not** uniform. It is largest at small windows and on a single thread, and
-falls to break-even at large windows with a thread pool — because OpenCV parallelises
-`warpAffine` above roughly 384 px but not the `filter2D`/`addWeighted` that replace it.
-Any speed figure quoted without a window size and a thread count is meaningless.
+The gain from *this* change is **not** uniform. It is largest at small windows and on a
+single thread, and falls to break-even at large windows with a thread pool — because
+OpenCV parallelises `warpAffine` above roughly 384 px but not the
+`filter2D`/`addWeighted` that replace it. That region is covered by the fused
+Gauss–Newton stage instead. Any speed figure quoted without a window size and a thread
+count is meaningless.
 
 ### The math
 
