@@ -14,8 +14,15 @@ endif()
 find_package(OpenCV REQUIRED COMPONENTS core imgproc video)
 set(FASTECC_CV opencv_core opencv_imgproc opencv_video)
 
+# A bilinear warp that does not quantise the sampling coordinate, and a
+# vectoriser diagnostic.  Both off by default; see src/warp_exact.inc.
+option(FASTECC_EXACT_WARP "Use a non-quantising bilinear warp" OFF)
+
 if(MSVC)
-  add_compile_options(/utf-8)   # sources are UTF-8 (avoids C4819 on Japanese locales)
+  add_compile_options(/utf-8)
+  if(FASTECC_VEC_REPORT)
+    add_compile_options(/Qvec-report:2)
+  endif()   # sources are UTF-8 (avoids C4819 on Japanese locales)
 endif()
 
 # --- the library -----------------------------------------------------------
@@ -24,6 +31,9 @@ target_include_directories(fast_ecc PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(fast_ecc PUBLIC ${FASTECC_CV})
+if(FASTECC_EXACT_WARP)
+  target_compile_definitions(fast_ecc PRIVATE FASTECC_EXACT_WARP)
+endif()
 target_include_directories(fast_ecc PUBLIC ${OpenCV_INCLUDE_DIRS})
 
 # --- tools (optional) ------------------------------------------------------

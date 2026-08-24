@@ -130,6 +130,10 @@ static void warp_gradients_affine_ECC(
     }
 }
 
+#ifdef FASTECC_EXACT_WARP
+#include "warp_exact.inc"
+#endif
+
 #include "gn_fused.inc"
 
 static void warp_gradients_translation_ECC(
@@ -346,12 +350,20 @@ double findTransformECC(InputArray templateImage,
         // the warp's linear part below.  This removes two warps per iteration.
         if (motionType != MOTION_HOMOGRAPHY)
         {
+#ifdef FASTECC_EXACT_WARP
+            warpExactBilinear(imageFloat, imageWarped, map, false);
+#else
             warpAffine(imageFloat, imageWarped, map, imageWarped.size(), imageFlags);
+#endif
             warpAffine(preMask,    imageMask,   map, imageMask.size(),   maskFlags);
         }
         else
         {
+#ifdef FASTECC_EXACT_WARP
+            warpExactBilinear(imageFloat, imageWarped, map, true);
+#else
             warpPerspective(imageFloat, imageWarped, map, imageWarped.size(), imageFlags);
+#endif
             warpPerspective(preMask,    imageMask,   map, imageMask.size(),   maskFlags);
         }
         imageMask.row(0).setTo(0); imageMask.row(imageMask.rows - 1).setTo(0);
