@@ -777,6 +777,63 @@ Second, the ordering of the motion types by gain is the same here as in the harn
 prediction of section 4.3 holding in a second implementation.
 </div>
 
+<h3>6.6 Hoisting the row-invariant columns</h3>
+
+<p>Within one row <span class="m">fy</span> is constant, so for any per-pixel quantity
+<span class="m">u</span></p>
+
+<div class="eq tight">
+<math display="block"><mrow>
+  <munder><mo>&sum;</mo><mi>x</mi></munder><mi>u</mi><msup><mi>fy</mi><mn>2</mn></msup>
+  <mo>=</mo><msup><mi>fy</mi><mn>2</mn></msup>
+  <munder><mo>&sum;</mo><mi>x</mi></munder><mi>u</mi>
+  <mspace width="2.2em"/>
+  <munder><mo>&sum;</mo><mi>x</mi></munder><mi>u</mi><mi>fy</mi>
+  <mo>=</mo><mi>fy</mi><munder><mo>&sum;</mo><mi>x</mi></munder><mi>u</mi>
+</mrow></math>
+<span class="cm">so the <span class="m">w</span> = y&sup2; and <span class="m">w</span> = y
+columns are the <span class="m">w</span> = 1 column scaled.</span>
+</div>
+
+<p>They do not have to be accumulated per pixel at all. Only the
+<span class="m">w</span> = 1 column is summed in the loop; the other two are formed from
+it once per row. That is exact, and it removes arithmetic and live accumulators at the
+same time:</p>
+
+<div class="tw"><table>
+<thead><tr><th>motion</th><th>accumulators</th><th>ops per pixel</th></tr></thead>
+<tbody>
+<tr><td>affine</td><td>30 &rarr; <b>20</b></td><td>40 &rarr; <b>30</b></td></tr>
+<tr><td>homography</td><td>52 &rarr; <b>36</b></td><td>&mdash;</td></tr>
+<tr><td>translation / euclidean</td><td colspan="2">no row-invariant columns: <span class="m">w</span> = (1)</td></tr>
+</tbody></table></div>
+
+<p>This came out of asking whether the stage is limited by its accumulator count before
+writing any explicit SIMD. It is: splitting the kernel into two passes with fewer live
+sums in each beats the single pass by <b>1.07&ndash;1.10&times;</b> even though it reads
+every plane twice. Hoisting is the better answer to the same problem, because it eases
+the pressure without paying for a second pass.</p>
+
+<div class="tw"><table>
+<thead><tr><th>window</th><th>256</th><th>512</th><th>768</th><th>1024</th></tr></thead>
+<tbody>
+<tr><td>before</td><td>0.611</td><td>2.566</td><td>5.709</td><td>10.515 ms</td></tr>
+<tr><td>after</td><td>0.389</td><td>1.595</td><td>3.639</td><td>6.510 ms</td></tr>
+<tr><td>ratio</td><td class="best">1.57&times;</td><td class="best">1.61&times;</td><td class="best">1.57&times;</td><td class="best">1.62&times;</td></tr>
+</tbody></table></div>
+
+<p>Single thread, median of 11, <code>eval/accbench.cpp</code>. More than the
+1.33&times; the op count alone predicts, which is the register pressure easing on top.</p>
+
+<div class="note">
+<b>End to end it is much smaller, and the difference is worth stating plainly.</b>
+After fusion this stage is no longer most of an iteration, so 1.6&times; on the stage is
+1.07&ndash;1.12&times; on the whole call: affine 24.8 &rarr; 22.1 ms, homography 40.8
+&rarr; 38.3 ms at 512&times;512. A stage-level ratio is not a library-level ratio, and
+quoting the first as the second is how the accuracy claim in this project went wrong
+once already.
+</div>
+
 <h2>7. What was tried and did not work</h2>
 
 <h3>7.1 <code>gemm</code> makes it worse</h3>
@@ -801,7 +858,7 @@ prediction of section 4.3 holding in a second implementation.
 
 <ul>
 <li><b>Generating <span class="m">x</span>, <span class="m">y</span> in place buys nothing measurable.</b> An earlier version of this section listed it as future work, estimating that six input planes becoming four would cut traffic by about a third. The kernels have in fact always taken the coordinates from the loop counters, and the estimate turned out not to matter: measured against an otherwise identical kernel that reads two coordinate planes, the difference is <b>0.94x to 1.07x</b> across windows 128 to 1024 and 1, 4 and 12 threads &mdash; noise, with no systematic sign. The traffic estimate was right and the conclusion drawn from it was wrong: at roughly 40 operations per pixel this stage is compute-bound, not bandwidth-bound. Even at window 1024 on 12 threads it moves 24 B/px in 2.9 ns/px, about 8 GB/s, nowhere near saturation, so two more sequential streams disappear behind the prefetcher. What the in-place generation does buy is not throughput but footprint: two full-size float planes never allocated, 8 MB at window 1024. Measured by <code>eval/coordbench.cpp</code>.</li>
-<li><b>Explicit SIMD.</b>Auto-vectorisation is doing the work at the moment. Thirty accumulators do not fit in sixteen YMM registers, so they spill to L1. Blocking should help.</li>
+<li><b>Explicit SIMD.</b> Auto-vectorisation is doing the work at the moment, and it reaches roughly one operation per cycle &mdash; about 10 ns per pixel at window 1024 on one thread, against the 16 flops per cycle an AVX2 machine can retire. The premise for it is now measured rather than assumed: the accumulator table does limit the stage (see 6.6). But hoisting has already taken affine to 20 live accumulators and homography to 36, so the pressure this would relieve is smaller than it was, and the gain has to be re-measured before it is worth writing. Not attempted.</li>
 <li><b>Homography is implemented, and it gained the most.</b>The first version of this report said here that the per-pixel division stops it being a face-splitting product. That was wrong. The division folds into the gradient side (4.3), and OpenCV's own <code>image_jacobian_homo_ECC</code> is already in that form. <span class="m">P</span> = 8 has the most headroom, and measures <b>2.47×</b> at window 768 on four threads -- the best of all four motion types.</li>
 <li><b>translation and euclidean are implemented too, but gain little.</b>
 <math><mrow><mi>w</mi><mo>=</mo><mo>(</mo><mn>1</mn><mo>)</mo></mrow></math> means the Hessian has only 3 or 6 entries, so this stage is a small share of the work. Window 768 on four threads: 1.27x and 1.88x. Euclidean still gets close to affine (2.00x) because building <math><msub><mi>g</mi><mi>r</mi></msub></math> folds into the same pass.</li>
