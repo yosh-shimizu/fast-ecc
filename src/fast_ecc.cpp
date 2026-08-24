@@ -222,6 +222,8 @@ static void warp_gradients_affine_ECC(
     }
 }
 
+#include "gn_fused.inc"
+
 static void image_jacobian_affine_ECC(const Mat& src1, const Mat& src2,
                                       const Mat& src3, const Mat& src4,
                                       Mat& dst)
@@ -573,12 +575,17 @@ double findTransformECC(InputArray templateImage,
         const double tmpNorm = std::sqrt(countNonZero(imageMask)*(tmpStd.val[0])*(tmpStd.val[0]));
         const double imgNorm = std::sqrt(countNonZero(imageMask)*(imgStd.val[0])*(imgStd.val[0]));
 
+        // The fused path needs only the recombined gradients; building the
+        // jacobian is exactly the work it exists to avoid.
+        const bool fused = (motionType == MOTION_AFFINE);
+
         // recombine warped-image gradients into image-domain gradients, then
         // assemble the Jacobian of the image wrt the warp parameters
         switch (motionType){
             case MOTION_AFFINE:
                 warp_gradients_affine_ECC(imageWarpedGradientX, imageWarpedGradientY, map, gradientXWarped, gradientYWarped);
-                image_jacobian_affine_ECC(gradientXWarped, gradientYWarped, Xgrid, Ygrid, jacobian);
+                if (!fused)
+                    image_jacobian_affine_ECC(gradientXWarped, gradientYWarped, Xgrid, Ygrid, jacobian);
                 break;
             case MOTION_HOMOGRAPHY:
                 warp_gradients_affine_ECC(imageWarpedGradientX, imageWarpedGradientY, map, gradientXWarped, gradientYWarped);
@@ -594,8 +601,18 @@ double findTransformECC(InputArray templateImage,
                 break;
         }
 
-        // calculate Hessian and its inverse
-        project_onto_jacobian_ECC(jacobian, jacobian, hessian);
+        // The Gram matrix and both projections come out of a single pass over
+        // the gradients, with no jacobian materialised.  Only affine so far.
+        if (fused)
+        {
+            GNAffine acc;
+            runFusedGN(acc, gradientXWarped, gradientYWarped, imageWarped, templateZM,
+                       hessian, imageProjection, templateProjection);
+        }
+        else
+        {
+            project_onto_jacobian_ECC(jacobian, jacobian, hessian);
+        }
         hessianInv = hessian.inv();
 
         const double correlation = templateZM.dot(imageWarped);
@@ -608,8 +625,11 @@ double findTransformECC(InputArray templateImage,
         }
 
         // project images into jacobian
-        project_onto_jacobian_ECC( jacobian, imageWarped, imageProjection);
-        project_onto_jacobian_ECC(jacobian, templateZM, templateProjection);
+        if (!fused)
+        {
+            project_onto_jacobian_ECC( jacobian, imageWarped, imageProjection);
+            project_onto_jacobian_ECC(jacobian, templateZM, templateProjection);
+        }
 
         // calculate the parameter lambda to account for illumination variation
         imageProjectionHessian = hessianInv*imageProjection;
