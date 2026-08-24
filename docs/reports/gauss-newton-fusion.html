@@ -97,7 +97,7 @@
     <p>Homography, window 512, four threads, combined with the warp reduction. At four threads it is 1.40-2.89x regardless of window or motion type. Accuracy and convergence radius are numerically unchanged.</p></div>
 </div>
 
-<div class="note"> This is an optimisation <b>still under review</b>. Numerical equivalence -- matching accuracy, bias and convergence counts -- is <b>confirmed for all four motion types</b>, but it has not been submitted upstream. </div>
+<div class="note"> <b>Landed in fast-ecc</b> for all four motion types, in commits <code>d17db7b</code> (affine), <code>cc97d79</code> (homography) and <code>a1fc282</code> (translation, euclidean); the now-unreachable jacobian path was deleted in <code>0c9416b</code>. Numerical equivalence -- matching accuracy, bias and convergence counts -- is confirmed for all four. Not submitted upstream: the three-line identity of section 3 could go on its own, but sections 4 and 5 bring a new kernel and belong in a separate proposal. </div>
 
 <h2>1. What one ECC iteration computes</h2>
 
@@ -745,6 +745,36 @@ errorProjection = lambda*templateProjection - imageProjection;</pre>
 <li><b>The claim in 4 that the diagonal only needs <code>dot</code> turned out to be worthless.</b>0.96-1.04x -- inside measurement noise, and it <b>sometimes goes negative</b> . It brings nothing but complexity, so it is not adopted.</li>
 <li><b>The parallelism in 5 pays only when <span class="m">P</span> is large.</b> 1.20-1.29x for affine and homography, 1.03-1.10x for translation and euclidean. The two motion types with <math><mrow><mi>w</mi><mo>=</mo><mo>(</mo><mn>1</mn><mo>)</mo></mrow></math> have little projection work to begin with. On a single thread all of them fall to 0.96-1.04x, as they must.</li>
 </ul> The product of the parts (<code>C1+C2+C3</code> measures 1.05-1.44x) does not reach the whole (1.07-2.50x). <b>Most of what fusion gains comes from not materialising the Jacobian, rather than from adding up the parts.</b>
+</div>
+
+<h3>6.5 As landed in fast-ecc</h3>
+
+<p>The measurements above come from <code>eval/uni_ecc.cpp</code>, where the change is a
+runtime flag on one body so that it can be compared against the unfused path in the same
+binary. The numbers below are from the shipped implementation instead, measured with
+<code>./build/bench</code> on a 512x512 synthetic image against a
+<a href="https://github.com/opencv/opencv/pull/29775">border-fixed</a> OpenCV.</p>
+
+<div class="tw"><table>
+<thead><tr><th>motion</th><th>cv</th><th>fast</th><th>speed-up</th><th>before fusion</th><th>corner RMS</th></tr></thead>
+<tbody>
+<tr><td>translation</td><td>24.9 ms</td><td>13.7 ms</td><td class="best">1.82&times;</td><td>1.09&times;</td><td>0.0100 px</td></tr>
+<tr><td>euclidean</td><td>36.5 ms</td><td>19.8 ms</td><td class="best">1.84&times;</td><td>1.06&times;</td><td>0.0069 px</td></tr>
+<tr><td>affine</td><td>51.7 ms</td><td>25.4 ms</td><td class="best">2.04&times;</td><td>1.11&times;</td><td>0.0192 px</td></tr>
+<tr><td>homography</td><td>130.3 ms</td><td>40.8 ms</td><td class="best">3.19&times;</td><td>1.21&times;</td><td>0.0351 px</td></tr>
+</tbody></table></div>
+
+<p>The corner RMS column is unchanged by the fusion to every digit printed, which is the
+claim that matters: this is the same algebra evaluated in a different order.</p>
+
+<div class="good-note">
+Two things the harness numbers do not show. First, deleting the jacobian path took
+<b>212 lines</b> out of the implementation along with the
+<span class="m">hs</span> &times; (<span class="m">ws</span>&middot;<span class="m">P</span>)
+buffer and the two full-size coordinate planes, which the fused kernels never read.
+Second, the ordering of the motion types by gain is the same here as in the harness
+(<span class="m">P</span> = 2, 3, 6, 8 giving 1.82, 1.84, 2.04, 3.19), which is the
+prediction of section 4.3 holding in a second implementation.
 </div>
 
 <h2>7. What was tried and did not work</h2>
