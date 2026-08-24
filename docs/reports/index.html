@@ -6,8 +6,7 @@
   :root{--bg:#0f1420;--fg:#dfe6f2;--muted:#9aa7bd;--line:#27314a;--accent:#5aa9ff;--good:#37d39b}
   *{box-sizing:border-box}
   body{margin:0;padding:48px 20px 72px;background:var(--bg);color:var(--fg);
-       font:16px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,
-            "Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif}
+       font:16px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
   main{max-width:820px;margin:0 auto}
   h1{font-size:28px;margin:0 0 6px;letter-spacing:.01em}
   .sub{color:var(--muted);font-size:14px;margin:0 0 34px}
@@ -23,46 +22,52 @@
   .tag.plan{color:#ffc861;border-color:#5a4a24}
   .note{border-left:3px solid var(--line);padding:2px 0 2px 16px;color:var(--muted);
         font-size:13.5px;margin:30px 0 0}
+  code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+       background:#1b2334;border:1px solid var(--line);border-radius:4px;padding:1px 5px}
   footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);
          color:var(--muted);font-size:13px}
 </style>
 <main>
 <h1>fast-ecc — experiment reports</h1>
-<p class="sub">Measurements behind the changes in
-<a href="https://github.com/yosh-shimizu/fast-ecc">yosh-shimizu/fast-ecc</a>.
-Written in Japanese.</p>
+<p class="sub">The measurements behind the changes in
+<a href="https://github.com/yosh-shimizu/fast-ecc">yosh-shimizu/fast-ecc</a>.</p>
 
 <a class="card" href="warp-reduction.html">
-  <h2>warp 削減の解説<span class="tag">landed</span></h2>
-  <p>1 反復あたり 3 回の bilinear warp を 1 回に減らす仕組み。連鎖律で
-  <code>A⁻ᵀ</code> を掛け戻すことで、勾配画像を別々に warp せずに済ませる。</p>
+  <h2>Reducing the warps per iteration<span class="tag">landed</span></h2>
+  <p>How three bilinear warps per iteration become one. The chain rule lets the
+  gradients be taken <em>after</em> the warp and mapped back with <code>A⁻ᵀ</code>,
+  so the two gradient warps disappear.</p>
 </a>
 
 <a class="card" href="warp-reduction-and-border-fix.html">
-  <h2>warp 削減 × 境界修正、および gaussFiltSize の再最適化<span class="tag">landed</span></h2>
-  <p>二つの変更が無害に合成できるかの検証と、ぼかし幅の最適値の再検討。
-  warp 削減の利得が大窓で消える原因が OpenCV のスレッド化の非対称性であることを特定し、
-  単スレッドでは窓によらず 1.27〜1.31× で平坦であることを示す。
-  fast-ecc の「精度が良い」が gaussFiltSize=5 に依存した偶然だったことの確認も含む。</p>
+  <h2>The warp reduction against the border fix, and re-tuning gaussFiltSize<span class="tag">landed</span></h2>
+  <p>Whether the two changes compose without harming each other, and what the
+  optimal blur width is once the border defect no longer penalises wide filters.
+  Identifies OpenCV's threading asymmetry as the reason the warp reduction stops
+  paying at large windows — on a single thread it is flat at 1.27–1.31× across the
+  whole range. Also establishes that this fork's apparent accuracy advantage was an
+  accident of <code>gaussFiltSize=5</code>.</p>
 </a>
 
 <a class="card" href="gauss-newton-fusion.html">
-  <h2>ガウス・ニュートン段の融合<span class="tag plan">measured, not yet committed</span></h2>
-  <p>ヤコビアンを実体化せず、ヘッセ行列と射影を 1 パスで作る。4 つの運動種別すべてで
-  ヤコビアンが面分割積 <code>u ⊗ w</code> の列部分集合として書けることを示し、
-  節約がパラメータ数とともに増えることを実測する（窓 768・4 スレッドで homography 2.47×）。</p>
+  <h2>Fusing the Gauss–Newton stage<span class="tag plan">measured, not yet committed</span></h2>
+  <p>Building the Hessian and the projections in one pass, without ever materialising
+  the Jacobian. Shows that all four motion types are a column subset of the same
+  face-splitting product <code>u ⊗ w</code>, and that the saving grows with the
+  parameter count — 2.47× for homography at window 768 on four threads.</p>
 </a>
 
 <p class="note">
-これらのレポートは <code>eval/</code> 以下の計測ハーネスを参照しているが、
-それは fast-ecc とは別の作業ツリーにあり、このリポジトリには含まれていない。
-数値の再現にはそのハーネスが要る。リポジトリ内で再現できるのは
-<code>./build/bench</code> と <code>ctest</code> の範囲。
+These reports reference the measuring harness under <code>eval/</code>, which lives in
+a separate working tree and is not part of this repository; reproducing the figures
+needs it. What is reproducible from here is <code>./build/bench</code> and
+<code>ctest</code>.
 </p>
 
 <footer>
-測定環境: Intel Core i7-8700K (6C/12T) / Windows 11 / MSVC / Release /
-OpenCV 4.15.0-dev（境界修正を適用したビルド）。<br>
-速度の数値には必ず運動種別・窓サイズ・スレッド数が付いている。この三つが揃わない比は意味を持たない。
+Measured on an Intel Core i7-8700K (6C/12T), Windows 11, MSVC, Release, against
+OpenCV 4.15.0-dev built with the border fix applied.<br>
+Every speed figure carries a motion type, a window size and a thread count. A ratio
+without all three does not mean anything in this code.
 </footer>
 </main>

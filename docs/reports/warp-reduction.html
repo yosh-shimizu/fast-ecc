@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ECC 高速化 — 反復あたりの幾何ワープ削減</title>
+<title>Reducing the warps per ECC iteration</title>
 <style>
   :root{
     --bg:#0f1420; --card:#171e2e; --ink:#e7ecf3; --muted:#9aa7bd; --line:#27314a;
@@ -11,7 +11,7 @@
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
-       font-family:-apple-system,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;
+       font-family:-apple-system,"Segoe UI",Roboto,sans-serif;
        line-height:1.7;font-size:15px}
   .wrap{max-width:980px;margin:0 auto;padding:32px 22px 80px}
   h1{font-size:28px;line-height:1.25;margin:0 0 6px}
@@ -52,138 +52,192 @@
 <body>
 <div class="wrap">
 
-<h1>ECC 高速化テクニックの解説</h1>
-<p class="sub">「反復あたりの幾何ワープを 3 → 1 に削減する」最適化の仕組みと数学的根拠<br>
-対象: OpenCV <code>cv::findTransformECC</code>（Forward-Additive ECC）／ 参考実装 <code>ref/ecc.cpp</code></p>
+<h1>Reducing the warps per ECC iteration</h1>
+<p class="sub">How three bilinear warps per iteration become one, and why it is allowed<br>
+Baseline: OpenCV <code>cv::findTransformECC</code> (forward-additive ECC) &nbsp;/&nbsp;
+this fork: <code>src/fast_ecc.cpp</code></p>
 
 <!-- ============ SUMMARY ============ -->
-<h2>1. 要約</h2>
+<h2>1. Summary</h2>
 <div class="cards">
-  <div class="card"><h4>核心</h4><div class="big" style="color:var(--good)">3 → 1</div>
-    <p>反復あたりの幾何ワープ（warpAffine / warpPerspective）回数を削減。勾配を「ワープ後画像の filter2D」で得る。</p></div>
-  <div class="card"><h4>なぜ速い</h4><div class="big">warp ≫ conv</div>
-    <p>双線形ワープは座標変換+4タップ補間/画素。homography は毎画素除算も。これを安い conv+addWeighted に置換。</p></div>
-  <div class="card"><h4>正しさ</h4><div class="big" style="color:var(--accent)">A·Aᵀ</div>
-    <p>連鎖律の係数を addWeighted で戻す。translation/euclidean は厳密、affine/homography は正定値前処理（収束保存）。</p></div>
+  <div class="card"><h4>The change</h4><div class="big" style="color:var(--good)">3 → 1</div>
+    <p>Geometric warps per iteration (<code>warpAffine</code> / <code>warpPerspective</code>).
+    The gradients are obtained by running <code>filter2D</code> on the warped image instead.</p></div>
+  <div class="card"><h4>Why it is cheaper</h4><div class="big">warp ≫ conv</div>
+    <p>A bilinear warp costs a coordinate transform plus a four-tap interpolation per pixel,
+    and <code>warpPerspective</code> adds a division. A 1×3 convolution and an
+    <code>addWeighted</code> cost a handful of multiply-adds.</p></div>
+  <div class="card"><h4>Why it is correct</h4><div class="big" style="color:var(--accent)">A⁻ᵀ</div>
+    <p>The chain-rule factor is undone with one <code>addWeighted</code>. Exact for
+    translation, euclidean and affine; an approximation only for homography.</p></div>
 </div>
-<p>ECC は <code>ρ(p)=⟨î<sub>r</sub>, i<sub>w</sub>(p)⟩ / ‖i<sub>w</sub>(p)‖</code> を反復最大化する。各反復で必要なのは
-<b>(a) ワープ後画像 i<sub>w</sub></b> と <b>(b) パラメータヤコビアン用の勾配 ∇I(W(x))</b> の2つ。
-高速化の鍵は (b) の入手方法を変えることにある。</p>
+<p>ECC iteratively maximises
+<code>ρ(p)=⟨î<sub>r</sub>, i<sub>w</sub>(p)⟩ / ‖i<sub>w</sub>(p)‖</code>. Each iteration needs
+two things: <b>(a) the warped image i<sub>w</sub></b>, and <b>(b) the gradient
+∇I(W(x)) that the parameter Jacobian is built from</b>. The whole speed-up comes from
+changing how (b) is obtained.</p>
 
 <!-- ============ WHAT CHANGED ============ -->
-<h2>2. 何を変えたか</h2>
+<h2>2. What changed</h2>
 
-<h3>2.1 オリジナル（OpenCV）— 毎反復で勾配を「幾何ワープ」</h3>
-<p>ループ前に入力画像の勾配 <code>∇I</code> を一度だけ計算し、毎反復で<b>画像・勾配x・勾配y・マスクの計4枚（うち画像系3枚）を幾何ワープ</b>する。</p>
-<pre><span class="c">// ループ前: 入力全体で勾配を1回計算（filter2D）</span>
+<h3>2.1 OpenCV — warp the gradients every iteration</h3>
+<p>The gradient <code>∇I</code> of the input is computed once before the loop, and then
+<b>four images are warped every iteration</b> — the image, both gradients, and the mask.
+Three of those are bilinear warps of image data.</p>
+<pre><span class="c">// before the loop: one gradient pass over the whole input</span>
 filter2D(imageFloat, gradientX, -1, dx);
 filter2D(imageFloat, gradientY, -1, dx.t());
 
-<span class="c">// 毎反復: 3枚を幾何ワープ（高コスト）</span>
-<span class="k">warpAffine</span>(imageFloat, imageWarped,     map, ...);  <span class="c">// 画像</span>
-<span class="k">warpAffine</span>(gradientX,  gradientXWarped, map, ...);  <span class="c">// 勾配x  ← 重い</span>
-<span class="k">warpAffine</span>(gradientY,  gradientYWarped, map, ...);  <span class="c">// 勾配y  ← 重い</span>
-warpAffine(preMask,    imageMask,       map, ...);  <span class="c">// マスク</span></pre>
+<span class="c">// every iteration: three geometric warps</span>
+<span class="k">warpAffine</span>(imageFloat, imageWarped,     map, ...);  <span class="c">// the image</span>
+<span class="k">warpAffine</span>(gradientX,  gradientXWarped, map, ...);  <span class="c">// gradient x  &lt;- expensive</span>
+<span class="k">warpAffine</span>(gradientY,  gradientYWarped, map, ...);  <span class="c">// gradient y  &lt;- expensive</span>
+warpAffine(preMask,    imageMask,       map, ...);  <span class="c">// the mask (nearest neighbour)</span></pre>
 
-<h3>2.2 参考実装 — 画像だけワープし、勾配は「ワープ後に作る」</h3>
-<p>幾何ワープは<b>画像1枚＋マスクのみ</b>。勾配はワープ後画像を <code>filter2D</code> で微分し、warp の線形係数で <code>addWeighted</code> 再合成する。</p>
-<pre><span class="c">// 毎反復: 幾何ワープは画像1枚だけ</span>
-<span class="k">warpAffine</span>(imageFloat, imageWarped, map, ...);          <span class="c">// 画像（1枚だけ！）</span>
-warpAffine(preMask,    imageMask,   map, ...);            <span class="c">// マスク</span>
+<h3>2.2 This fork — warp only the image, then differentiate it</h3>
+<p>Only <b>the image and the mask</b> are warped. The gradients are produced by
+differentiating the <em>already warped</em> image with <code>filter2D</code>, then undoing
+the chain-rule factor with <code>addWeighted</code>.</p>
+<pre><span class="c">// every iteration: one geometric warp of image data</span>
+<span class="k">warpAffine</span>(imageFloat, imageWarped, map, ...);          <span class="c">// the image, and only the image</span>
+warpAffine(preMask,    imageMask,   map, ...);            <span class="c">// the mask</span>
 
-<span class="c">// ワープ後画像から勾配を作る（安い）</span>
-<span class="g">filter2D</span>(imageWarped, imageWarpedGradientX, -1, dx);     <span class="c">// 1×3 分離conv</span>
+<span class="c">// gradients taken on the warped image (cheap)</span>
+<span class="g">filter2D</span>(imageWarped, imageWarpedGradientX, -1, dx);     <span class="c">// separable 1x3</span>
 <span class="g">filter2D</span>(imageWarped, imageWarpedGradientY, -1, dx.t());
 
-<span class="c">// 連鎖律の係数を画素ごとに戻す（安い）</span>
+<span class="c">// undo the chain-rule factor, per pixel (cheap)</span>
 <span class="g">warp_gradients_affine_ECC</span>(imageWarpedGradientX, imageWarpedGradientY,
                           map, gradientXWarped, gradientYWarped);
-<span class="c">//  └ 中身: addWeighted(gx, a, gy, b, 0, outX);  // a*gx + b*gy</span>
-<span class="c">//          addWeighted(gx, c, gy, d, 0, outY);  // c*gx + d*gy</span></pre>
-<p class="note">ループ前の勾配プリ計算（<code>gradientX/gradientY</code>）は不要になり撤去。参考実装で残る同名の宣言は使われない残骸。</p>
+<span class="c">//  which is: addWeighted(gx,  d/det, gy, -c/det, 0, outX);</span>
+<span class="c">//            addWeighted(gx, -b/det, gy,  a/det, 0, outY);</span></pre>
+<p class="note">The pre-loop gradient pass is gone entirely — there is nothing left to
+warp, so there is nothing to precompute.</p>
 
 <!-- ============ WHY FASTER ============ -->
-<h2>3. なぜ速いか（コスト比較）</h2>
+<h2>3. Where the time goes</h2>
 <table>
-<thead><tr><th>反復あたりの主処理</th><th>オリジナル</th><th>参考実装</th></tr></thead>
+<thead><tr><th>work per iteration</th><th>OpenCV</th><th>this fork</th></tr></thead>
 <tbody>
-<tr><td>幾何ワープ（画像系, 双線形）</td><td class="bad">3 回</td><td class="best">1 回</td></tr>
-<tr><td>filter2D（1×3 分離）</td><td>0 回</td><td>2 回</td></tr>
-<tr><td>addWeighted（画素線形結合）</td><td>0 回</td><td>2 回</td></tr>
-<tr><td>マスクのワープ（最近傍）</td><td>1 回</td><td>1 回</td></tr>
+<tr><td>geometric warps of image data (bilinear)</td><td class="bad">3</td><td class="best">1</td></tr>
+<tr><td><code>filter2D</code> (separable 1×3)</td><td>0</td><td>2</td></tr>
+<tr><td><code>addWeighted</code> (per-pixel linear combination)</td><td>0</td><td>2</td></tr>
+<tr><td>mask warp (nearest neighbour)</td><td>1</td><td>1</td></tr>
 </tbody></table>
-<p>双線形 <code>warpAffine</code> は「逆変換の座標計算＋4タップ補間＋境界判定」を画素ごとに行う。
-<code>warpPerspective</code> はさらに<b>毎画素の射影除算</b>を伴う。一方 <code>filter2D</code>(1×3) と <code>addWeighted</code>
-は画素あたり数回の積和のみ。重いワープ2回を軽い演算に置換するため、<b>特に homography で効果が大きい</b>。</p>
+<p>A bilinear <code>warpAffine</code> does an inverse coordinate transform, a four-tap
+interpolation and a bounds check for every pixel. <code>warpPerspective</code> adds a
+<b>division per pixel</b> on top. A 1×3 <code>filter2D</code> and an
+<code>addWeighted</code> are a few multiply-adds each. Replacing two heavy warps with four
+light passes is <b>worth most where the warp is most expensive, which is homography</b>.</p>
 
 <div class="chart">
-  <h4>反復あたりの「画像系・幾何ワープ」回数（少ないほど速い）</h4>
-  <p class="cap">削減されるのは最もコストの高い処理。homography では除算付き warpPerspective が 2 回消える。</p>
+  <h4>Geometric warps of image data, per iteration (fewer is faster)</h4>
+  <p class="cap">What is removed is the most expensive operation in the loop. For
+  homography, two divisions-per-pixel <code>warpPerspective</code> calls disappear.</p>
   <svg viewBox="0 0 620 200" width="100%" height="200" font-family="sans-serif" font-size="12">
     <line x1="60" y1="160" x2="605" y2="160" stroke="#27314a"/>
-    <text x="50" y="40" fill="#9aa7bd" text-anchor="end">回</text>
+    <text x="50" y="40" fill="#9aa7bd" text-anchor="end">warps</text>
     <rect x="110" y="40"  width="90" height="120" fill="#ff6b6b"/><text x="155" y="34" fill="#ff6b6b" text-anchor="middle">3</text>
     <rect x="410" y="120" width="90" height="40"  fill="#37d39b"/><text x="455" y="114" fill="#37d39b" text-anchor="middle">1</text>
-    <text x="155" y="180" fill="#cdd8ea" text-anchor="middle">オリジナル</text>
-    <text x="455" y="180" fill="#cdd8ea" text-anchor="middle">参考実装</text>
+    <text x="155" y="180" fill="#cdd8ea" text-anchor="middle">OpenCV</text>
+    <text x="455" y="180" fill="#cdd8ea" text-anchor="middle">this fork</text>
   </svg>
 </div>
 
+<p>The gain is <b>not uniform</b>, and a single ratio for it would be misleading. It is
+largest at small windows and on a single thread, and decays to break-even at large windows
+with a thread pool — OpenCV parallelises the <code>warpAffine</code> being removed above
+roughly 384 px, but not the <code>filter2D</code> and <code>addWeighted</code> that replace
+it. That is measured in
+<a href="warp-reduction-and-border-fix.html">the companion report</a>.</p>
+
 <!-- ============ MATH ============ -->
-<h2>4. 数学的根拠 — なぜ成立するか</h2>
-<p>ワープ後画像は <code>i<sub>w</sub>(x) = I(A·x + t)</code>（A は map の 2×2 線形部、<code>WARP_INVERSE_MAP</code>）。
-これを <code>filter2D</code> で空間微分すると、<b>連鎖律</b>で勾配にヤコビアン因子が掛かる:</p>
-<div class="eq">∂<sub>x</sub>[ I(A·x + t) ] = Aᵀ · ∇I(W(x))      （filter2D が返す生の勾配 g̃ = Aᵀ ∇I）</div>
-<p>ECC のヤコビアン式が必要とするのは生の <code>∇I(W(x))</code>。そこで <code>warp_gradients_*_ECC</code> が
-<b>A を掛けて戻す</b>（addWeighted）。結果は <code>A·g̃ = A·Aᵀ·∇I</code> となる。</p>
+<h2>4. Why it is allowed</h2>
+<p>The warped image is <code>i<sub>w</sub>(x) = I(A·x + t)</code>, where <code>A</code> is
+the 2×2 linear part of the map (<code>WARP_INVERSE_MAP</code> convention). Differentiating
+that with <code>filter2D</code> brings down a Jacobian factor by the <b>chain rule</b>:</p>
+<div class="eq">∂<sub>x</sub>[ I(A·x + t) ] = Aᵀ · ∇I(W(x))      (so filter2D returns g̃ = Aᵀ ∇I, not ∇I)</div>
+<p>What the ECC Jacobian assembly needs is the bare <code>∇I(W(x))</code>. So
+<code>warp_gradients_*_ECC</code> multiplies by <b><code>A⁻ᵀ</code></b> — a single
+<code>addWeighted</code> per output channel — and recovers it exactly:
+<code>A⁻ᵀ g̃ = A⁻ᵀAᵀ ∇I = ∇I</code>.</p>
 
 <table>
-<thead><tr><th>モーション</th><th>線形部 A</th><th>A·Aᵀ</th><th>結果</th></tr></thead>
+<thead><tr><th>motion</th><th>linear part A</th><th>A⁻ᵀ</th><th>result</th></tr></thead>
 <tbody>
-<tr><td>translation</td><td>I（単位）</td><td>I</td><td class="best">厳密一致</td></tr>
-<tr><td>euclidean</td><td>R（回転=直交）</td><td>I</td><td class="best">厳密一致</td></tr>
-<tr><td>affine</td><td>一般 2×2</td><td>≠ I（対称正定値）</td><td>近似（前処理子）</td></tr>
-<tr><td>homography</td><td>一般（射影）</td><td>≠ I（対称正定値）</td><td>近似（前処理子）</td></tr>
+<tr><td>translation</td><td>I (identity)</td><td>I</td><td class="best">exact</td></tr>
+<tr><td>euclidean</td><td>R (rotation, orthonormal)</td><td>R</td><td class="best">exact</td></tr>
+<tr><td>affine</td><td>general 2×2</td><td>the inverse frame change</td><td class="best">exact</td></tr>
+<tr><td>homography</td><td>projective</td><td>linear part only</td><td>approximate</td></tr>
 </tbody></table>
 
 <div class="cards">
-  <div class="card"><h4>translation / euclidean</h4><div class="big" style="color:var(--good)">厳密</div>
-    <p>A が単位/直交なので A·Aᵀ=I。オリジナルと完全に同一のヤコビアンを、ワープ2回分の節約で得る。</p></div>
-  <div class="card"><h4>affine / homography</h4><div class="big">近似</div>
-    <p>A·Aᵀ 因子が残るが、これは<b>対称正定値</b>＝プリコンディショナとして作用。上昇方向は保たれ、
-    ステップ→0 の不動点も実質不変。「正しさを損なわず」ワープを削減できる。</p></div>
+  <div class="card"><h4>translation / euclidean / affine</h4><div class="big" style="color:var(--good)">exact</div>
+    <p>The frame change is a plain 2×2 matrix and inverting it recovers <code>∇I</code>
+    exactly. For an orthonormal <code>A</code> the inverse transpose is <code>A</code>
+    itself, which is why those two cases can use the linear part directly.</p></div>
+  <div class="card"><h4>homography</h4><div class="big">approximate</div>
+    <p>A projective warp has a Jacobian that varies per pixel; only its linear part is
+    used here. The residual factor is symmetric positive definite, so it acts as a
+    preconditioner — the ascent direction is preserved and the fixed point where the
+    step goes to zero is unchanged.</p></div>
 </div>
 
-<!-- ============ COMPANION & CAVEATS ============ -->
-<h2>5. 付随する工夫と注意点</h2>
-<h3>5.1 境界処理は速度化トリックの「対」</h3>
-<p>ワープ後画像を <code>filter2D</code> すると、有効領域とゼロ埋め境界の境目で勾配が汚染される
-（オリジナルは「計算済み勾配をワープ」していたので無問題だった）。そのため参考実装は
-<b>マスクの 2 画素縁をゼロ化</b>し、汚染勾配を破棄している。これは高速化に伴い必要になった<b>正しさの補正</b>。</p>
-<pre>preMask.row(0..1).setTo(0);  preMask.row(末尾0..1).setTo(0);   <span class="c">// 2px縁を無効化</span>
-imageWarpedGradientX.setTo(0, 1 - imageMask);                  <span class="c">// 縁の勾配を捨てる</span></pre>
+<p class="note"><b>The recombination coefficient does not move the fixed point.</b> It is
+an invertible reparameterisation of the step, so <code>Jᵀr = 0</code> is the same
+condition either way. This fork originally multiplied by <code>A</code> rather than
+<code>A⁻ᵀ</code>; correcting it was a matter of saying the right thing in the code, not a
+measurable accuracy gain — corner RMS moved by less than 0.001 px over 180 random trials,
+with no systematic difference.</p>
 
-<h3>5.2 そのほかの差分</h3>
-<table>
-<thead><tr><th>箇所</th><th>内容</th><th>性質</th></tr></thead>
-<tbody>
-<tr><td>GaussianBlur</td><td>sigma を明示指定（<code>1.5</code>）。オリジナルはサイズから自動</td><td>精度・収束に影響（速度ではない）</td></tr>
-<tr><td>ループ内 <code>std::cout &lt;&lt; map</code></td><td>収束軌跡のデバッグ出力</td><td class="bad">本番では削除（I/O が支配的に）</td></tr>
-</tbody></table>
+<!-- ============ COMPANION & CAVEATS ============ -->
+<h2>5. What the change drags along with it</h2>
+<h3>5.1 Differentiating after the warp contaminates the border</h3>
+<p>Running <code>filter2D</code> on the warped image reads across the boundary between the
+valid region and the zero fill, so the gradients there are wrong. OpenCV does not have this
+problem, because it warps gradients that were computed on the untouched input. So this fork
+<b>zeroes a two-pixel rim of the mask</b> and throws those gradients away. It is not an
+optimisation — it is the correction that the optimisation makes necessary.</p>
+<pre>preMask.row(0..1).setTo(0);  preMask.row(rows-2..rows-1).setTo(0);   <span class="c">// invalidate a 2 px rim</span>
+imageWarpedGradientX.setTo(0, 1 - imageMask);                        <span class="c">// discard those gradients</span></pre>
+
+<h3>5.2 A separate border defect, inherited rather than introduced</h3>
+<p>There is a second, unrelated border problem that this fork carried over from
+<code>ecc.cpp</code> verbatim: the Gaussian pre-filter extrapolates the template border with
+<code>BORDER_REFLECT_101</code>, fabricating a ring <code>gaussFiltSize/2</code> px wide that
+was then used at full weight. It biases the estimated scale downward. It is
+<a href="https://github.com/opencv/opencv/pull/29775">reported and fixed upstream</a>, and
+fixed here.</p>
+<p>The two are easy to confuse and are not the same thing. The rim above exists because
+gradients are taken after the warp; the ring exists because a blur invents data at the edge,
+and it is there whether or not the warp reduction is applied.</p>
 
 <!-- ============ CONCLUSION ============ -->
-<h2>6. 結論</h2>
-<p>高速化の正体は、<b>毎反復の勾配を「∇I を幾何ワープして得る」代わりに、「ワープ後画像を filter2D し連鎖律係数を addWeighted で戻して得る」</b>こと。
-これにより反復あたりの画像系・幾何ワープを <b>3 → 1</b> に削減する。</p>
+<h2>6. Conclusion</h2>
+<p>The speed-up is one substitution: instead of obtaining each iteration's gradients by
+<b>warping ∇I</b>, obtain them by <b>differentiating the warped image and undoing the
+chain-rule factor with an <code>addWeighted</code></b>. That takes the geometric warps of
+image data from <b>3 to 1</b> per iteration.</p>
 <ul>
-  <li>translation / euclidean では<b>厳密に等価</b>、affine / homography では<b>正定値前処理として作用する近似</b>で収束は保たれる。</li>
-  <li>効果は <code>warpPerspective</code> に毎画素除算がある <b>homography で最大</b>。</li>
-  <li>ワープ後微分に伴う<b>境界汚染の除去（2px 縁マスク）</b>が必須の対であり、デバッグ出力は本番で除く。</li>
+  <li><b>Exact</b> for translation, euclidean and affine. For homography it is an
+  approximation that acts as a positive-definite preconditioner, so convergence is
+  preserved.</li>
+  <li>Worth most for <b>homography</b>, where <code>warpPerspective</code> carries a
+  per-pixel division.</li>
+  <li>Comes with an obligation: the <b>two-pixel rim mask</b> that discards gradients
+  contaminated by differentiating across the fill boundary.</li>
+  <li>The measured gain depends on window size and thread count — see
+  <a href="warp-reduction-and-border-fix.html">the companion report</a> before quoting a
+  number.</li>
 </ul>
 
 <footer>
-ECC 高速化テクニック解説 ／ 参考実装: <code>ref/ecc.cpp</code>・基準: OpenCV <code>cv::findTransformECC</code><br>
-関連: <code>ECC_improvement_report.html</code>（数学的改良: ADMM / Moreau / IRLS / σ<sub>rel</sub> / FA vs IC 精度差）
+Part of the experiment reports for
+<a href="https://github.com/yosh-shimizu/fast-ecc">fast-ecc</a>.
+Baseline: OpenCV <code>cv::findTransformECC</code>; implementation:
+<code>src/fast_ecc.cpp</code>.<br>
+See also: <a href="warp-reduction-and-border-fix.html">the warp reduction against the border
+fix</a>, and <a href="gauss-newton-fusion.html">fusing the Gauss–Newton stage</a>.
 </footer>
 
 </div>
