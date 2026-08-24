@@ -53,6 +53,9 @@
 #include "fast_ecc.hpp"
 
 #include <opencv2/imgproc.hpp>
+#ifdef FASTECC_SIMD
+#include <opencv2/core/hal/intrin.hpp>
+#endif
 #include <cmath>
 
 using namespace cv;
@@ -131,6 +134,11 @@ static void warp_gradients_affine_ECC(
 }
 
 #include "gn_fused.inc"
+#ifdef FASTECC_SIMD
+#include "gn_fused_simd.inc"
+#else
+typedef GNAffine GNAffineSimd;   // the generated scalar kernel
+#endif
 
 static void warp_gradients_translation_ECC(
     const Mat& gradientX, const Mat& gradientY,
@@ -409,7 +417,7 @@ double findTransformECC(InputArray templateImage,
         // the gradients, with no jacobian materialised.
         if (motionType == MOTION_AFFINE)
         {
-            GNAffine acc;
+            GNAffineSimd acc;
             runFusedGN(acc, gradientXWarped, gradientYWarped, imageWarped, templateZM,
                        hessian, imageProjection, templateProjection);
         }
