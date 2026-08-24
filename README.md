@@ -105,7 +105,7 @@ border-fixed OpenCV:
 Two changes contribute, and they cover each other. The **warp reduction** takes the
 three bilinear warps per iteration down to one; it pays most at small windows and
 decays to nothing at large ones with a thread pool, because OpenCV parallelises the
-`warpAffine` it removes but not the `filter2D`/`addWeighted` that replace it. The
+`warpAffine` it removes but not the `filter2D` that replaces it. The
 **fused Gauss–Newton stage** does the opposite: it builds the Hessian and both
 projections in one pass without materialising the Jacobian, and the saving grows with
 the parameter count, so it is largest exactly where the warp reduction has given up.
@@ -149,18 +149,18 @@ gradient images `∂I/∂x`, `∂I/∂y` (plus a cheap nearest-neighbour mask wa
 inner loop.
 
 This version warps **only the image**, then obtains the gradients from the *warped*
-image with a `filter2D` and a single `addWeighted` recombination — so the two bilinear
-gradient warps per iteration disappear.
+image with a `filter2D`; the `A⁻ᵀ` recombination is applied per pixel inside the fused
+Gauss–Newton pass. So the two bilinear gradient warps per iteration disappear.
 
 | | image warp | gradient warps | mask warp |
 |---|:---:|:---:|:---:|
 | `cv::findTransformECC` | 1 | 2 | 1 |
-| `fastecc::findTransformECC` | 1 | **0** (filter2D + addWeighted) | 1 |
+| `fastecc::findTransformECC` | 1 | **0** (filter2D) | 1 |
 
 The gain from *this* change is **not** uniform. It is largest at small windows and on a
 single thread, and falls to break-even at large windows with a thread pool — because
 OpenCV parallelises `warpAffine` above roughly 384 px but not the
-`filter2D`/`addWeighted` that replace it. That region is covered by the fused
+`filter2D` that replaces it. That region is covered by the fused
 Gauss–Newton stage instead. Any speed figure quoted without a window size and a thread
 count is meaningless.
 
@@ -176,7 +176,8 @@ a warp with linear part `A`,
 ```
 
 So the finite-difference gradient of the **already-warped** image is the image-domain
-gradient pre-multiplied by `Aᵀ`. Multiplying it by `A⁻ᵀ` (`warp_gradients_*_ECC`) undoes
+gradient pre-multiplied by `Aᵀ`. Multiplying it by `A⁻ᵀ` (`recombination`, applied per pixel
+inside the fused pass) undoes
 that frame change and recovers the quantity the Jacobian assembly expects, **without
 warping the gradient images separately**.
 
@@ -189,6 +190,31 @@ Note that the recombination coefficient does **not** change the Gauss–Newton f
 point — it is an invertible reparameterisation, so `Jᵀr = 0` is the same condition
 either way. Correcting it from `A` to `A⁻ᵀ` was a correctness cleanup, not a measurable
 accuracy improvement.
+
+### The normalisation is folded into the fused pass
+
+Everything between the `filter2D` and the fused Gauss–Newton pass used to be a chain of
+masked OpenCV calls that each wrote a plane: three masked `setTo`, two `meanStdDev`,
+two masked `subtract`, two `countNonZero`, a dot product and the two `addWeighted` of
+the recombination. Profiling one iteration showed that chain, together with the mask
+warp, at 45–60 % of the time on a single thread (window 200) — more than the warp and
+the Gauss–Newton stage combined for translation.
+
+It is now two passes that write nothing. `maskedStats` collects the six masked moments
+(N, ΣI, ΣI², ΣT, ΣT², ΣIT) in one sweep; the means, both norms and the correlation of the
+centred vectors are algebra on those. The fused kernels then read the *raw* planes and
+do the masking (a masked pixel is skipped), the `A⁻ᵀ` recombination and the zero-mean
+centring per pixel. The arithmetic is the same, only the summation order differs: the
+fixed point agrees with the previous layout to four digits in all four motion types.
+
+Per iteration, one thread, window 200 (best of three interleaved runs):
+
+| motion | before | after | |
+|---|---:|---:|---:|
+| translation | 0.591 ms | 0.468 ms | 1.26× |
+| euclidean | 0.692 ms | 0.571 ms | 1.21× |
+| affine | 0.811 ms | 0.691 ms | 1.17× |
+| homography | 1.743 ms | 1.556 ms | 1.12× |
 
 ### Not bit-identical to OpenCV
 
