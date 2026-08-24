@@ -577,7 +577,8 @@ double findTransformECC(InputArray templateImage,
 
         // The fused path needs only the recombined gradients; building the
         // jacobian is exactly the work it exists to avoid.
-        const bool fused = (motionType == MOTION_AFFINE);
+        const bool fused = (motionType == MOTION_AFFINE ||
+                            motionType == MOTION_HOMOGRAPHY);
 
         // recombine warped-image gradients into image-domain gradients, then
         // assemble the Jacobian of the image wrt the warp parameters
@@ -589,7 +590,8 @@ double findTransformECC(InputArray templateImage,
                 break;
             case MOTION_HOMOGRAPHY:
                 warp_gradients_affine_ECC(imageWarpedGradientX, imageWarpedGradientY, map, gradientXWarped, gradientYWarped);
-                image_jacobian_homo_ECC(gradientXWarped, gradientYWarped, Xgrid, Ygrid, map, jacobian);
+                if (!fused)
+                    image_jacobian_homo_ECC(gradientXWarped, gradientYWarped, Xgrid, Ygrid, map, jacobian);
                 break;
             case MOTION_TRANSLATION:
                 warp_gradients_translation_ECC(imageWarpedGradientX, imageWarpedGradientY, gradientXWarped, gradientYWarped);
@@ -602,10 +604,22 @@ double findTransformECC(InputArray templateImage,
         }
 
         // The Gram matrix and both projections come out of a single pass over
-        // the gradients, with no jacobian materialised.  Only affine so far.
-        if (fused)
+        // the gradients, with no jacobian materialised.
+        if (motionType == MOTION_AFFINE)
         {
             GNAffine acc;
+            runFusedGN(acc, gradientXWarped, gradientYWarped, imageWarped, templateZM,
+                       hessian, imageProjection, templateProjection);
+        }
+        else if (motionType == MOTION_HOMOGRAPHY)
+        {
+            // the per-pixel projective division folds into the gradient side,
+            // so the same face-splitting form applies with a third plane
+            const float* h = map.ptr<float>(0);
+            GNHomography acc;
+            acc.h0 = h[0]; acc.h1 = h[3]; acc.h2 = h[6];
+            acc.h3 = h[1]; acc.h4 = h[4]; acc.h5 = h[7];
+            acc.h6 = h[2]; acc.h7 = h[5];
             runFusedGN(acc, gradientXWarped, gradientYWarped, imageWarped, templateZM,
                        hessian, imageProjection, templateProjection);
         }
