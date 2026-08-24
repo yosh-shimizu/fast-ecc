@@ -36,4 +36,32 @@ double findTransformECC(
     cv::InputArray inputMask = cv::noArray(),
     int gaussFiltSize = 5);
 
+// EXPERIMENT (branch sigma-param): the pre-filter's sigma as an optimisation
+// parameter.  See src/fast_ecc_sigma.cpp for the modes and the caveats.
+enum SigmaMode {
+    SIGMA_FIXED = 0,       // sigma stays at sigma0 (control)
+    SIGMA_JOINT = 1,       // sigma is a Gauss-Newton parameter (input-side column)
+    SIGMA_JOINT_SYM = 2,   // same, with the template's sigma-derivative folded in
+    SIGMA_SCHEDULE = 3,    // sigma <- max(sigmaMin, sigma * decay) per iteration
+    SIGMA_NUISANCE = 4     // the sigma column is solved for but sigma is never changed
+};
+
+struct SigmaResult {
+    double rho;        // final enhanced correlation coefficient
+    double sigma;      // final sigma
+    int iterations;    // iterations run
+};
+
+SigmaResult findTransformECCSigma(
+    cv::InputArray templateImage,
+    cv::InputArray inputImage,
+    cv::InputOutputArray warpMatrix,
+    int motionType,
+    cv::TermCriteria criteria,
+    double sigma0,
+    int mode,
+    double sigmaMin = 0.8,
+    double sigmaMax = 6.0,
+    double decay = 0.7);
+
 } // namespace fastecc

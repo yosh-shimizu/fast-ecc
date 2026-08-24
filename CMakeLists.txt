@@ -19,7 +19,7 @@ if(MSVC)
 endif()
 
 # --- the library -----------------------------------------------------------
-add_library(fast_ecc src/fast_ecc.cpp)
+add_library(fast_ecc src/fast_ecc.cpp src/fast_ecc_sigma.cpp)
 target_include_directories(fast_ecc PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
