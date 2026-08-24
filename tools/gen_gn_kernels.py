@@ -17,6 +17,13 @@
 # the w = 1 column is summed in the loop and the other two are formed from it at
 # row end.  That is exact, and it removes both arithmetic and live accumulators
 # (affine 30 -> 20, homography 52 -> 36).
+#
+# The kernels read the RAW planes: the warped image, the blurred template, the
+# two finite-difference gradients of the warped image, and the warped mask.
+# Masking, the A^-T recombination of the gradient and the zero-mean centring
+# happen per pixel inside the loop (a masked pixel is skipped; a = r00*gx +
+# r01*gy, b = r10*gx + r11*gy; ii = im - muI, tt = tm - muT).  Nothing is
+# materialised between filter2D and this pass.
 import io
 import sys
 
@@ -41,16 +48,20 @@ PRE = {
     'Homography': '',
 }
 
+# translation's A^-T is the identity, so it reads the gradients directly
 PIX = {
     'Translation':
         '            const float a = pgx[x], b = pgy[x];\n',
     'Euclidean':
-        '            const float a = pgx[x], b = pgy[x];\n'
+        '            const float a = r00 * pgx[x] + r01 * pgy[x];\n'
+        '            const float b = r10 * pgx[x] + r11 * pgy[x];\n'
         '            const float r = a * hatX + b * hatY;\n',
     'Affine':
-        '            const float a = pgx[x], b = pgy[x];\n',
+        '            const float a = r00 * pgx[x] + r01 * pgy[x];\n'
+        '            const float b = r10 * pgx[x] + r11 * pgy[x];\n',
     'Homography':
-        '            const float gxv = pgx[x], gyv = pgy[x];\n'
+        '            const float gxv = r00 * pgx[x] + r01 * pgy[x];\n'
+        '            const float gyv = r10 * pgx[x] + r11 * pgy[x];\n'
         '            const float den = fx * h2 + fy * h5 + 1.f;\n'
         '            // cv::divide yields 0 where the denominator is 0; match that\n'
         '            const float inv = den != 0.f ? 1.f / den : 0.f;\n'
@@ -65,11 +76,13 @@ POST = {
     'Euclidean': '            hatX -= h1;  hatY += h0;\n',
 }
 
+RECOMB = '    float r00, r01, r10, r11;   // A^-T of the current warp\n'
+MEANS  = '    float muI, muT;             // masked means of warped image and template\n'
 MEMBERS = {
-    'Translation': '',
-    'Euclidean':   '    float h0, h1;\n',
-    'Affine':      '',
-    'Homography':  '    float h0, h1, h2, h3, h4, h5, h6, h7;\n',
+    'Translation': MEANS,
+    'Euclidean':   RECOMB + MEANS + '    float h0, h1;\n',
+    'Affine':      RECOMB + MEANS,
+    'Homography':  RECOMB + MEANS + '    float h0, h1, h2, h3, h4, h5, h6, h7;\n',
 }
 
 
@@ -133,7 +146,7 @@ for name, K, L, U, cols in MOTIONS:
     o.append('    }')
     o.append('')
     o.append('    void rows(const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,')
-    o.append('              int y0, int y1) {')
+    o.append('              const Mat& mask, int y0, int y1) {')
     o.append('        const int w = gx.cols;')
     # double totals
     o.append('        double ' + ', '.join('t_%s = 0' % a for a in acc) + ';')
@@ -144,6 +157,7 @@ for name, K, L, U, cols in MOTIONS:
     o.append('            const float* pgy = gy.ptr<float>(y);')
     o.append('            const float* pim = im.ptr<float>(y);')
     o.append('            const float* ptm = tm.ptr<float>(y);')
+    o.append('            const uchar* pmk = mask.ptr<uchar>(y);')
     o.append('            const float fy = (float)y;')
     if PRE[name]:
         o.append(PRE[name].rstrip('\n').replace('        ', '            '))
@@ -151,6 +165,8 @@ for name, K, L, U, cols in MOTIONS:
     o.append('            float ' + ', '.join('%s = 0' % p for p in liveproj) + ';')
     o.append('')
     o.append('            for (int x = 0; x < w; ++x) {')
+    o.append('                if (pmk[x] != 0) {')
+    body_start = len(o)          # everything from here to the projections is indented once more
     if L == 3:
         o.append('                const float fx = (float)x;')
     elif name == 'Homography':
@@ -181,8 +197,8 @@ for name, K, L, U, cols in MOTIONS:
             term = 'uu%d' % a if (L == 1 or b == ONE) else 'uu%d * ww%d' % (a, b)
             line.append('m%d_%d += %s;' % (a, b, term))
         o.append('                ' + '  '.join(line))
-    # projections
-    o.append('                const float ii = pim[x], tt = ptm[x];')
+    # projections (centred on the fly)
+    o.append('                const float ii = pim[x] - muI, tt = ptm[x] - muT;')
     for s, (k, l) in enumerate(cols):
         if s in hoistp:
             continue                       # formed at row end from its partner
@@ -193,6 +209,9 @@ for name, K, L, U, cols in MOTIONS:
         terms = ['%s%d += j%d * %s;' % (pre, s, s, src) for s in kept]
         terms += ['%s%s += %s * %s;' % (pre, e, U[int(e[1:])], src) for e in extra]
         o.append('                ' + '  '.join(terms))
+    for i in range(body_start, len(o)):
+        o[i] = '\n'.join('    ' + ln for ln in o[i].split('\n'))
+    o.append('                }')
     if name in POST:
         o.append(POST[name].rstrip('\n').replace('            ', '                '))
     o.append('            }')
