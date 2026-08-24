@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fusing the Gauss-Newton stage of ECC</title>
+<style>
+  :root{
+    --bg:#0f1420; --card:#171e2e; --ink:#e7ecf3; --muted:#9aa7bd; --line:#27314a;
+    --accent:#5aa9ff; --good:#37d39b; --warn:#ffb454; --bad:#ff6b6b;
+    --mathbg:#0b1018;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,"Segoe UI",Roboto,sans-serif;
+       line-height:1.8;font-size:15px}
+  .wrap{max-width:1000px;margin:0 auto;padding:32px 22px 80px}
+  h1{font-size:28px;line-height:1.25;margin:0 0 6px}
+  h2{font-size:22px;margin:46px 0 12px;padding-bottom:8px;border-bottom:2px solid var(--line)}
+  h3{font-size:17px;margin:28px 0 8px;color:#cdd8ea}
+  h4{font-size:15px;margin:20px 0 6px;color:#b8c6dc}
+  p{margin:11px 0}
+  ul,ol{margin:11px 0;padding-left:22px}
+  li{margin:6px 0}
+  .sub{color:var(--muted);margin:0 0 24px}
+  a{color:var(--accent)}
+  code{background:#0b0f18;border:1px solid var(--line);border-radius:5px;padding:1px 6px;
+       font-family:"SF Mono",Consolas,Menlo,monospace;font-size:12.8px;color:#d8e2f2}
+
+  /* ---- math ------------------------------------------------------------ */
+  /* Inline symbols.  Serif italic so they read as mathematics and never get
+     confused with the monospace <code> spans, which are identifiers.        */
+  .m{font-family:"Cambria Math","STIX Two Math","Latin Modern Math",Georgia,
+                 "Times New Roman",serif;
+     font-style:italic;font-size:1.08em;color:#eaf1fa;letter-spacing:.01em}
+  .m.up{font-style:normal}
+  math{font-family:"Cambria Math","STIX Two Math","Latin Modern Math",Georgia,
+                   "Times New Roman",serif;
+       font-size:1.18em;color:#eaf1fa}
+  math[display="block"]{margin:2px 0}
+  .eq{background:var(--mathbg);border:1px solid var(--line);border-left:3px solid var(--accent);
+      border-radius:8px;padding:16px 22px;margin:18px 0;overflow-x:auto}
+  .eq .cm{display:block;margin-top:10px;padding-top:9px;border-top:1px dashed #232d44;
+          color:#8994ab;font-size:12.5px;line-height:1.65;
+          font-family:-apple-system,"Segoe UI",Roboto,sans-serif;
+          font-style:normal}
+  .eq.tight{padding:12px 22px}
+
+  pre{background:#0b0f18;border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin:14px 0;
+      overflow-x:auto;font-family:"SF Mono",Consolas,Menlo,monospace;font-size:12.6px;line-height:1.6;color:#d8e2f2}
+  pre .c{color:#5f6b82}  pre .k{color:#ff9aa2}  pre .g{color:#37d39b}  pre .n{color:#ffb454}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:14px;margin:18px 0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .card h4{margin:0 0 6px;font-size:13.5px;color:var(--accent);letter-spacing:.02em}
+  .card .big{font-size:26px;font-weight:700;margin:2px 0;line-height:1.2}
+  .card p{margin:4px 0 0;color:var(--muted);font-size:13px;line-height:1.6}
+  .tw{overflow-x:auto;margin:14px 0}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;
+        background:var(--card);border-radius:10px;overflow:hidden}
+  th,td{padding:9px 11px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+  th:first-child,td:first-child{text-align:left}
+  thead th{background:#1d2740;color:#cfdcf2;font-weight:600;border-bottom:2px solid var(--line)}
+  tbody tr:hover{background:#1b2438}
+  td.best{color:var(--good);font-weight:700}
+  td.bad{color:var(--bad)}
+  td.dim{color:var(--muted)}
+  td.grp{color:var(--muted);font-weight:600}
+  table.nota td{white-space:normal}
+  table.nota td:first-child{width:130px;text-align:center;font-size:16px}
+  .note{background:#1a2030;border:1px solid var(--line);border-left:3px solid var(--warn);
+        border-radius:8px;padding:12px 16px;margin:15px 0;color:#e8d7b6;font-size:13.5px;line-height:1.75}
+  .good-note{background:#16241f;border:1px solid #24503f;border-left:3px solid var(--good);
+        border-radius:8px;padding:12px 16px;margin:15px 0;color:#bde8d6;font-size:13.5px;line-height:1.75}
+  .chart{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:18px 0}
+  .chart h4{margin:0 0 4px;font-size:14px;color:#cdd8ea}
+  .chart .cap{color:var(--muted);font-size:12.5px;margin:0 0 10px;line-height:1.65}
+  .chart svg{display:block;width:100%;height:auto}
+  .lgd{display:flex;flex-wrap:wrap;gap:14px;margin-top:8px;font-size:12.5px;color:var(--muted)}
+  .lgd i{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+  footer{margin-top:52px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line);padding-top:16px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Fusing the Gauss-Newton stage of ECC</h1>
+<p class="sub">Building the Hessian and the three projections in one pass, without materialising the Jacobian<br> Subject: OpenCV <code>cv::findTransformECC</code> , <code>image_jacobian_*_ECC</code> and <code>project_onto_jacobian_ECC</code> (translation / euclidean / affine / homography). Implementation: the <code>eval/uni_ecc.cpp</code> flag in <code>fastGN</code> ; measurement <code>eval/gnbench.cpp</code></p>
+
+<div class="cards">
+  <div class="card"><h4>memory traffic</h4><div class="big" style="color:var(--good)">85 → 6</div>
+    <p>Image-plane passes per iteration. The Jacobian is never built, so most of them go away.</p></div>
+  <div class="card"><h4>accumulators</h4><div class="big">21 → 18</div>
+    <p>The affine Hessian is not a general symmetric matrix. It has only 18 independent entries. For the other three motion types the count comes out exact.</p></div>
+  <div class="card"><h4>this stage alone</h4><div class="big" style="color:var(--good)">up to 6.3x</div>
+    <p>Window 1024, 12 threads. 4.8x at window 768, 3.0x at 256.</p></div>
+  <div class="card"><h4>whole ECC</h4><div class="big" style="color:var(--good)">up to 2.9x</div>
+    <p>Homography, window 512, four threads, combined with the warp reduction. At four threads it is 1.40-2.89x regardless of window or motion type. Accuracy and convergence radius are numerically unchanged.</p></div>
+</div>
+
+<div class="note"> This is an optimisation <b>still under review</b>. Numerical equivalence -- matching accuracy, bias and convergence counts -- is <b>confirmed for all four motion types</b>, but it has not been submitted upstream. </div>
+
+<h2>1. What one ECC iteration computes</h2>
+
+<h3>1.1 Notation</h3>
+
+<div class="tw"><table class="nota">
+<thead><tr><th style="text-align:center">symbol</th><th style="text-align:left">meaning</th></tr></thead>
+<tbody>
+<tr><td><math><mi>N</mi></math></td><td style="text-align:left">Pixels in the template window. At a 768 px window, <span class="m">N</span> = 589,824</td></tr>
+<tr><td><math><mi>P</mi></math></td><td style="text-align:left">Parameter count. translation 2 / euclidean 3 / <b>affine 6</b> / homography 8</td></tr>
+<tr><td><math><mover accent="true"><mi>t</mi><mo>‾</mo></mover></math></td>
+    <td style="text-align:left">The zero-meaned template. A vector of length <span class="m">N</span> </td></tr>
+<tr><td><math><mrow><mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo stretchy="false">(</mo><mi>p</mi><mo stretchy="false">)</mo></mrow></math></td>
+    <td style="text-align:left">The input image warped by parameters <span class="m">p</span> , zero-meaned</td></tr>
+<tr><td><math><mi>G</mi></math></td>
+    <td style="text-align:left">The Jacobian <math><mrow><mo>∂</mo><mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo>/</mo><mo>∂</mo><mi>p</mi></mrow></math> .<span class="m">N</span> × <span class="m">P</span> matrix. In the code, <code>jacobian</code></td></tr>
+<tr><td><math><msub><mi>g</mi><mi>n</mi></msub></math></td>
+    <td style="text-align:left">The gradient of the warped image at pixel <span class="m">n</span> . In the code, <math><mrow><mo>(</mo><msub><mi>g</mi><mi>x</mi></msub><mo>,</mo><msub><mi>g</mi><mi>y</mi></msub><mo>)</mo></mrow></math> <code>gradientXWarped</code>, <code>gradientYWarped</code></td></tr>
+<tr><td><math><msub><mi>c</mi><mi>n</mi></msub></math></td>
+    <td style="text-align:left">The window coordinates of pixel <span class="m">n</span> as a <math><mrow><mo>(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo>,</mo><mn>1</mn><mo>)</mo></mrow></math> . In the code, <code>Xgrid</code>, <code>Ygrid</code></td></tr>
+</tbody></table></div>
+
+<h3>1.2 What the iteration solves</h3>
+
+<p>ECC (Evangelidis &amp; Psarakis, PAMI 2008) maximises the normalised correlation.</p>
+
+<div class="eq">
+<math display="block">
+  <mrow>
+    <mi>ρ</mi><mo stretchy="false">(</mo><mi>p</mi><mo stretchy="false">)</mo>
+    <mo>=</mo>
+    <mfrac>
+      <mrow>
+        <mo>⟨</mo>
+        <mover accent="true"><mi>t</mi><mo>‾</mo></mover>
+        <mo>,</mo>
+        <mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo stretchy="false">(</mo><mi>p</mi><mo stretchy="false">)</mo>
+        <mo>⟩</mo>
+      </mrow>
+      <mrow>
+        <mo>‖</mo><mover accent="true"><mi>t</mi><mo>‾</mo></mover><mo>‖</mo>
+        <mspace width="0.25em"/>
+        <mo>‖</mo><mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo stretchy="false">(</mo><mi>p</mi><mo stretchy="false">)</mo><mo>‖</mo>
+      </mrow>
+    </mfrac>
+  </mrow>
+</math>
+</div>
+
+<p>It is a forward-additive Gauss-Newton iteration, and every step starts by building these three:</p>
+
+<div class="eq">
+<math display="block">
+  <mtable columnalign="right center left" rowspacing="0.5em" columnspacing="0.3em">
+    <mtr>
+      <mtd><mi>H</mi></mtd><mtd><mo>=</mo></mtd>
+      <mtd><mrow><msup><mi>G</mi><mtext>T</mtext></msup><mi>G</mi></mrow></mtd>
+    </mtr>
+    <mtr>
+      <mtd><msub><mi>v</mi><mtext>i</mtext></msub></mtd><mtd><mo>=</mo></mtd>
+      <mtd><mrow><msup><mi>G</mi><mtext>T</mtext></msup><mover accent="true"><mi>i</mi><mo>‾</mo></mover></mrow></mtd>
+    </mtr>
+    <mtr>
+      <mtd><msub><mi>v</mi><mtext>t</mtext></msub></mtd><mtd><mo>=</mo></mtd>
+      <mtd><mrow><msup><mi>G</mi><mtext>T</mtext></msup><mover accent="true"><mi>t</mi><mo>‾</mo></mover></mrow></mtd>
+    </mtr>
+  </mtable>
+</math>
+<span class="cm"><span class="m">H</span> is the <span class="m">P</span>×<span class="m">P</span> Hessian (the Gram matrix). <span class="m">v</span><sub class="m">i</sub>, <span class="m">v</span><sub class="m">t</sub> is a vector of length <span class="m">P</span> .</span>
+</div>
+
+<p>It then finds the scale <span class="m">λ</span> that absorbs the illumination change,</p>
+
+<div class="eq">
+<math display="block">
+  <mrow>
+    <mi>λ</mi><mo>=</mo>
+    <mfrac>
+      <mrow>
+        <msup><mrow><mo>‖</mo><mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo>‖</mo></mrow><mn>2</mn></msup>
+        <mo>−</mo>
+        <msubsup><mi>v</mi><mtext>i</mtext><mtext>T</mtext></msubsup>
+        <msup><mi>H</mi><mrow><mo>−</mo><mn>1</mn></mrow></msup>
+        <msub><mi>v</mi><mtext>i</mtext></msub>
+      </mrow>
+      <mrow>
+        <mo>⟨</mo><mover accent="true"><mi>t</mi><mo>‾</mo></mover><mo>,</mo>
+        <mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo>⟩</mo>
+        <mo>−</mo>
+        <msubsup><mi>v</mi><mtext>t</mtext><mtext>T</mtext></msubsup>
+        <msup><mi>H</mi><mrow><mo>−</mo><mn>1</mn></mrow></msup>
+        <msub><mi>v</mi><mtext>i</mtext></msub>
+      </mrow>
+    </mfrac>
+  </mrow>
+</math>
+</div>
+
+<p>and forms the parameter update.</p>
+
+<div class="eq">
+<math display="block">
+  <mrow>
+    <mi>Δ</mi><mi>p</mi><mo>=</mo>
+    <msup><mi>H</mi><mrow><mo>−</mo><mn>1</mn></mrow></msup>
+    <msup><mi>G</mi><mtext>T</mtext></msup>
+    <mrow><mo>(</mo>
+      <mi>λ</mi><mover accent="true"><mi>t</mi><mo>‾</mo></mover>
+      <mo>−</mo>
+      <mover accent="true"><mi>i</mi><mo>‾</mo></mover>
+    <mo>)</mo></mrow>
+  </mrow>
+</math>
+</div>
+
+<div class="note"> There are <b><math><msup><mi>G</mi><mtext>T</mtext></msup></math>four multiplications by </b> here: one in <span class="m">H</span> (with itself), one each in <span class="m">v</span><sub class="m">i</sub> and <span class="m">v</span><sub class="m">t</sub> , and one in <span class="m">Δp</span> . OpenCV implements them as four calls to <code>project_onto_jacobian_ECC()</code> . <b>This report takes those four down to zero.</b>
+</div>
+
+<h2>2. The current implementation, and what it costs</h2>
+
+<h3>2.1 How the Jacobian is laid out</h3>
+
+<p>OpenCV keeps the Jacobian as a single <b><code>hs × (ws*P)</code> of size <code>Mat</code></b> -- <span class="m">P</span> blocks side by side.</p>
+
+<pre><span class="c">// modules/video/src/ecc.cpp</span>
+<span class="k">static void</span> image_jacobian_affine_ECC(<span class="k">const</span> Mat&amp; src1, <span class="k">const</span> Mat&amp; src2,
+                                      <span class="k">const</span> Mat&amp; src3, <span class="k">const</span> Mat&amp; src4, Mat&amp; dst)
+{
+    <span class="k">const int</span> w = src1.cols;
+    dst.colRange(<span class="n">0</span>, w)     = src1.mul(src3);  <span class="c">// gx * x</span>
+    dst.colRange(w, <span class="n">2</span>*w)   = src2.mul(src3);  <span class="c">// gy * x</span>
+    dst.colRange(<span class="n">2</span>*w, <span class="n">3</span>*w) = src1.mul(src4);  <span class="c">// gx * y</span>
+    dst.colRange(<span class="n">3</span>*w, <span class="n">4</span>*w) = src2.mul(src4);  <span class="c">// gy * y</span>
+    src1.copyTo(dst.colRange(<span class="n">4</span>*w, <span class="n">5</span>*w));        <span class="c">// gx</span>
+    src2.copyTo(dst.colRange(<span class="n">5</span>*w, <span class="n">6</span>*w));        <span class="c">// gy</span>
+}</pre>
+
+<p>Because of that side-by-side layout, <b>each block is not contiguous memory but a strided view with a row stride of <code>ws*P</code> .</b>2.2 The Hessian re-reads the blocks </p>
+
+<h3> times<span class="m">P</span><sup class="m">2</sup>// dst is square, so this is the Hessian</h3>
+
+<pre><span class="k">static void</span> project_onto_jacobian_ECC(<span class="k">const</span> Mat&amp; src1, <span class="k">const</span> Mat&amp; src2, Mat&amp; dst)
+{
+    ...
+    <span class="k">else</span> {  <span class="c">// block i</span>
+        w = src2.cols / dst.cols;
+        Mat mat;
+        <span class="k">for</span> (<span class="k">int</span> i = <span class="n">0</span>; i &lt; dst.rows; i++) {
+            mat = Mat(src1.colRange(i*w, (i+<span class="n">1</span>)*w));         <span class="c">// diagonal: one plane read</span>
+            dstPtr[i*(dst.rows+<span class="n">1</span>)] = pow(norm(mat), <span class="n">2</span>);    <span class="c">// two planes read (i and j)</span>
+
+            <span class="k">for</span> (<span class="k">int</span> j = i+<span class="n">1</span>; j &lt; dst.cols; j++) {
+                dstPtr[i*dst.cols+j] =
+                    mat.dot(src2.colRange(j*w, (j+<span class="n">1</span>)*w));    <span class="c"> is </span>
+                dstPtr[j*dst.cols+i] = dstPtr[i*dst.cols+j];
+            }
+        }
+    }
+}</pre>
+
+<p><code>mat</code> held across the <code>i</code> loop, but <b><code>Mat::dot</code> is re-read from memory every time</b>. If the window does not fit in L3, that means going to DRAM each time. Six diagonal planes plus fifteen off-diagonal pairs at two planes each comes to <b>36 planes</b> .</p>
+
+<p>The vector projections have the same shape: <code>src2</code> (the image) and each block are read <span class="m">P</span> times, so one projection is <b>12 planes</b> , and there are three of them.</p>
+
+<h3>2.3 Counting the plane passes per iteration</h3>
+
+<div class="tw"><table>
+<thead><tr><th style="text-align:left">stage</th><th>read</th><th>write</th><th>total</th></tr></thead>
+<tbody>
+<tr><td>Jacobian assembly (<code>gx</code>, <code>gy</code>, <code>x</code>, <code>y</code> into 6 blocks)</td><td>4</td><td>6</td><td>10</td></tr>
+<tr><td><code>project(J, J)</code> -- the Hessian</td><td class="bad">36</td><td class="dim">—</td><td class="bad">36</td></tr>
+<tr><td><code>project(J, ī)</code> -- projecting the image</td><td>12</td><td class="dim">—</td><td>12</td></tr>
+<tr><td><code>project(J, t̄)</code> -- projecting the template</td><td>12</td><td class="dim">—</td><td>12</td></tr>
+<tr><td><code>error = λ·t̄ − ī</code>building </td><td>2</td><td>1</td><td>3</td></tr>
+<tr><td><code>project(J, error)</code> -- projecting the update</td><td>12</td><td class="dim">—</td><td>12</td></tr>
+<tr><td><b>total</b></td><td></td><td></td><td class="bad"><b>85 planes</b></td></tr>
+</tbody></table></div>
+
+<p>At a 768 px window one plane is 590K x 4 B = 2.25 MB, so that is <b>191 MB per iteration</b> of memory traffic. And because <code>Mat::dot</code> has no <code>parallel_for_</code> , all 85 of those planes stream on a single thread.</p>
+
+<div class="note"> Measured, <b>at window 768 on 12 threads this stage is 8.8 ms of a 16.0 ms iteration (55%)</b> (those 8.8 ms cover 70 of the 85 planes -- the fourth projection and building <code>error</code> are not included in the 6.1 measurement, so the real share is a little higher). The two warps that the warp reduction targets are 1.12 ms (7%) under the same conditions. </div>
+
+<h2>3. Optimisation 1: the fourth projection falls out of the algebra</h2>
+
+<p>It is enough to expand the projection of the update.</p>
+
+<div class="eq">
+<math display="block">
+  <mtable columnalign="right center left" rowspacing="0.45em" columnspacing="0.3em">
+    <mtr>
+      <mtd>
+        <mrow>
+          <msup><mi>G</mi><mtext>T</mtext></msup>
+          <mrow><mo>(</mo>
+            <mi>λ</mi><mover accent="true"><mi>t</mi><mo>‾</mo></mover>
+            <mo>−</mo><mover accent="true"><mi>i</mi><mo>‾</mo></mover>
+          <mo>)</mo></mrow>
+        </mrow>
+      </mtd>
+      <mtd><mo>=</mo></mtd>
+      <mtd>
+        <mrow>
+          <mi>λ</mi>
+          <mrow><mo>(</mo><msup><mi>G</mi><mtext>T</mtext></msup>
+            <mover accent="true"><mi>t</mi><mo>‾</mo></mover><mo>)</mo></mrow>
+          <mo>−</mo>
+          <mrow><mo>(</mo><msup><mi>G</mi><mtext>T</mtext></msup>
+            <mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo>)</mo></mrow>
+        </mrow>
+      </mtd>
+    </mtr>
+    <mtr>
+      <mtd></mtd><mtd><mo>=</mo></mtd>
+      <mtd>
+        <mrow>
+          <mi>λ</mi><msub><mi>v</mi><mtext>t</mtext></msub>
+          <mo>−</mo><msub><mi>v</mi><mtext>i</mtext></msub>
+        </mrow>
+      </mtd>
+    </mtr>
+  </mtable>
+</math>
+<span class="cm">Plain linearity.<span class="m">v</span><sub class="m">t</sub> and <span class="m">v</span><sub class="m">i</sub> have already been computed.</span>
+</div>
+
+<p><b>The fourth <code>project_onto_jacobian_ECC</code> (12 planes) is unnecessary, and so is building the <code>error</code> matrix it consumes (3 planes). 85 planes become 70.</b></p>
+
+<pre><span class="c">// before</span>
+error = lambda*templateZM - imageWarped;
+project_onto_jacobian_ECC(jacobian, error, errorProjection);
+
+<span class="c">// after</span>
+errorProjection = lambda*templateProjection - imageProjection;</pre>
+
+<div class="good-note"> This is <b>a three-line substitution that changes no structure</b> -- it touches neither the layout nor the algorithm. Accuracy is unchanged (the floating-point rounding differs, but skipping the intermediate <code>error</code> matrix removes an error source rather than adding one). <b>It can go upstream on its own, and it helps every motion type.</b>
+</div>
+
+<h2>4. Optimisation 2: the affine Hessian has only 18 degrees of freedom</h2>
+
+<h3>4.1 The Jacobian is a face-splitting product</h3>
+
+<p>An affine warp is</p>
+
+<div class="eq tight">
+<math display="block">
+  <mtable columnalign="right center left" columnspacing="0.3em" rowspacing="0.35em">
+    <mtr>
+      <mtd><msup><mi>x</mi><mo>′</mo></msup></mtd><mtd><mo>=</mo></mtd>
+      <mtd><mrow><msub><mi>p</mi><mn>0</mn></msub><mi>x</mi><mo>+</mo>
+                 <msub><mi>p</mi><mn>2</mn></msub><mi>y</mi><mo>+</mo>
+                 <msub><mi>p</mi><mn>4</mn></msub></mrow></mtd>
+    </mtr>
+    <mtr>
+      <mtd><msup><mi>y</mi><mo>′</mo></msup></mtd><mtd><mo>=</mo></mtd>
+      <mtd><mrow><msub><mi>p</mi><mn>1</mn></msub><mi>x</mi><mo>+</mo>
+                 <msub><mi>p</mi><mn>3</mn></msub><mi>y</mi><mo>+</mo>
+                 <msub><mi>p</mi><mn>5</mn></msub></mrow></mtd>
+    </mtr>
+  </mtable>
+</math>
+</div>
+
+<p> so the six partial derivatives at pixel <span class="m">n</span> are these:</p>
+
+<div class="eq">
+<math display="block">
+  <mrow>
+    <mfrac><mrow><mo>∂</mo><mover accent="true"><mi>i</mi><mo>‾</mo></mover></mrow>
+           <mrow><mo>∂</mo><mi>p</mi></mrow></mfrac>
+    <mo>=</mo>
+    <mrow><mo>[</mo>
+      <mtable columnspacing="1.1em"><mtr>
+        <mtd><mrow><msub><mi>g</mi><mi>x</mi></msub><mi>x</mi></mrow></mtd>
+        <mtd><mrow><msub><mi>g</mi><mi>y</mi></msub><mi>x</mi></mrow></mtd>
+        <mtd><mrow><msub><mi>g</mi><mi>x</mi></msub><mi>y</mi></mrow></mtd>
+        <mtd><mrow><msub><mi>g</mi><mi>y</mi></msub><mi>y</mi></mrow></mtd>
+        <mtd><msub><mi>g</mi><mi>x</mi></msub></mtd>
+        <mtd><msub><mi>g</mi><mi>y</mi></msub></mtd>
+      </mtr></mtable>
+    <mo>]</mo></mrow>
+  </mrow>
+</math>
+<span class="cm">Left to right they correspond to <span class="m">p</span><sub class="m">0</sub> … <span class="m">p</span><sub class="m">5</sub> . The last two are the translation, so no coordinate multiplies them (they are multiplied by 1).</span>
+</div>
+
+<p>That is exactly the <b>Kronecker product of the 2-vector <math><msub><mi>g</mi><mi>n</mi></msub></math> with the 3-vector <math><msub><mi>c</mi><mi>n</mi></msub></math> </b> ,</p>
+
+<div class="eq">
+<math display="block">
+  <mrow>
+    <mtext>row n of G</mtext>
+    <mo>=</mo>
+    <msub><mi>g</mi><mi>n</mi></msub>
+    <mo>⊗</mo>
+    <msub><mi>c</mi><mi>n</mi></msub>
+    <mo>,</mo>
+    <mspace width="1.4em"/>
+    <msub><mi>g</mi><mi>n</mi></msub><mo>=</mo>
+    <mrow><mo>(</mo><msub><mi>g</mi><mi>x</mi></msub><mo>,</mo><msub><mi>g</mi><mi>y</mi></msub><mo>)</mo></mrow>
+    <mo>,</mo>
+    <mspace width="0.8em"/>
+    <msub><mi>c</mi><mi>n</mi></msub><mo>=</mo>
+    <mrow><mo>(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo>,</mo><mn>1</mn><mo>)</mo></mrow>
+  </mrow>
+</math>
+<span class="cm">6 = 2 x 3. <span class="m">G</span> is the <b>face-splitting product</b> (a row-wise Kronecker product) of the gradient matrix and the coordinate matrix.</span>
+</div>
+
+<p>So the Hessian takes this form.</p>
+
+<div class="eq">
+<math display="block">
+  <mrow>
+    <mi>H</mi><mo>=</mo>
+    <msup><mi>G</mi><mtext>T</mtext></msup><mi>G</mi>
+    <mo>=</mo>
+    <munder><mo>∑</mo><mi>n</mi></munder>
+    <mrow><mo>(</mo><msub><mi>g</mi><mi>n</mi></msub>
+      <msubsup><mi>g</mi><mi>n</mi><mtext>T</mtext></msubsup><mo>)</mo></mrow>
+    <mo>⊗</mo>
+    <mrow><mo>(</mo><msub><mi>c</mi><mi>n</mi></msub>
+      <msubsup><mi>c</mi><mi>n</mi><mtext>T</mtext></msubsup><mo>)</mo></mrow>
+  </mrow>
+</math>
+<span class="cm"><math><mrow><mo>(</mo><mi>a</mi><mo>⊗</mo><mi>b</mi><mo>)</mo></mrow><msup><mrow><mo>(</mo><mi>a</mi><mo>⊗</mo><mi>b</mi><mo>)</mo></mrow><mtext>T</mtext></msup>
+<mo>=</mo><mrow><mo>(</mo><mi>a</mi><msup><mi>a</mi><mtext>T</mtext></msup><mo>)</mo></mrow><mo>⊗</mo><mrow><mo>(</mo><mi>b</mi><msup><mi>b</mi><mtext>T</mtext></msup><mo>)</mo></mrow></math> applied at every pixel and summed, and nothing more.</span>
+</div>
+
+<p><math><mrow><msub><mi>g</mi><mi>n</mi></msub><msubsup><mi>g</mi><mi>n</mi><mtext>T</mtext></msubsup></mrow></math> is 2x2 symmetric with 3 independent entries (<math><msubsup><mi>g</mi><mi>x</mi><mn>2</mn></msubsup></math>,
+<math><mrow><msub><mi>g</mi><mi>x</mi></msub><msub><mi>g</mi><mi>y</mi></msub></mrow></math>,
+<math><msubsup><mi>g</mi><mi>y</mi><mn>2</mn></msubsup></math>), and <math><mrow><msub><mi>c</mi><mi>n</mi></msub><msubsup><mi>c</mi><mi>n</mi><mtext>T</mtext></msubsup></mrow></math> is 3x3 symmetric with 6 independent entries (<math><msup><mi>x</mi><mn>2</mn></msup></math>,
+<math><mrow><mi>x</mi><mi>y</mi></mrow></math>,
+<math><msup><mi>y</mi><mn>2</mn></msup></math>,
+<math><mi>x</mi></math>, <math><mi>y</mi></math>, <math><mn>1</mn></math>). Therefore:</p>
+
+<div class="good-note">
+<b>The 21 upper-triangular entries of the 6x6 Hessian can be written with only 3 x 6 = 18 sums.</b> The other three are duplicates (<span class="m">H</span><sub class="m">12</sub> = <span class="m">H</span><sub class="m">03</sub>, <span class="m">H</span><sub class="m">14</sub> = <span class="m">H</span><sub class="m">05</sub>, <span class="m">H</span><sub class="m">34</sub> = <span class="m">H</span><sub class="m">25</sub> -- all of them duplicates on the <math><mrow><msub><mi>g</mi><mi>x</mi></msub><msub><mi>g</mi><mi>y</mi></msub></mrow></math> side). The affine ECC Hessian is not a general symmetric matrix. </div>
+
+<h3>4.2 The correspondence</h3>
+
+<p>Rows are the 3 entries of <math><mrow><msub><mi>g</mi><mi>n</mi></msub><msubsup><mi>g</mi><mi>n</mi><mtext>T</mtext></msubsup></mrow></math> , columns the 6 entries of <math><mrow><msub><mi>c</mi><mi>n</mi></msub><msubsup><mi>c</mi><mi>n</mi><mtext>T</mtext></msubsup></mrow></math> . Each cell names the Hessian entry it becomes.</p>
+
+<div class="tw"><table>
+<thead><tr><th style="text-align:left"></th>
+<th><math><msup><mi>x</mi><mn>2</mn></msup></math></th>
+<th><math><mrow><mi>x</mi><mi>y</mi></mrow></math></th>
+<th><math><msup><mi>y</mi><mn>2</mn></msup></math></th>
+<th><math><mi>x</mi></math></th>
+<th><math><mi>y</mi></math></th>
+<th><math><mn>1</mn></math></th></tr></thead>
+<tbody>
+<tr><td class="grp"><math><msubsup><mi>g</mi><mi>x</mi><mn>2</mn></msubsup></math></td>
+    <td>H₀₀</td><td>H₀₂</td><td>H₂₂</td><td>H₀₄</td><td>H₂₄</td><td>H₄₄</td></tr>
+<tr><td class="grp"><math><mrow><msub><mi>g</mi><mi>x</mi></msub><msub><mi>g</mi><mi>y</mi></msub></mrow></math></td>
+    <td>H₀₁</td><td class="best">H₀₃ = H₁₂</td><td>H₂₃</td><td class="best">H₀₅ = H₁₄</td><td class="best">H₂₅ = H₃₄</td><td>H₄₅</td></tr>
+<tr><td class="grp"><math><msubsup><mi>g</mi><mi>y</mi><mn>2</mn></msubsup></math></td>
+    <td>H₁₁</td><td>H₁₃</td><td>H₃₃</td><td>H₁₅</td><td>H₃₅</td><td>H₅₅</td></tr>
+</tbody></table></div>
+
+<p>The projections have the same structure: entry <math><mrow><msup><mi>G</mi><mtext>T</mtext></msup><mi>v</mi></mrow></math> of <math><mrow><mo>(</mo><mi>g</mi><mo>,</mo><mi>c</mi><mo>)</mo></mrow></math> is <math><mrow><munder><mo>∑</mo><mi>n</mi></munder><mi>g</mi><mi>c</mi><mi>v</mi></mrow></math> . There are no duplicates, 6 each, 12 for the two of them. <b>Accumulate 30 scalars and this whole stage is done.</b></p>
+
+<h3>4.3 All four motion types have the same shape</h3>
+
+<p>This structure is not specific to affine. <b>For every motion type, the ECC Jacobian can be written as a column subset of the face-splitting product of a gradient-side vector <span class="m">u</span> with a coordinate-side vector <span class="m">w</span> </b> . What differs is the contents of <span class="m">u</span> and <span class="m">w</span> , and which columns are taken.</p>
+
+<div class="tw"><table>
+<thead><tr><th>motion type</th><th><span class="m">P</span></th>
+<th><span class="m">u</span> (gradient side)</th><th><span class="m">w</span> (coordinate side)</th>
+<th>columns</th><th><span class="m">H</span> entries</th><th>scalars accumulated</th></tr></thead>
+<tbody>
+<tr><td>translation</td><td>2</td>
+    <td><math><mrow><mo>(</mo><msub><mi>g</mi><mi>x</mi></msub><mo>,</mo><msub><mi>g</mi><mi>y</mi></msub><mo>)</mo></mrow></math></td>
+    <td><math><mrow><mo>(</mo><mn>1</mn><mo>)</mo></mrow></math></td>
+    <td>2 = 2x1 (all)</td><td>3</td><td>3</td></tr>
+<tr><td>euclidean</td><td>3</td>
+    <td><math><mrow><mo>(</mo><msub><mi>g</mi><mi>r</mi></msub><mo>,</mo><msub><mi>g</mi><mi>x</mi></msub><mo>,</mo><msub><mi>g</mi><mi>y</mi></msub><mo>)</mo></mrow></math></td>
+    <td><math><mrow><mo>(</mo><mn>1</mn><mo>)</mo></mrow></math></td>
+    <td>3 = 3x1 (all)</td><td>6</td><td>6</td></tr>
+<tr><td><b>affine</b></td><td>6</td>
+    <td><math><mrow><mo>(</mo><msub><mi>g</mi><mi>x</mi></msub><mo>,</mo><msub><mi>g</mi><mi>y</mi></msub><mo>)</mo></mrow></math></td>
+    <td><math><mrow><mo>(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo>,</mo><mn>1</mn><mo>)</mo></mrow></math></td>
+    <td>6 = 2x3 (all)</td><td>21</td><td class="best">18</td></tr>
+<tr><td>homography</td><td>8</td>
+    <td><math><mrow><mo>(</mo><msub><mi>g</mi><mi>x</mi></msub><mo>,</mo><msub><mi>g</mi><mi>y</mi></msub><mo>,</mo><msub><mi>g</mi><mi>p</mi></msub><mo>)</mo></mrow></math></td>
+    <td><math><mrow><mo>(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo>,</mo><mn>1</mn><mo>)</mo></mrow></math></td>
+    <td>8 = 3×3 − 1</td><td>36</td><td>36</td></tr>
+</tbody></table></div>
+
+<p>The number of scalars is always <math><mrow><mi>tri</mi><mo>(</mo><mi>K</mi><mo>)</mo><mo>·</mo><mi>tri</mi><mo>(</mo><mi>L</mi><mo>)</mo></mrow></math> (<math><mrow><mi>tri</mi><mo>(</mo><mi>n</mi><mo>)</mo><mo>=</mo><mi>n</mi><mo>(</mo><mi>n</mi><mo>+</mo><mn>1</mn><mo>)</mo><mo>/</mo><mn>2</mn></mrow></math>). <b>Affine is the only one that genuinely gains, 18 &lt; 21</b> , because 6 = 2x3 is the only case with <math><mrow><mi>K</mi><mo>,</mo><mi>L</mi><mo>&gt;</mo><mn>1</mn></mrow></math> that also uses every column. For the rest the counts coincide exactly.</p>
+
+<div class="good-note"> But <b>the real gain is not the smaller count -- it is never materialising the Jacobian</b> . That takes one pass regardless of <span class="m">P</span> , so <b>the saving grows with <span class="m">P</span> </b> . The measurements in 6 come out exactly that way (window 768 on four threads: translation 1.27x rising to homography 2.47x). </div>
+
+<h4>What is <math><msub><mi>g</mi><mi>p</mi></msub></math> for homography</h4>
+
+<p>The Jacobian of a projective warp carries a per-pixel division <math><mrow><mi>d</mi><mo>=</mo><msub><mi>h</mi><mn>6</mn></msub><mi>x</mi><mo>+</mo>
+<msub><mi>h</mi><mn>7</mn></msub><mi>y</mi><mo>+</mo><mn>1</mn></mrow></math> . At first sight that breaks the face-splitting form, but it does not. <b>Fold the division into the gradient side</b> . OpenCV's own <code>image_jacobian_homo_ECC</code> already does exactly that:</p>
+
+<div class="eq tight">
+<math display="block"><mrow>
+  <msub><mi>g</mi><mi>x</mi></msub><mo>=</mo><msub><mi>I</mi><mi>x</mi></msub><mo>/</mo><mi>d</mi>
+  <mo>,</mo><mspace width="1.2em"/>
+  <msub><mi>g</mi><mi>y</mi></msub><mo>=</mo><msub><mi>I</mi><mi>y</mi></msub><mo>/</mo><mi>d</mi>
+  <mo>,</mo><mspace width="1.2em"/>
+  <msub><mi>g</mi><mi>p</mi></msub><mo>=</mo>
+  <mo>−</mo><msup><mi>x</mi><mo>′</mo></msup><msub><mi>g</mi><mi>x</mi></msub>
+  <mo>−</mo><msup><mi>y</mi><mo>′</mo></msup><msub><mi>g</mi><mi>y</mi></msub>
+</mrow></math>
+<span class="cm"><math><mrow><msup><mi>x</mi><mo>′</mo></msup><mo>,</mo><msup><mi>y</mi><mo>′</mo></msup></mrow></math> are the projected coordinates. <code>hatX_</code> / <code>hatY_</code> correspond to them.</span>
+</div>
+
+<p>Of the nine products of those three with <math><mrow><mo>(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo>,</mo><mn>1</mn><mo>)</mo></mrow></math> , the eight excluding <math><mrow><msub><mi>g</mi><mi>p</mi></msub><mo>·</mo><mn>1</mn></mrow></math> are the eight columns, unchanged.<b>Far from being the exception, homography had the most headroom of all.</b></p>
+
+<h2>5. Optimisation 3: no Jacobian, one pass, in parallel</h2>
+
+<p>The 30 scalars need only <code>gx</code>, <code>gy</code>, <code>x</code>, <code>y</code>, <code>ī</code>, <code>t̄</code> -- <b>six planes</b> . The Jacobian never has to be written, and never has to be read back.</p>
+
+<div class="chart">
+  <h4>Data flow, one iteration</h4>
+  <p class="cap">Left: the current code. The Jacobian is materialised and re-read by four projections. Right: fused. Six planes are read once.</p>
+  <svg viewBox="0 0 940 300" role="img" aria-label="current against fused data flow">
+    <text x="16" y="20" fill="#ff6b6b" font-size="14" font-weight="700">current -- 85 planes</text>
+    <rect x="16" y="34" width="86" height="86" rx="6" fill="#1d2740" stroke="#3a4763"/>
+    <text x="59" y="70" fill="#cdd8ea" font-size="11.5" text-anchor="middle">gx gy</text>
+    <text x="59" y="88" fill="#cdd8ea" font-size="11.5" text-anchor="middle">x  y</text>
+    <text x="59" y="106" fill="#9aa7bd" font-size="10.5" text-anchor="middle">4 planes</text>
+    <path d="M106 77 L142 77" stroke="#5aa9ff" stroke-width="2" marker-end="url(#ah)"/>
+    <text x="124" y="70" fill="#9aa7bd" font-size="10" text-anchor="middle">assemble</text>
+    <g>
+      <rect x="146" y="34" width="30" height="86" rx="3" fill="#243050" stroke="#3a4763"/>
+      <rect x="180" y="34" width="30" height="86" rx="3" fill="#243050" stroke="#3a4763"/>
+      <rect x="214" y="34" width="30" height="86" rx="3" fill="#243050" stroke="#3a4763"/>
+      <rect x="248" y="34" width="30" height="86" rx="3" fill="#243050" stroke="#3a4763"/>
+      <rect x="282" y="34" width="30" height="86" rx="3" fill="#243050" stroke="#3a4763"/>
+      <rect x="316" y="34" width="30" height="86" rx="3" fill="#243050" stroke="#3a4763"/>
+    </g>
+    <text x="246" y="136" fill="#cdd8ea" font-size="11.5" text-anchor="middle">Jacobian hs x (ws*6), 6 planes written</text>
+    <text x="246" y="152" fill="#9aa7bd" font-size="10.5" text-anchor="middle">each block is a strided view with row stride ws*6</text>
+    <path d="M246 160 L246 186" stroke="#ff6b6b" stroke-width="2" marker-end="url(#ar)"/>
+    <rect x="120" y="190" width="252" height="86" rx="8" fill="#241a1e" stroke="#57343a"/>
+    <text x="246" y="211" fill="#ff9aa2" font-size="12" text-anchor="middle">project_onto_jacobian_ECC × 4</text>
+    <text x="246" y="231" fill="#e7ecf3" font-size="11.5" text-anchor="middle">Hessian 36 planes + projections 12x3</text>
+    <text x="246" y="250" fill="#ff6b6b" font-size="11.5" font-weight="700" text-anchor="middle">72 planes re-read</text>
+    <text x="246" y="268" fill="#9aa7bd" font-size="10.5" text-anchor="middle">Mat::dot is not parallelised</text>
+
+    <line x1="410" y1="24" x2="410" y2="284" stroke="#27314a" stroke-width="1" stroke-dasharray="5 5"/>
+
+    <text x="446" y="20" fill="#37d39b" font-size="14" font-weight="700">fused -- 6 planes</text>
+    <rect x="446" y="34" width="120" height="120" rx="6" fill="#1d2740" stroke="#3a4763"/>
+    <text x="506" y="62" fill="#cdd8ea" font-size="11.5" text-anchor="middle">gx  gy</text>
+    <text x="506" y="82" fill="#cdd8ea" font-size="11.5" text-anchor="middle">x   y</text>
+    <text x="506" y="102" fill="#cdd8ea" font-size="11.5" text-anchor="middle">ī    t̄</text>
+    <text x="506" y="126" fill="#37d39b" font-size="11" text-anchor="middle">6 planes read, nothing else</text>
+    <text x="506" y="144" fill="#9aa7bd" font-size="10.5" text-anchor="middle">no Jacobian is built</text>
+    <path d="M570 94 L610 94" stroke="#37d39b" stroke-width="2" marker-end="url(#ag)"/>
+    <rect x="614" y="46" width="180" height="96" rx="8" fill="#16241f" stroke="#24503f"/>
+    <text x="704" y="70" fill="#37d39b" font-size="12" text-anchor="middle">one pass, parallel over row stripes</text>
+    <text x="704" y="92" fill="#e7ecf3" font-size="11.5" text-anchor="middle">accumulate 30 scalars</text>
+    <text x="704" y="112" fill="#9aa7bd" font-size="10.5" text-anchor="middle">Gram 18 + projections 6x2</text>
+    <text x="704" y="131" fill="#9aa7bd" font-size="10.5" text-anchor="middle">parallel_for_(Range(0, hs))</text>
+    <path d="M704 146 L704 186" stroke="#37d39b" stroke-width="2" marker-end="url(#ag)"/>
+    <rect x="602" y="190" width="204" height="86" rx="8" fill="#1d2740" stroke="#3a4763"/>
+    <text x="704" y="217" fill="#e7ecf3" font-size="12" text-anchor="middle">H (6×6),  v_i,  v_t</text>
+    <text x="704" y="240" fill="#9aa7bd" font-size="11" text-anchor="middle">the update projection is lambda*v_t - v_i</text>
+    <text x="704" y="260" fill="#9aa7bd" font-size="11" text-anchor="middle">(no extra pass)</text>
+
+    <defs>
+      <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0 0 L8 4 L0 8 z" fill="#5aa9ff"/></marker>
+      <marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0 0 L8 4 L0 8 z" fill="#ff6b6b"/></marker>
+      <marker id="ag" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0 0 L8 4 L0 8 z" fill="#37d39b"/></marker>
+    </defs>
+  </svg>
+</div>
+
+<h3>5.1 The inner loop</h3>
+
+<p>Accumulate in <code>float</code> per row and promote to <code>double</code> at the end of each row. It is straight-line code, so the compiler can vectorise it, and the per-row promotion keeps the precision.</p>
+
+<pre><span class="k">for</span> (<span class="k">int</span> x = <span class="n">0</span>; x &lt; w; ++x) {
+    <span class="k">const float</span> a = pgx[x], b = pgy[x], u = pX[x], v = pY[x];
+    <span class="k">const float</span> aa = a*a, ab = a*b, bb = b*b;   <span class="c">// the 3 entries of g g^T</span>
+    <span class="k">const float</span> uu = u*u, uv = u*v, vv = v*v;   <span class="c">// the 6 entries of c c^T (u, v, 1 are trivial)</span>
+
+    g00 += aa*uu;  g01 += aa*uv;  g02 += aa*vv;   <span class="c">// gx^2 row</span>
+    g03 += aa*u;   g04 += aa*v;   g05 += aa;
+    g10 += ab*uu;  g11 += ab*uv;  g12 += ab*vv;   <span class="c">// gxgy row</span>
+    g13 += ab*u;   g14 += ab*v;   g15 += ab;
+    g20 += bb*uu;  g21 += bb*uv;  g22 += bb*vv;   <span class="c">// gy^2 row</span>
+    g23 += bb*u;   g24 += bb*v;   g25 += bb;
+
+    <span class="k">const float</span> ii = pim[x], tt = ptm[x];
+    <span class="k">const float</span> ai = a*ii, bi = b*ii, at = a*tt, bt = b*tt;
+    pi0 += ai*u; pi1 += bi*u; pi2 += ai*v; pi3 += bi*v; pi4 += ai; pi5 += bi;
+    pt0 += at*u; pt1 += bt*u; pt2 += at*v; pt3 += bt*v; pt4 += at; pt5 += bt;
+}</pre>
+
+<p>6 multiplies + 18 FMA + 4 multiplies + 12 FMA per pixel, about <b>40 operations</b> . Looping naively over 21 <code>j[p]*j[q]</code> with <code>double</code> costs 72 operations instead, and a nested loop carrying <code>k++</code> does not vectorise (measured 2.4-2.8x slower).</p>
+
+<h3>5.2 Parallelism and the reduction</h3>
+
+<pre><span class="k">class</span> GNBody : <span class="k">public</span> ParallelLoopBody {
+    <span class="k">void</span> operator()(<span class="k">const</span> Range&amp; r) <span class="k">const</span> CV_OVERRIDE {
+        GNSums s;
+        gnRows(gx_, gy_, X_, Y_, im_, tm_, r.start, r.end, s);  <span class="c">// row stripe</span>
+        AutoLock lk(mtx_);
+        out_.push_back(s);                                       <span class="c">// only 30 scalars come back</span>
+    }
+};</pre>
+
+<p>Only 30 <code>double</code> cross thread boundaries, so the reduction is effectively free. This matters because <code>Mat::dot</code> is not parallelised, and <b>as it stands this stage uses one core out of twelve</b> .</p>
+
+<h2>6. Measurements</h2>
+
+<h3>6.1 This stage alone (<code>gnbench</code>)</h3>
+
+<p>affine, median of 7. The current column is Jacobian assembly plus Hessian plus two projections (the fourth is removed by optimisation 1, so it is excluded here; including it widens the gap).</p>
+
+<div class="tw"><table>
+<thead><tr><th>window</th><th>Hessian</th><th>projections x2</th><th>current, total</th><th>naive fusion (1T)</th><th>factorised (1T)</th><th>factorised (parallel)</th><th>vs current</th></tr></thead>
+<tbody>
+<tr><td>256</td><td>0.333</td><td>0.198</td><td>0.606</td><td class="bad">1.415</td><td>0.599</td><td class="best">0.203</td><td class="best">2.98×</td></tr>
+<tr><td>384</td><td>0.645</td><td>0.359</td><td>1.167</td><td class="bad">3.195</td><td>1.326</td><td class="best">0.435</td><td class="best">2.68×</td></tr>
+<tr><td>512</td><td>1.108</td><td>0.647</td><td>2.066</td><td class="bad">5.720</td><td>2.440</td><td class="best">1.024</td><td class="best">2.02×</td></tr>
+<tr><td>768</td><td>4.609</td><td>2.217</td><td>8.764</td><td class="bad">13.061</td><td>5.581</td><td class="best">1.826</td><td class="best">4.80×</td></tr>
+<tr><td>1024</td><td>7.440</td><td>4.600</td><td>15.387</td><td class="bad">27.375</td><td>9.690</td><td class="best">2.455</td><td class="best">6.27×</td></tr>
+</tbody></table></div>
+
+<p>Even pinned to a single thread, the factorised version beats the current code at large windows (window 1024: 15.47 -> 9.74 ms, 1.59x). Parallelism is on top of that.</p>
+
+<h3>6.2 Whole ECC (<code>eval</code>, per-iteration cost, median of three repeats)</h3>
+
+<p><code>ufix</code> = <a href="https://github.com/opencv/opencv/pull/29775">opencv#29775</a> (the border fix). <code>uboth</code> adds the fast-ecc warp reduction on top.<code>ugn</code> is the fused GN alone.<code>uall</code> is both.</p>
+
+<div class="chart">
+  <h4>Whole-ECC speed-up (<code>uall</code> / <code>ufix</code>)</h4>
+  <p class="cap">The larger the window -- where the warp reduction is powerless -- the more the fused stage pays (affine, 12 threads; the four-thread figures are in the table below).</p>
+  <svg viewBox="0 0 720 250" role="img" aria-label="whole-ECC speed-up by window size">
+    <line x1="70" y1="200" x2="690" y2="200" stroke="#3a4763" stroke-width="1"/>
+    <line x1="70" y1="160" x2="690" y2="160" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="120" x2="690" y2="120" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="80"  x2="690" y2="80"  stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="40"  x2="690" y2="40"  stroke="#27314a" stroke-width="1"/>
+    <text x="60" y="204" fill="#9aa7bd" font-size="11" text-anchor="end">1.0×</text>
+    <text x="60" y="164" fill="#9aa7bd" font-size="11" text-anchor="end">1.5×</text>
+    <text x="60" y="124" fill="#9aa7bd" font-size="11" text-anchor="end">2.0×</text>
+    <text x="60" y="84"  fill="#9aa7bd" font-size="11" text-anchor="end">2.5×</text>
+    <text x="60" y="44"  fill="#9aa7bd" font-size="11" text-anchor="end">3.0×</text>
+    <polyline points="70,159.2 276,156.0 483,144.8 690,143.2" fill="none" stroke="#5aa9ff" stroke-width="2.5"/>
+    <polyline points="70,150.4 276,139.2 483,100.8 690,79.2" fill="none" stroke="#37d39b" stroke-width="2.5"/>
+    <polyline points="70,174.4 276,190.4 483,198.4 690,200.0" fill="none" stroke="#ff6b6b" stroke-width="2.5" stroke-dasharray="5 4"/>
+    <circle cx="70" cy="159.2" r="4" fill="#5aa9ff"/><circle cx="276" cy="156.0" r="4" fill="#5aa9ff"/>
+    <circle cx="483" cy="144.8" r="4" fill="#5aa9ff"/><circle cx="690" cy="143.2" r="4" fill="#5aa9ff"/>
+    <circle cx="70" cy="150.4" r="4" fill="#37d39b"/><circle cx="276" cy="139.2" r="4" fill="#37d39b"/>
+    <circle cx="483" cy="100.8" r="4" fill="#37d39b"/><circle cx="690" cy="79.2" r="4" fill="#37d39b"/>
+    <circle cx="70" cy="174.4" r="4" fill="#ff6b6b"/><circle cx="276" cy="190.4" r="4" fill="#ff6b6b"/>
+    <circle cx="483" cy="198.4" r="4" fill="#ff6b6b"/><circle cx="690" cy="200.0" r="4" fill="#ff6b6b"/>
+    <text x="70"  y="223" fill="#cdd8ea" font-size="12" text-anchor="middle">256</text>
+    <text x="276" y="223" fill="#cdd8ea" font-size="12" text-anchor="middle">512</text>
+    <text x="483" y="223" fill="#cdd8ea" font-size="12" text-anchor="middle">768</text>
+    <text x="690" y="223" fill="#cdd8ea" font-size="12" text-anchor="middle">1024</text>
+    <text x="380" y="242" fill="#9aa7bd" font-size="11.5" text-anchor="middle">window size (px)</text>
+  </svg>
+  <div class="lgd">
+    <span><i style="background:#37d39b"></i><code>uall</code>/<code>ufix</code> (affine, 12 threads)</span>
+    <span><i style="background:#5aa9ff"></i><code>uall</code>/<code>ufix</code> (1 thread)</span>
+    <span><i style="background:#ff6b6b"></i><code>uboth</code>/<code>ufix</code> (affine, warp reduction only, 12 threads)</span>
+  </div>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>threads</th><th>motion type</th><th>window</th><th><code>ufix</code> ms</th><th>warp reduction only</th><th>fused GN only</th><th>both</th></tr></thead>
+<tbody>
+<tr><td class="grp" rowspan="12">4</td><td class="grp" rowspan="3">translation</td><td>256</td><td>30.4</td><td>1.52×</td><td>1.05×</td><td class="best">1.65×</td></tr>
+<tr><td>512</td><td>96.1</td><td>1.19×</td><td>1.10×</td><td class="best">1.40×</td></tr>
+<tr><td>768</td><td>201.4</td><td>1.17×</td><td>1.27×</td><td class="best">1.45×</td></tr>
+<tr><td class="grp" rowspan="3">euclidean</td><td>256</td><td>48.3</td><td>1.34×</td><td>1.51×</td><td class="best">2.28×</td></tr>
+<tr><td>512</td><td>149.5</td><td>1.14×</td><td>1.58×</td><td class="best">1.99×</td></tr>
+<tr><td>768</td><td>311.9</td><td class="bad">1.04×</td><td class="best">1.88×</td><td class="best">2.03×</td></tr>
+<tr><td class="grp" rowspan="3">affine</td><td>256</td><td>44.0</td><td>1.26×</td><td>1.30×</td><td class="best">1.87×</td></tr>
+<tr><td>512</td><td>163.5</td><td>1.12×</td><td>1.52×</td><td class="best">1.87×</td></tr>
+<tr><td>768</td><td>383.9</td><td class="bad">1.05×</td><td class="best">2.00×</td><td class="best">2.12×</td></tr>
+<tr><td class="grp" rowspan="3">homography</td><td>256</td><td>87.5</td><td>1.28×</td><td>1.69×</td><td class="best">2.55×</td></tr>
+<tr><td>512</td><td>299.4</td><td>1.16×</td><td class="best">2.07×</td><td class="best">2.88×</td></tr>
+<tr><td>768</td><td>634.0</td><td class="bad">1.06×</td><td class="best">2.47×</td><td class="best">2.89×</td></tr>
+<tr><td class="grp" rowspan="12">1</td><td class="grp" rowspan="3">translation</td><td>256</td><td>29.8</td><td>1.53×</td><td>1.07×</td><td class="best">1.64×</td></tr>
+<tr><td>512</td><td>124.8</td><td>1.48×</td><td>1.09×</td><td class="best">1.61×</td></tr>
+<tr><td>768</td><td>289.3</td><td>1.43×</td><td>1.10×</td><td class="best">1.60×</td></tr>
+<tr><td class="grp" rowspan="3">euclidean</td><td>256</td><td>41.0</td><td>1.33×</td><td>1.35×</td><td class="best">1.97×</td></tr>
+<tr><td>512</td><td>169.9</td><td>1.31×</td><td>1.32×</td><td class="best">1.93×</td></tr>
+<tr><td>768</td><td>390.1</td><td>1.28×</td><td>1.33×</td><td class="best">1.89×</td></tr>
+<tr><td class="grp" rowspan="3">affine</td><td>256</td><td>43.4</td><td>1.34×</td><td>1.09×</td><td class="best">1.47×</td></tr>
+<tr><td>512</td><td>186.2</td><td>1.29×</td><td>1.17×</td><td class="best">1.52×</td></tr>
+<tr><td>768</td><td>491.1</td><td>1.20×</td><td>1.26×</td><td class="best">1.66×</td></tr>
+<tr><td class="grp" rowspan="3">homography</td><td>256</td><td>89.2</td><td>1.28×</td><td>1.21×</td><td class="best">1.65×</td></tr>
+<tr><td>512</td><td>353.4</td><td>1.23×</td><td>1.25×</td><td class="best">1.61×</td></tr>
+<tr><td>768</td><td>872.0</td><td>1.22×</td><td>1.43×</td><td class="best">1.87×</td></tr>
+</tbody></table></div>
+
+<p>Every ratio is per-iteration cost against <code>ufix</code> (<a href="https://github.com/opencv/opencv/pull/29775">opencv#29775</a> , the border fix alone), minimum of three repeats.<b>Four threads is taken as the everyday operating point</b> (this machine is 6C/12T, but running 12 wide is outside realistic use).</p>
+
+<div class="good-note">
+<b>The two optimisations cover each other's weak region exactly.</b> The warp reduction is strong at small windows (1.26-1.52x at 256) and gone at large ones (1.04-1.17x at 768). The fused stage is the opposite: the larger the window and the larger <span class="m">P</span> , the more it pays (window 768: translation 1.27x rising to homography 2.47x). With both, <b>four threads gives 1.40-2.89x regardless of window or motion type</b> . </div>
+
+<p>On a single thread the picture changes. The warp reduction is flat at 1.20-1.53x regardless of window, and the fused stage manages only 1.07-1.43x. <b>Most of what the fused stage gains comes from parallelism</b> (<code>Mat::dot</code> has no <code>parallel_for_</code>), and the algebraic reduction on its own only pays at large windows and large <span class="m">P</span> .</p>
+
+<h3>6.3 Numerical equivalence</h3>
+
+<div class="tw"><table>
+<thead><tr><th style="text-align:left">check</th><th style="text-align:left">result</th></tr></thead>
+<tbody>
+<tr><td><code>fixedpoint</code> 4 motion types x 200 trials</td><td style="text-align:left"><code>ugn</code> and <code>ufix</code> agree on cornMed, bias, dScale and rho <b>to every printed digit</b> (translation, euclidean, affine, homography)</td></tr>
+<tr><td><code>accuracy</code> 4 motion types x 200 trials</td><td style="text-align:left">Likewise. For instance affine 0.0017 / 0.0017, homography 0.0026 / 0.0026</td></tr>
+<tr><td><code>basin</code> affine, 150 trials</td><td style="text-align:left">At all five deformation steps from x0.25 to x4, <b>the convergence counts match exactly</b> (150 / 148 / 104 / 39 / 6)</td></tr>
+</tbody></table></div>
+
+<h3>6.4 Contribution of each element (four threads)</h3>
+
+<p>Sections 3 to 5 enabled one at a time. This is the table to look at when deciding what to adopt and in what order.</p>
+
+<div class="tw"><table>
+<thead><tr><th>motion type</th><th>window</th>
+<th>3, the projection identity</th><th>4, the diagonal via <code>dot</code></th><th>5, parallelising the projections</th>
+<th>fused GN (everything)</th></tr></thead>
+<tbody>
+<tr><td class="grp" rowspan="3">translation</td><td>256</td><td>1.07×</td><td class="bad">1.02×</td><td>1.03×</td><td class="best">1.07×</td></tr>
+<tr><td>512</td><td>1.06×</td><td class="bad">1.03×</td><td>1.10×</td><td class="best">1.24×</td></tr>
+<tr><td>768</td><td>1.09×</td><td class="bad">1.00×</td><td>1.08×</td><td class="best">1.27×</td></tr>
+<tr><td class="grp" rowspan="3">euclidean</td><td>256</td><td>1.01×</td><td class="bad">0.97×</td><td>1.05×</td><td class="best">1.44×</td></tr>
+<tr><td>512</td><td>1.04×</td><td class="bad">1.03×</td><td>1.08×</td><td class="best">1.71×</td></tr>
+<tr><td>768</td><td>1.06×</td><td class="bad">1.02×</td><td>1.10×</td><td class="best">1.89×</td></tr>
+<tr><td class="grp" rowspan="3">affine</td><td>256</td><td>1.06×</td><td class="bad">1.00×</td><td class="best">1.22×</td><td class="best">1.35×</td></tr>
+<tr><td>512</td><td>1.09×</td><td class="bad">0.99×</td><td class="best">1.27×</td><td class="best">1.49×</td></tr>
+<tr><td>768</td><td>1.10×</td><td class="bad">0.96×</td><td class="best">1.29×</td><td class="best">1.91×</td></tr>
+<tr><td class="grp" rowspan="3">homography</td><td>256</td><td>1.04×</td><td class="bad">1.01×</td><td class="best">1.20×</td><td class="best">1.64×</td></tr>
+<tr><td>512</td><td>1.06×</td><td class="bad">1.01×</td><td class="best">1.21×</td><td class="best">1.87×</td></tr>
+<tr><td>768</td><td>1.10×</td><td class="bad">1.04×</td><td class="best">1.23×</td><td class="best">2.50×</td></tr>
+</tbody></table></div>
+
+<div class="note">
+<b>Three things are worth reading here.</b>
+<ul>
+<li><b>The identity in 3 is cheap but small.</b>1.01-1.10x for every motion type and window -- a fair return for a three-line change. It gives the same on a single thread, having nothing to do with parallelism.</li>
+<li><b>The claim in 4 that the diagonal only needs <code>dot</code> turned out to be worthless.</b>0.96-1.04x -- inside measurement noise, and it <b>sometimes goes negative</b> . It brings nothing but complexity, so it is not adopted.</li>
+<li><b>The parallelism in 5 pays only when <span class="m">P</span> is large.</b> 1.20-1.29x for affine and homography, 1.03-1.10x for translation and euclidean. The two motion types with <math><mrow><mi>w</mi><mo>=</mo><mo>(</mo><mn>1</mn><mo>)</mo></mrow></math> have little projection work to begin with. On a single thread all of them fall to 0.96-1.04x, as they must.</li>
+</ul> The product of the parts (<code>C1+C2+C3</code> measures 1.05-1.44x) does not reach the whole (1.07-2.50x). <b>Most of what fusion gains comes from not materialising the Jacobian, rather than from adding up the parts.</b>
+</div>
+
+<h2>7. What was tried and did not work</h2>
+
+<h3>7.1 <code>gemm</code> makes it worse</h3>
+
+<p>The obvious idea -- lay the Jacobian out contiguously as <span class="m">P</span>×<span class="m">N</span> and take <code>gemm</code> with <math><mrow><msup><mi>G</mi><mtext>T</mtext></msup><mi>G</mi></mrow></math> so the block re-reads disappear -- is <b>2 to 3 times slower than the current code</b> .</p>
+
+<div class="tw"><table>
+<thead><tr><th>window</th><th>current</th><th>gemm ×3</th><th>gemm x1 (expanded)</th><th>factorised (parallel)</th></tr></thead>
+<tbody>
+<tr><td>512</td><td>2.066</td><td class="bad">10.099</td><td class="bad">13.307</td><td class="best">1.024</td></tr>
+<tr><td>1024</td><td>15.387</td><td class="bad">41.740</td><td class="bad">53.297</td><td class="best">2.455</td></tr>
+</tbody></table></div>
+
+<p>The <code>gemm</code> in OpenCV 4.1.0 is not tuned for the extremely tall and extremely wide shapes <span class="m">P</span>×<span class="m">N</span> and <span class="m">N</span>×<span class="m">P</span> . Stacking <math><mrow><mo>[</mo><mi>G</mi><mo>;</mo><mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo>;</mo>
+<mover accent="true"><mi>t</mi><mo>‾</mo></mover><mo>]</mo></mrow></math> and producing everything with a single <math><mrow><mi>A</mi><msup><mi>A</mi><mtext>T</mtext></msup></mrow></math> -- mathematically the prettiest option -- was slow in the same way.</p>
+
+<h3>7.2 Naive fusion is slower on a single thread</h3>
+
+<p><code>j[6]</code> is built, and a nested loop over 21 <code>j[p]*j[q]</code> with <code>double</code> is 2.3 to 1.8 times <b>slower</b> than the current code. Factorising into straight-line code is the point; fusing on its own is not what makes it fast.</p>
+
+<h2>8. What is left, and what constrains it</h2>
+
+<ul>
+<li><b>The coordinates <span class="m">x</span>, <span class="m">y</span> do not have to be read.</b> They are the column and row index, so they can be generated in place. Six planes become four, which should cut traffic by roughly a third (not implemented, not measured).</li>
+<li><b>Explicit SIMD.</b>Auto-vectorisation is doing the work at the moment. Thirty accumulators do not fit in sixteen YMM registers, so they spill to L1. Blocking should help.</li>
+<li><b>Homography is implemented, and it gained the most.</b>The first version of this report said here that the per-pixel division stops it being a face-splitting product. That was wrong. The division folds into the gradient side (4.3), and OpenCV's own <code>image_jacobian_homo_ECC</code> is already in that form. <span class="m">P</span> = 8 has the most headroom, and measures <b>2.47×</b> at window 768 on four threads -- the best of all four motion types.</li>
+<li><b>translation and euclidean are implemented too, but gain little.</b>
+<math><mrow><mi>w</mi><mo>=</mo><mo>(</mo><mn>1</mn><mo>)</mo></mrow></math> means the Hessian has only 3 or 6 entries, so this stage is a small share of the work. Window 768 on four threads: 1.27x and 1.88x. Euclidean still gets close to affine (2.00x) because building <math><msub><mi>g</mi><mi>r</mi></msub></math> folds into the same pass.</li>
+<li><b>Optimisation 1 is what goes upstream first.</b>The linear combination in 3 is three lines, touches neither layout nor algorithm, and helps every motion type. Sections 4 and 5 introduce a new kernel and belong in a separate change.</li>
+</ul>
+
+<h2>9. Summary</h2>
+
+<ol>
+<li><b>The projection of the update falls out of the algebra.</b>
+<math><mrow><msup><mi>G</mi><mtext>T</mtext></msup><mo>(</mo><mi>λ</mi>
+<mover accent="true"><mi>t</mi><mo>‾</mo></mover><mo>−</mo>
+<mover accent="true"><mi>i</mi><mo>‾</mo></mover><mo>)</mo><mo>=</mo>
+<mi>λ</mi><msub><mi>v</mi><mtext>t</mtext></msub><mo>−</mo>
+<msub><mi>v</mi><mtext>i</mtext></msub></mrow></math> . A three-line substitution frees 15 planes.</li>
+<li><b>For all four motion types the Jacobian is a column subset of a face-splitting product.</b> What separates translation, euclidean, affine and homography is the contents of <span class="m">u</span>, <span class="m">w</span> and which columns are taken; the number of scalars accumulated is always <math><mrow><mi>tri</mi><mo>(</mo><mi>K</mi><mo>)</mo><mo>·</mo><mi>tri</mi><mo>(</mo><mi>L</mi><mo>)</mo></mrow></math> . For affine that is 18 rather than 21. <math><mrow><mi>H</mi><mo>=</mo><munder><mo>∑</mo><mi>n</mi></munder>
+<mo>(</mo><msub><mi>g</mi><mi>n</mi></msub><msubsup><mi>g</mi><mi>n</mi><mtext>T</mtext></msubsup><mo>)</mo>
+<mo>⊗</mo>
+<mo>(</mo><msub><mi>c</mi><mi>n</mi></msub><msubsup><mi>c</mi><mi>n</mi><mtext>T</mtext></msubsup><mo>)</mo></mrow></math> follows immediately from the form.</li>
+<li><b>Without materialising the Jacobian, 85 planes per iteration become 6.</b> Accumulating 30 scalars in one pass is all it takes.</li>
+<li><b>As it stands this stage uses one core</b> (<code>Mat::dot</code> has no <code>parallel_for_</code>). Parallelising over row stripes is effectively free, the reduction being 30 scalars.</li>
+<li><b>The saving grows with <span class="m">P</span> .</b>The gain from not materialising the Jacobian is that one pass suffices, so more parameters means more saving. Window 768 on four threads: translation 1.27x / euclidean 1.88x / affine 2.00x / <b>homography 2.47×</b> . The first version of this report said homography was not implemented because it is not a face-splitting product; that was wrong, and it turned out to be the best case of all.</li>
+<li><b>Combined with the warp reduction there is no gap left.</b>The warp reduction pays at small windows (1.26-1.52x at 256) and the fused stage at large ones, so with both, four threads gives <b>1.40-2.89x regardless of window or motion type</b> . This stage taken alone reaches 6.3x. Accuracy, bias and convergence radius are all numerically unchanged.</li>
+</ol>
+
+<footer> Measured on: Windows 11 / MSVC / OpenCV 4.1.0 prebuilt (<code>opencv_world410</code>) / Intel Core i7-8700K (6C/12T, L2 1.5 MB, L3 12 MB).<br> Implementation: <code>eval/uni_ecc.cpp</code> (the <code>fastGN</code> flag; the four kernels are generated by <code>scratchpad/genkern.py</code>), <code>eval/gnbench.cpp</code> . Raw data: <code>eval/results/</code> .<br> The equations are set in MathML, with no external script.<br> Related: <code>ECC_warp_gauss_revisit.html</code> (the warp reduction against the border fix, and re-tuning gaussFiltSize), <code>ECC_speedup_warp_reduction.html</code> (how the warp reduction works). </footer>
+
+</div>
+</body>
+</html>
