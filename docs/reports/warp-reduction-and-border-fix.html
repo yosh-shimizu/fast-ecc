@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Warp reduction against the border fix / re-tuning gaussFiltSize</title>
+<style>
+  :root{
+    --bg:#0f1420; --card:#171e2e; --ink:#e7ecf3; --muted:#9aa7bd; --line:#27314a;
+    --accent:#5aa9ff; --good:#37d39b; --warn:#ffb454; --bad:#ff6b6b; --chip:#1f2940;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,"Segoe UI",Roboto,sans-serif;
+       line-height:1.7;font-size:15px}
+  .wrap{max-width:980px;margin:0 auto;padding:32px 22px 80px}
+  h1{font-size:28px;line-height:1.25;margin:0 0 6px}
+  h2{font-size:22px;margin:42px 0 12px;padding-bottom:8px;border-bottom:2px solid var(--line)}
+  h3{font-size:17px;margin:26px 0 8px;color:#cdd8ea}
+  h4.sec{font-size:15px;margin:20px 0 6px;color:#b8c6dc}
+  p{margin:10px 0}
+  ul,ol{margin:10px 0;padding-left:22px}
+  li{margin:5px 0}
+  .sub{color:var(--muted);margin:0 0 24px}
+  a{color:var(--accent)}
+  code{background:#0b0f18;border:1px solid var(--line);border-radius:5px;padding:1px 6px;
+       font-family:"SF Mono",Consolas,Menlo,monospace;font-size:13px;color:#d8e2f2}
+  pre{background:#0b0f18;border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin:14px 0;
+      overflow-x:auto;font-family:"SF Mono",Consolas,Menlo,monospace;font-size:12.8px;line-height:1.55;color:#d8e2f2}
+  pre .c{color:#5f6b82}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:18px 0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .card h4{margin:0 0 6px;font-size:14px;color:var(--accent);letter-spacing:.02em}
+  .card .big{font-size:26px;font-weight:700;margin:2px 0}
+  .card p{margin:4px 0 0;color:var(--muted);font-size:13px}
+  .tw{overflow-x:auto;margin:14px 0}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;
+        background:var(--card);border-radius:10px;overflow:hidden}
+  th,td{padding:9px 11px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+  th:first-child,td:first-child{text-align:left}
+  thead th{background:#1d2740;color:#cfdcf2;font-weight:600;border-bottom:2px solid var(--line)}
+  tbody tr:hover{background:#1b2438}
+  td.best{color:var(--good);font-weight:700}
+  td.bad{color:var(--bad)}
+  td.dim{color:var(--muted)}
+  td.grp{color:var(--muted);font-weight:600}
+  .note{background:#1a2030;border:1px solid var(--line);border-left:3px solid var(--warn);
+        border-radius:8px;padding:10px 14px;margin:14px 0;color:#e8d7b6;font-size:13.5px}
+  .good-note{background:#16241f;border:1px solid #24503f;border-left:3px solid var(--good);
+        border-radius:8px;padding:10px 14px;margin:14px 0;color:#bde8d6;font-size:13.5px}
+  .chart{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:18px 0}
+  .chart h4{margin:0 0 4px;font-size:14px}
+  .chart .cap{color:var(--muted);font-size:12.5px;margin:0 0 10px}
+  .chart svg{display:block;width:100%;height:auto}
+  .lgd{display:flex;flex-wrap:wrap;gap:14px;margin-top:8px;font-size:12.5px;color:var(--muted)}
+  .lgd i{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+  footer{margin-top:50px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line);padding-top:16px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>The warp reduction on top of the border fix, and re-tuning gaussFiltSize</h1>
+<p class="sub">Measured 2026-08-23. Subject: OpenCV <code>cv::findTransformECC</code> and <a href="https://github.com/opencv/opencv/pull/29775">opencv/opencv#29775</a> (the pre-filter border fix), together with <a href="https://github.com/yosh-shimizu/fast-ecc">fast-ecc</a> (three warps per iteration cut to one)<br> Implementation <code>eval/uni_ecc.cpp</code> / raw data <code>eval/results/</code> / Markdown version <code>ECC_warp_gauss_revisit.md</code></p>
+
+<h2>0. The questions, and the answers</h2>
+
+<div class="cards">
+  <div class="card"><h4>(a) Do they compose?</h4><div class="big" style="color:var(--good)">Yes</div>
+    <p>No loss of accuracy and none of convergence radius. At windows of 128-256 px, <b>1.24-1.49x</b>.</p></div>
+  <div class="card"><h4>(a) On large images it</h4><div class="big" style="color:var(--warn)">does not pay</div>
+    <p>The gain is gone above a 384 px window, and 768-1024 px is break-even. The cause is an asymmetry in OpenCV threading (see 2.5).<b>On a single thread it is 1.27-1.31x across the whole range</b>.</p></div>
+  <div class="card"><h4>(a) Accuracy is</h4><div class="big" style="color:var(--good)">best combined</div>
+    <p>The scale bias left in fast-ecc alone (t = -38) disappears once the two are combined.</p></div>
+  <div class="card"><h4>(b) The best gauss</h4><div class="big">5 → 9</div>
+    <p>Accuracy holds (0.0016 -> 0.0017 px) while the convergence rate goes from 68% to 72%. Before the fix, 5 -> 9 cost a factor of 2.4 in accuracy.</p></div>
+  <div class="card"><h4>(b) What the blur buys</h4><div class="big" style="color:var(--warn)">Convergence radius, only</div>
+    <p>Under noise, more blur is strictly worse. It does not buy robustness to noise.</p></div>
+</div>
+
+<div class="note">
+<b>The goal was to measure and conclude.</b>Nothing was adopted into an implementation and nothing further was sent upstream. </div>
+
+<h2>1. How this was measured</h2>
+
+<h3>1.1 Removing the confound: one source, two flags</h3>
+
+<p><code>cand_ecc.cpp</code> (the border fix) and <code>fast_ecc.cpp</code> (the warp reduction) derive from different upstream snapshots, so comparing them directly mixes in differences that belong to neither change. <code>eval/uni_ecc.cpp</code> gives <b>one body two boolean flags</b> and produces all four combinations from the same code path.</p>
+
+<div class="tw"><table>
+<thead><tr><th>estimator</th><th style="text-align:center"><code>fixBorder</code></th>
+<th style="text-align:center"><code>fastWarp</code></th><th style="text-align:left">corresponds to</th></tr></thead>
+<tbody>
+<tr><td><code>ubase</code></td><td style="text-align:center" class="dim">—</td><td style="text-align:center" class="dim">—</td><td style="text-align:left">unmodified upstream</td></tr>
+<tr><td><code>ufix</code></td><td style="text-align:center" class="best">✓</td><td style="text-align:center" class="dim">—</td><td style="text-align:left">opencv#29775</td></tr>
+<tr><td><code>ufast</code></td><td style="text-align:center" class="dim">—</td><td style="text-align:center" class="best">✓</td><td style="text-align:left">fast-ecc</td></tr>
+<tr><td><code>uboth</code></td><td style="text-align:center" class="best">✓</td><td style="text-align:center" class="best">✓</td><td style="text-align:left"><b>both (the subject of this report)</b></td></tr>
+</tbody></table></div>
+
+<p>Agreement with the existing implementations was verified: at <code>eval fixedpoint est=cv,ubase,cand,ufix,fast,ufast motion=affine</code> , <code>ubase</code>=<code>cv</code> and <code>ufix</code>=<code>cand</code> match <code>ufast</code>=<code>fast</code> on cornMed, bias and rho to four decimal places.</p>
+
+<p>The border fix is written in the same shape as the upstream PR: outside the loop the <code>templtMask</code> ring is dropped, and inside the loop the mask is intersected and gradients outside it are zeroed. The research copy <code>bitwise_and</code> rebuilds the ring every iteration, which would load the speed comparison with cost that belongs to neither change. <code>cand_ecc.cpp</code> </p>
+
+<h3>1.2 Speed is measured with the iteration count pinned</h3>
+
+<p><code>ms</code> column is wall time for one call, so when estimators converge in different numbers of iterations the per-iteration cost is invisible.<b><code>eps=0</code> makes the stopping test |rho - rho'| >= 0 always true, so every estimator runs <code>iters</code> iterations exactly</b>. That is the per-iteration cost. Wall time to convergence was measured separately with the default <code>eps=1e-6</code>.</p>
+
+<div class="note"> Median of three repeats per cell. Order effects were checked at window 256 by swapping the order (none found). <b>A single measurement produced a spurious 48% difference</b>, so repeats are mandatory.<br><br> The speed figures were <b>re-taken with the machine quiet</b>. The first measurements were contaminated by other heavy work on the same machine and were inflated by a factor of 1.4-1.6 (per-iteration cost, affine window 512: 178 ms contaminated against 129 ms re-measured). The trend in the ratios did not change, but individual cells moved by up to 0.14 (wall time to convergence, translation window 256: 1.59x -> 1.45x; per-iteration cost, affine window 128: 1.16x -> 1.27x). The re-measurement records CPU load before and after every repeat (the <code>C1b</code>/<code>C2b</code> lines in <code>@@@@</code>), and it stays within 0-35%. </div>
+
+<h3>1.3 Parallelism</h3>
+
+<p>ECC on a 200 px window keeps barely one core busy per process. Two sequential batches on a 12-core machine leave it 17% utilised, so the accuracy runs were split one process per configuration and fanned out 17 ways. <b>Only the speed measurements were run alone.</b></p>
+
+<div class="note"> That applies to a 200 px window. As 2.5 shows, <code>warpAffine</code> does reach the thread pool above 384 px, so at large windows ECC uses several cores too.<b>To pin the thread count, use <code>threads=N</code>; </b> —
+<code>OPENCV_FOR_THREADS_NUM</code> is ignored by this build. </div>
+
+<p>Common settings: analytic scene (exact ground truth), window=200, margin=8, gaussFiltSize=5, trials=200-300, seed=12345.</p>
+
+<h2>2. (a) The warp reduction on top of the border fix</h2>
+
+<h3>2.1 Accuracy: entirely harmless, and it clears the bias left in fast-ecc alone</h3>
+
+<p><code>fixedpoint</code> (started exactly at the ground truth, so whatever moves is bias), trials=300. The value is the median RMS displacement of the four window corners (px, lower is better).</p>
+
+<div class="tw"><table>
+<thead><tr><th>motion</th><th><code>ubase</code></th><th><code>ufix</code></th><th><code>ufast</code></th><th><code>uboth</code></th></tr></thead>
+<tbody>
+<tr><td>translation</td><td>0.0169</td><td>0.0176</td><td>0.0175</td><td>0.0176</td></tr>
+<tr><td>euclidean</td><td>0.0043</td><td>0.0018</td><td>0.0020</td><td class="best">0.0018</td></tr>
+<tr><td>affine</td><td class="bad">0.0408</td><td>0.0016</td><td>0.0050</td><td class="best">0.0017</td></tr>
+<tr><td>homography</td><td class="bad">0.0428</td><td>0.0025</td><td>0.0060</td><td class="best">0.0025</td></tr>
+</tbody></table></div>
+
+<p>Scale bias (relative; the bracketed number is t, and |t| >= 3 means a systematic offset):</p>
+
+<div class="tw"><table>
+<thead><tr><th>motion</th><th><code>ubase</code></th><th><code>ufix</code></th><th><code>ufast</code></th><th><code>uboth</code></th></tr></thead>
+<tbody>
+<tr><td>affine</td><td class="bad">−2.8e−4 (−146)</td><td class="best">+6.0e−7 (0.8)</td><td class="bad">−3.1e−5 (−38)</td><td class="best">+5.9e−7 (0.8)</td></tr>
+<tr><td>homography</td><td class="bad">−2.7e−4 (−28)</td><td class="best">+2.6e−6 (1.3)</td><td class="bad">−2.7e−5 (−10)</td><td class="best">+2.6e−6 (1.3)</td></tr>
+</tbody></table></div>
+
+<ul>
+<li><b><code>uboth</code> is as accurate as <code>ufix</code>, and it is.</b>The warp reduction takes nothing away from what the border fix achieved.</li>
+<li><b><code>ufast</code> left a systematic scale shrink (t = -38), and <code>uboth</code> clears it.</b> fast-ecc erodes the input mask by 2 px and the warped mask by 1 px, which happened to remove most of the pre-filter ring (2 px at gaussFiltSize=5). That is why the -2.8e-4 of <code>ubase</code> had shrunk ninefold to -3.1e-5 without ever reaching zero. It reaches zero only once the ring is dropped deliberately, in <code>uboth</code>. The mechanism is confirmed in 2.1.1.</li>
+<li>All four agree on translation. The rings on opposite edges cancel, so the border has no effect and the value sits on the floor set by quantisation of the warp interpolation coefficients (about 0.011-0.018 px).</li>
+</ul>
+
+<p>Starting 1 px off the ground truth, <code>accuracy</code> gives the same ordering (affine: 0.0406 / 0.0017 / 0.0051 / 0.0017).</p>
+
+<h4 class="sec">2.1.1 The apparent accuracy of fast-ecc depended on gaussFiltSize=5 (mechanism confirmed)</h4>
+
+<p>The guess above -- that fast-ecc happened to drop most of the blur ring because it erodes the mask -- is testable. The ring is <code>gaussFiltSize/2</code> wide, so sweeping gauss makes a prediction. fast-ecc erodes 1 px of the warped mask, so <b>a 1 px ring (gauss=3) should be covered exactly and leave zero bias, and anything wider should leak</b>.</p>
+
+<div class="tw"><table>
+<thead><tr><th>gauss</th><th>ring width</th><th><code>ufast</code> cornMed</th><th><code>ufast</code> dScale (t)</th><th><code>uboth</code> cornMed</th></tr></thead>
+<tbody>
+<tr><td>3</td><td>1 px</td><td class="best">0.0017</td><td class="best">−7.5e−06 (0.8)</td><td>0.0017</td></tr>
+<tr><td>5</td><td>2 px</td><td>0.0050</td><td class="bad">−3.1e−05 (−38)</td><td>0.0017</td></tr>
+<tr><td>9</td><td>4 px</td><td class="bad">0.0283</td><td class="bad">−1.8e−04 (−75)</td><td>0.0016</td></tr>
+<tr><td>17</td><td>8 px</td><td class="bad">0.1241</td><td class="bad">−7.4e−04 (−51)</td><td>0.0023</td></tr>
+</tbody></table></div>
+
+<p>As predicted. <b>The mechanism is settled</b>. Two things follow:</p>
+<ul>
+<li>The accuracy advantage of fast-ecc alone held at <b><code>gaussFiltSize=5</code> (the default) by coincidence</b>, and is not a property of the algorithm. At gauss=17 it is only twice as good as <code>ubase</code> (0.2586).</li>
+<li>So <b>if 3 raises <code>gaussFiltSize</code>, the border fix is mandatory</b>. The warp reduction alone cannot survive a wide blur.</li>
+</ul>
+
+<h3>2.2 Convergence radius: nobody moves it</h3>
+
+<p><code>basin</code> (started from the undisplaced estimate, deformation scaled 0.25x to 4x; converged means corner error &lt; 1 px), affine, trials=200:</p>
+
+<div class="tw"><table>
+<thead><tr><th>deformation</th><th><code>ubase</code></th><th><code>ufix</code></th><th><code>ufast</code></th><th><code>uboth</code></th></tr></thead>
+<tbody>
+<tr><td>×0.25</td><td>100%</td><td>100%</td><td>100%</td><td>100%</td></tr>
+<tr><td>×0.5</td><td>98%</td><td>98%</td><td>98%</td><td>98%</td></tr>
+<tr><td>×1</td><td>68%</td><td>68%</td><td>67%</td><td>68%</td></tr>
+<tr><td>×2</td><td>24%</td><td>24%</td><td>24%</td><td>24%</td></tr>
+<tr><td>×4</td><td>5%</td><td>4%</td><td>4%</td><td>4%</td></tr>
+</tbody></table></div>
+
+<p>euclidean and homography agree across all four in the same way (euclidean at x1, for instance: 79 / 78 / 78 / 78%). <b>The convergence radius is indistinguishable across all four.</b>Only the accuracy on convergence differs.</p>
+
+<h3>2.3 Speed: 1.24-1.49x at windows 128-256, 1.03-1.22x at 512</h3>
+
+<div class="chart">
+  <h4>Effect of the warp reduction (<code>uboth</code> / <code>ufix</code>, per-iteration cost ratio)</h4>
+  <p class="cap">The larger the window, the weaker the effect. Median of three repeats.</p>
+  <svg viewBox="0 0 720 260" role="img" aria-label="speed-up by window size">
+    <line x1="70" y1="210" x2="690" y2="210" stroke="#3a4763" stroke-width="1"/>
+    <line x1="70" y1="174" x2="690" y2="174" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="138" x2="690" y2="138" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="102" x2="690" y2="102" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="66"  x2="690" y2="66"  stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="30"  x2="690" y2="30"  stroke="#27314a" stroke-width="1"/>
+    <text x="60" y="214" fill="#9aa7bd" font-size="11" text-anchor="end">1.0×</text>
+    <text x="60" y="178" fill="#9aa7bd" font-size="11" text-anchor="end">1.1×</text>
+    <text x="60" y="142" fill="#9aa7bd" font-size="11" text-anchor="end">1.2×</text>
+    <text x="60" y="106" fill="#9aa7bd" font-size="11" text-anchor="end">1.3×</text>
+    <text x="60" y="70"  fill="#9aa7bd" font-size="11" text-anchor="end">1.4×</text>
+    <text x="60" y="34"  fill="#9aa7bd" font-size="11" text-anchor="end">1.5×</text>
+    <text x="70"  y="233" fill="#cdd8ea" font-size="12" text-anchor="middle">window 128</text>
+    <text x="365" y="233" fill="#cdd8ea" font-size="12" text-anchor="middle">window 256</text>
+    <text x="660" y="233" fill="#cdd8ea" font-size="12" text-anchor="middle">window 512</text>
+    <polyline points="70,55.2 365,33.6 660,130.8" fill="none" stroke="#5aa9ff" stroke-width="2.5"/>
+    <polyline points="70,73.2 365,91.2 660,181.2" fill="none" stroke="#37d39b" stroke-width="2.5"/>
+    <polyline points="70,112.8 365,102 660,170.4" fill="none" stroke="#ffb454" stroke-width="2.5"/>
+    <polyline points="70,116.4 365,116.4 660,199.2" fill="none" stroke="#ff6b6b" stroke-width="2.5"/>
+    <circle cx="70" cy="55.2" r="4" fill="#5aa9ff"/><circle cx="365" cy="33.6" r="4" fill="#5aa9ff"/><circle cx="660" cy="130.8" r="4" fill="#5aa9ff"/>
+    <circle cx="70" cy="73.2" r="4" fill="#37d39b"/><circle cx="365" cy="91.2" r="4" fill="#37d39b"/><circle cx="660" cy="181.2" r="4" fill="#37d39b"/>
+    <circle cx="70" cy="112.8" r="4" fill="#ffb454"/><circle cx="365" cy="102" r="4" fill="#ffb454"/><circle cx="660" cy="170.4" r="4" fill="#ffb454"/>
+    <circle cx="70" cy="116.4" r="4" fill="#ff6b6b"/><circle cx="365" cy="116.4" r="4" fill="#ff6b6b"/><circle cx="660" cy="199.2" r="4" fill="#ff6b6b"/>
+  </svg>
+  <div class="lgd">
+    <span><i style="background:#5aa9ff"></i>translation</span>
+    <span><i style="background:#37d39b"></i>euclidean</span>
+    <span><i style="background:#ffb454"></i>affine</span>
+    <span><i style="background:#ff6b6b"></i>homography</span>
+  </div>
+</div>
+
+<h4 class="sec">Per-iteration cost (<code>iters=20 eps=0</code>, median of three repeats, ms per 20 iterations)</h4>
+
+<div class="tw"><table>
+<thead><tr><th>motion</th><th>window</th><th><code>ubase</code></th><th><code>ufix</code></th><th><code>ufast</code></th><th><code>uboth</code></th><th><code>uboth</code>/<code>ufix</code></th></tr></thead>
+<tbody>
+<tr><td class="grp">translation</td><td>128</td><td>7.56</td><td>7.62</td><td>5.23</td><td>5.32</td><td class="best">1.43×</td></tr>
+<tr><td></td><td>256</td><td>28.73</td><td>28.61</td><td>18.70</td><td>19.14</td><td class="best">1.49×</td></tr>
+<tr><td></td><td>512</td><td>70.09</td><td>71.77</td><td>57.92</td><td>58.78</td><td class="best">1.22×</td></tr>
+<tr><td class="grp">euclidean</td><td>128</td><td>11.01</td><td>10.34</td><td>7.67</td><td>7.50</td><td class="best">1.38×</td></tr>
+<tr><td></td><td>256</td><td>39.05</td><td>39.48</td><td>31.35</td><td>29.65</td><td class="best">1.33×</td></tr>
+<tr><td></td><td>512</td><td>124.58</td><td>113.92</td><td>105.39</td><td>105.53</td><td>1.08×</td></tr>
+<tr><td class="grp">affine</td><td>128</td><td>10.85</td><td>11.07</td><td>8.79</td><td>8.69</td><td class="best">1.27×</td></tr>
+<tr><td></td><td>256</td><td>40.83</td><td>41.25</td><td>31.17</td><td>31.65</td><td class="best">1.30×</td></tr>
+<tr><td></td><td>512</td><td>129.36</td><td>130.61</td><td>119.86</td><td>117.38</td><td>1.11×</td></tr>
+<tr><td class="grp">homography</td><td>128</td><td>22.34</td><td>18.80</td><td>15.13</td><td>14.91</td><td class="best">1.26×</td></tr>
+<tr><td></td><td>256</td><td>79.97</td><td>79.34</td><td>60.63</td><td>63.10</td><td class="best">1.26×</td></tr>
+<tr><td></td><td>512</td><td>238.25</td><td>243.86</td><td>222.48</td><td>237.09</td><td>1.03×</td></tr>
+</tbody></table></div>
+
+<h4 class="sec">Wall time to convergence (default <code>eps=1e-6</code>, median of three repeats, ms per call)</h4>
+
+<div class="tw"><table>
+<thead><tr><th>motion</th><th>window</th><th><code>ubase</code></th><th><code>ufix</code></th><th><code>uboth</code></th><th><code>uboth</code>/<code>ufix</code></th></tr></thead>
+<tbody>
+<tr><td class="grp">translation</td><td>256</td><td>10.99</td><td>10.77</td><td>7.44</td><td class="best">1.45×</td></tr>
+<tr><td></td><td>512</td><td>25.41</td><td>27.71</td><td>24.41</td><td>1.14×</td></tr>
+<tr><td class="grp">euclidean</td><td>256</td><td>13.28</td><td>12.92</td><td>10.15</td><td class="best">1.27×</td></tr>
+<tr><td></td><td>512</td><td>36.65</td><td>37.15</td><td>33.86</td><td>1.10×</td></tr>
+<tr><td class="grp">affine</td><td>256</td><td>14.59</td><td>13.89</td><td>10.84</td><td class="best">1.28×</td></tr>
+<tr><td></td><td>512</td><td>40.99</td><td>42.40</td><td>38.54</td><td>1.10×</td></tr>
+<tr><td class="grp">homography</td><td>256</td><td>24.98</td><td>25.07</td><td>20.14</td><td class="best">1.24×</td></tr>
+<tr><td></td><td>512</td><td>74.09</td><td>74.92</td><td>70.18</td><td>1.07×</td></tr>
+</tbody></table></div>
+
+<p>The wall-time ratio tracks the per-iteration ratio closely.<b>The iteration count is unchanged</b> (consistent with the convergence radius being the same).</p>
+
+<div class="good-note">
+<b>The border fix itself costs nothing.</b><code>ufix</code>/<code>ubase</code> Its ratio has a median of 1.01 across all twelve conditions and the sign scatters (0.84-1.02). No systematic cost is detectable. The upstream PR does not trade away speed. </div>
+
+<h3>2.4 Extending the window to 1024: the gain approaches zero without ever clearly turning negative</h3>
+
+<div class="chart">
+  <h4>Saving per pixel <code>dt/Mpx</code> (default, 12 threads)</h4>
+  <p class="cap">A quantity that would be flat if the work were compute-bound. Flat up to window 256 (7-8), then collapsing from 384 onward.</p>
+  <svg viewBox="0 0 720 260" role="img" aria-label="saving per pixel by window size">
+    <line x1="70" y1="210" x2="690" y2="210" stroke="#3a4763" stroke-width="1"/>
+    <line x1="70" y1="165" x2="690" y2="165" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="120" x2="690" y2="120" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="75"  x2="690" y2="75"  stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="30"  x2="690" y2="30"  stroke="#27314a" stroke-width="1"/>
+    <text x="60" y="214" fill="#9aa7bd" font-size="11" text-anchor="end">0</text>
+    <text x="60" y="169" fill="#9aa7bd" font-size="11" text-anchor="end">5</text>
+    <text x="60" y="124" fill="#9aa7bd" font-size="11" text-anchor="end">10</text>
+    <text x="60" y="79"  fill="#9aa7bd" font-size="11" text-anchor="end">15</text>
+    <text x="60" y="34"  fill="#9aa7bd" font-size="11" text-anchor="end">20</text>
+    <polyline points="70,144.1 173,138.4 277,142.3 380,173.5 483,190.6 587,205.5 690,209.8"
+              fill="none" stroke="#5aa9ff" stroke-width="2.5"/>
+    <polyline points="70,139.4 173,142.2 277,136.6 380,181.2 483,197.9 587,210.5 690,209.4"
+              fill="none" stroke="#ffb454" stroke-width="2.5"/>
+    <polyline points="70,32.6 173,8.9 277,82.4 380,157.4 483,178.9 587,217.6 690,194.9"
+              fill="none" stroke="#ff6b6b" stroke-width="2.5"/>
+    <text x="70"  y="233" fill="#cdd8ea" font-size="11.5" text-anchor="middle">128</text>
+    <text x="173" y="233" fill="#cdd8ea" font-size="11.5" text-anchor="middle">192</text>
+    <text x="277" y="233" fill="#cdd8ea" font-size="11.5" text-anchor="middle">256</text>
+    <text x="380" y="233" fill="#37d39b" font-size="11.5" font-weight="700" text-anchor="middle">384</text>
+    <text x="483" y="233" fill="#cdd8ea" font-size="11.5" text-anchor="middle">512</text>
+    <text x="587" y="233" fill="#cdd8ea" font-size="11.5" text-anchor="middle">768</text>
+    <text x="690" y="233" fill="#cdd8ea" font-size="11.5" text-anchor="middle">1024</text>
+    <text x="380" y="252" fill="#9aa7bd" font-size="11.5" text-anchor="middle">window size (px)</text>
+    <line x1="380" y1="30" x2="380" y2="210" stroke="#37d39b" stroke-width="1" stroke-dasharray="4 4" opacity="0.6"/>
+  </svg>
+  <div class="lgd">
+    <span><i style="background:#5aa9ff"></i>translation</span>
+    <span><i style="background:#ffb454"></i>affine</span>
+    <span><i style="background:#ff6b6b"></i>homography</span>
+    <span style="color:#37d39b">dashed = where <code>warpAffine</code> starts to reach the thread pool</span>
+  </div>
+</div>
+
+<p><code>ufix</code> vs <code>uboth</code>, <code>iters=20 eps=0</code>, median of three repeats, default thread count (12):</p>
+
+<div class="tw"><table>
+<thead><tr><th>motion</th><th>window</th><th>ratio</th><th>dt/iter (ms)</th><th>dt/Mpx</th></tr></thead>
+<tbody>
+<tr><td class="grp">translation</td><td>128</td><td class="best">1.455×</td><td>0.120</td><td>7.32</td></tr>
+<tr><td></td><td>192</td><td class="best">1.515×</td><td>0.294</td><td>7.96</td></tr>
+<tr><td></td><td>256</td><td class="best">1.507×</td><td>0.493</td><td>7.52</td></tr>
+<tr><td></td><td>384</td><td>1.342×</td><td>0.599</td><td>4.06</td></tr>
+<tr><td></td><td>512</td><td>1.180×</td><td>0.564</td><td>2.15</td></tr>
+<tr><td></td><td>768</td><td>1.039×</td><td>0.292</td><td>0.50</td></tr>
+<tr><td></td><td>1024</td><td class="dim">1.001×</td><td>0.019</td><td>0.02</td></tr>
+<tr><td class="grp">affine</td><td>128</td><td class="best">1.292×</td><td>0.129</td><td>7.84</td></tr>
+<tr><td></td><td>256</td><td class="best">1.333×</td><td>0.535</td><td>8.16</td></tr>
+<tr><td></td><td>384</td><td>1.141×</td><td>0.473</td><td>3.20</td></tr>
+<tr><td></td><td>512</td><td>1.056×</td><td>0.351</td><td>1.34</td></tr>
+<tr><td></td><td>768</td><td class="bad">0.998×</td><td>−0.029</td><td>−0.05</td></tr>
+<tr><td></td><td>1024</td><td class="dim">1.002×</td><td>0.075</td><td>0.07</td></tr>
+<tr><td class="grp">homography</td><td>128</td><td class="best">1.391×</td><td>0.323</td><td>19.71</td></tr>
+<tr><td></td><td>256</td><td class="best">1.289×</td><td>0.929</td><td>14.18</td></tr>
+<tr><td></td><td>384</td><td>1.128×</td><td>0.861</td><td>5.84</td></tr>
+<tr><td></td><td>512</td><td>1.078×</td><td>0.907</td><td>3.46</td></tr>
+<tr><td></td><td>768</td><td class="bad">0.983×</td><td>−0.500</td><td>−0.85</td></tr>
+<tr><td></td><td>1024</td><td class="dim">1.032×</td><td>1.761</td><td>1.68</td></tr>
+</tbody></table></div>
+
+<ul>
+<li><b>It never clearly gets slower.</b>The only measurable drop below 1.0 is homography at window 768, 0.983x (-1.7%); everything else is 0.998-1.03x, which is break-even. The accurate statement is that the gain approaches zero and occasionally dips 1-2% negative.</li>
+<li><b><code>dt/Mpx</code> is flat up to window 256 (7-8) and falls by more than a factor of ten from 384 onward.</b> The shape of that collapse is what identifies the cause.</li>
+</ul>
+
+<h3>2.5 Cause: an asymmetry in OpenCV threading (identified)</h3>
+
+<div class="note">
+<b>Correction.</b>The first version of this report concluded here that threading was not the cause and that memory bandwidth was the likely explanation. That control used <code>OPENCV_FOR_THREADS_NUM=1</code>, but <b>this OpenCV build ignores that environment variable</b> (found by calling <code>cv::setNumThreads</code> directly: with the variable set, <code>getNumThreads()</code> still reports 12). So the comparison was multi-threaded against multi-threaded, and was no control at all. The conclusion is the opposite. </div>
+
+<p><code>eval</code> was given a <code>threads=N</code> option (which calls <code>cv::setNumThreads</code>) and the measurement redone. affine, trials=12, median of three repeats:</p>
+
+<div class="tw"><table>
+<thead><tr><th>window</th><th><code>threads=1</code> ratio</th><th><code>threads=4</code> ratio</th><th><code>threads=12</code> ratio</th></tr></thead>
+<tbody>
+<tr><td>128</td><td class="best">1.267×</td><td>—</td><td>1.249×</td></tr>
+<tr><td>256</td><td class="best">1.313×</td><td>1.26×</td><td>1.329×</td></tr>
+<tr><td>512</td><td class="best">1.266×</td><td>1.12×</td><td class="bad">1.066×</td></tr>
+<tr><td>768</td><td class="best">1.281×</td><td class="bad">1.05×</td><td class="bad">0.998×</td></tr>
+</tbody></table></div>
+
+<p class="cap"><code>threads=4</code> column was re-measured later on affine (per-iteration cost, minimum of three repeats). <b>Four threads is taken as the everyday operating point</b> -- this machine is 6C/12T, but running 12 wide is outside realistic use. It behaves in between, and the loss of gain above window 512 follows the same trend as 12 threads.</p>
+
+<p><b>On a single thread the warp reduction is completely flat at 1.27-1.31x from window 128 to 768.</b> The degradation happens only when the thread pool is involved.</p>
+
+<p>Broken down by operation, the reason fits in one line (<code>eval/opbench.cpp</code>, <code>-tN</code> pins the thread count). The numbers are one-thread time divided by twelve-thread time, that is, parallel speed-up:</p>
+
+<div class="tw"><table>
+<thead><tr><th>window</th><th><code>warpAffine</code></th><th><code>filter2D</code></th><th><code>addWeighted</code></th><th><code>setTo</code></th></tr></thead>
+<tbody>
+<tr><td>128</td><td class="dim">1.00×</td><td class="dim">1.00×</td><td class="dim">1.00×</td><td class="dim">1.00×</td></tr>
+<tr><td>256</td><td class="dim">1.01×</td><td class="dim">1.00×</td><td class="dim">1.00×</td><td class="dim">1.00×</td></tr>
+<tr><td>384</td><td class="best">1.84×</td><td class="dim">0.93×</td><td class="dim">1.02×</td><td class="dim">1.00×</td></tr>
+<tr><td>512</td><td class="best">2.53×</td><td class="dim">0.98×</td><td class="dim">0.86×</td><td class="dim">1.00×</td></tr>
+<tr><td>768</td><td class="best">4.54×</td><td class="dim">0.93×</td><td class="dim">0.76×</td><td class="dim">0.93×</td></tr>
+<tr><td>1024</td><td class="best">4.36×</td><td class="dim">1.00×</td><td>1.66×</td><td class="dim">1.00×</td></tr>
+</tbody></table></div>
+
+<div class="good-note">
+<b>The side being removed (<code>warpAffine</code>) reaches the thread pool above a 384 px window. The side being added (<code>filter2D</code> with a 1x3 kernel, and <code>addWeighted</code>) never does.</b>So at large windows the trade is two warps running on 6-12 cores against four passes running on one, and the gain evaporates. </div>
+
+<p>Combining <code>dt</code> at both thread counts settles it:</p>
+
+<div class="tw"><table>
+<thead><tr><th>window</th><th><code>dt</code> 1 thread (ms)</th><th>dt/Mpx</th><th><code>dt</code> 12 threads (ms)</th><th>dt/Mpx</th></tr></thead>
+<tbody>
+<tr><td>128</td><td>0.112</td><td class="best">6.84</td><td>0.112</td><td>6.84</td></tr>
+<tr><td>192</td><td>0.277</td><td class="best">7.51</td><td>0.275</td><td>7.46</td></tr>
+<tr><td>256</td><td>0.462</td><td class="best">7.05</td><td>0.456</td><td>6.96</td></tr>
+<tr><td>384</td><td>1.051</td><td class="best">7.13</td><td>0.477</td><td class="bad">3.23</td></tr>
+<tr><td>512</td><td>1.934</td><td class="best">7.38</td><td>0.518</td><td class="bad">1.98</td></tr>
+<tr><td>768</td><td>4.394</td><td class="best">7.45</td><td>0.290</td><td class="bad">0.49</td></tr>
+<tr><td>1024</td><td>7.136</td><td class="best">6.81</td><td>0.780</td><td class="bad">0.74</td></tr>
+</tbody></table></div>
+
+<p><b>On a single thread <code>dt/Mpx</code> stays within 6.8-7.5 while the pixel count changes by a factor of 64.</b> The algorithmic saving is strictly proportional to pixel count and has not degraded at all.</p>
+
+<h3>2.6 Implication: at large windows the warp is no longer the main cost</h3>
+
+<p>There is a sequel to this mechanism. At window 768 on 12 threads, the two warps that can be removed are 1.12 ms (<b>7%</b>) of a 16.2 ms iteration. Even a perfectly fused and parallelised replacement would cap out around 1.06x.</p>
+
+<div class="note">
+<b>At large windows there is no headroom left on the gradient path.</b>The remaining nine tenths is the Gauss-Newton algebra: Jacobian assembly and <code>project_onto_jacobian_ECC</code>, eight planes for homography. On a single thread the warp is 18% of an iteration instead, so the warp reduction pays directly. </div>
+
+<div class="good-note">
+<b>Added later: this prediction was implemented and confirmed.</b>Fusing the Gauss-Newton stage does take that headroom (<code>ECC_gauss_newton_fusion.html</code>). At four threads and window 768, the fused stage alone gives translation 1.27x / euclidean 1.88x / affine 2.00x / homography 2.47x. <b>It is exactly complementary to the region where the warp reduction is powerless</b>. </div>
+
+<p>The whole picture with both changes at four threads (ratio against <code>ufix</code>, per-iteration cost, minimum of three repeats):</p>
+
+<div class="tw"><table>
+<thead><tr><th>motion type</th><th>window</th><th>warp reduction only</th><th>fused GN only</th><th>both</th></tr></thead>
+<tbody>
+<tr><td class="grp" rowspan="2">translation</td><td>256</td><td class="best">1.52×</td><td>1.05×</td><td class="best">1.65×</td></tr>
+<tr><td>768</td><td>1.17×</td><td>1.27×</td><td class="best">1.45×</td></tr>
+<tr><td class="grp" rowspan="2">euclidean</td><td>256</td><td>1.34×</td><td>1.51×</td><td class="best">2.28×</td></tr>
+<tr><td>768</td><td class="bad">1.04×</td><td class="best">1.88×</td><td class="best">2.03×</td></tr>
+<tr><td class="grp" rowspan="2">affine</td><td>256</td><td>1.26×</td><td>1.30×</td><td class="best">1.87×</td></tr>
+<tr><td>768</td><td class="bad">1.05×</td><td class="best">2.00×</td><td class="best">2.12×</td></tr>
+<tr><td class="grp" rowspan="2">homography</td><td>256</td><td>1.28×</td><td>1.69×</td><td class="best">2.55×</td></tr>
+<tr><td>768</td><td class="bad">1.06×</td><td class="best">2.47×</td><td class="best">2.89×</td></tr>
+</tbody></table></div>
+
+<div class="good-note">
+<b>The warp reduction pays at small windows and the fused stage at large ones.</b>With both, four threads gives <b>1.40-2.89x</b> regardless of window or motion type, with no gap left. </div>
+
+<p>What this means in practice:</p>
+<ul>
+<li><b><code>cv::setNumThreads(1)</code> (embedded use, or parallelism applied outside), the warp reduction gives 1.27-1.31x at every image size.</b></li>
+<li><b>With a thread pool and a window above 384 px, the warp reduction is worth almost nothing.</b> It does no harm either (break-even), but expect nothing from it.<b>The fused Gauss-Newton stage fills that region.</b></li>
+<li>Below a 384 px window it gives 1.25-1.5x regardless of thread count.</li>
+<li><b>Taking four threads as the everyday operating point</b>, the warp reduction gives 1.26-1.52x at window 256 and 1.04-1.17x at window 768. It does not fall off as sharply as at 12 threads.</li>
+</ul>
+
+<h2>3. (b) Re-tuning gaussFiltSize</h2>
+
+<h3>3.1 clean: one side of the trade-off is gone</h3>
+
+<div class="chart">
+  <h4>Blur width against accuracy (affine, window=200, <code>fixedpoint</code>, trials=300)</h4>
+  <p class="cap">The vertical axis is the median RMS corner displacement (px, log scale, lower is better). Before the fix it degrades linearly with gauss; after it, it is nearly flat.</p>
+  <svg viewBox="0 0 720 280" role="img" aria-label="gaussFiltSize and accuracy">
+    <line x1="70" y1="20"  x2="690" y2="20"  stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="90"  x2="690" y2="90"  stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="160" x2="690" y2="160" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="230" x2="690" y2="230" stroke="#3a4763" stroke-width="1"/>
+    <text x="60" y="24"  fill="#9aa7bd" font-size="11" text-anchor="end">1</text>
+    <text x="60" y="94"  fill="#9aa7bd" font-size="11" text-anchor="end">0.1</text>
+    <text x="60" y="164" fill="#9aa7bd" font-size="11" text-anchor="end">0.01</text>
+    <text x="60" y="234" fill="#9aa7bd" font-size="11" text-anchor="end">0.001</text>
+    <text x="24" y="130" fill="#9aa7bd" font-size="11" transform="rotate(-90 24 130)" text-anchor="middle">cornMed (px)</text>
+    <polyline points="70,210.5 147.5,134.4 225,117.3 302.5,100.4 380,91.1 457.5,73.9 535,61.1 612.5,50.4 690,28.3"
+              fill="none" stroke="#ff6b6b" stroke-width="2.5"/>
+    <polyline points="70,210.5 147.5,213.9 225,215.7 302.5,215.7 380,213.9 457.5,208.9 535,204.7 612.5,199.8 690,185.7"
+              fill="none" stroke="#37d39b" stroke-width="2.5"/>
+    <circle cx="70" cy="210.5" r="3.5" fill="#ff6b6b"/><circle cx="147.5" cy="134.4" r="3.5" fill="#ff6b6b"/>
+    <circle cx="225" cy="117.3" r="3.5" fill="#ff6b6b"/><circle cx="302.5" cy="100.4" r="3.5" fill="#ff6b6b"/>
+    <circle cx="380" cy="91.1" r="3.5" fill="#ff6b6b"/><circle cx="457.5" cy="73.9" r="3.5" fill="#ff6b6b"/>
+    <circle cx="535" cy="61.1" r="3.5" fill="#ff6b6b"/><circle cx="612.5" cy="50.4" r="3.5" fill="#ff6b6b"/>
+    <circle cx="690" cy="28.3" r="3.5" fill="#ff6b6b"/>
+    <circle cx="70" cy="210.5" r="3.5" fill="#37d39b"/><circle cx="147.5" cy="213.9" r="3.5" fill="#37d39b"/>
+    <circle cx="225" cy="215.7" r="3.5" fill="#37d39b"/><circle cx="302.5" cy="215.7" r="3.5" fill="#37d39b"/>
+    <circle cx="380" cy="213.9" r="3.5" fill="#37d39b"/><circle cx="457.5" cy="208.9" r="3.5" fill="#37d39b"/>
+    <circle cx="535" cy="204.7" r="3.5" fill="#37d39b"/><circle cx="612.5" cy="199.8" r="3.5" fill="#37d39b"/>
+    <circle cx="690" cy="185.7" r="3.5" fill="#37d39b"/>
+    <text x="70"   y="252" fill="#cdd8ea" font-size="11.5" text-anchor="middle">1</text>
+    <text x="147.5" y="252" fill="#cdd8ea" font-size="11.5" text-anchor="middle">3</text>
+    <text x="225"  y="252" fill="#cdd8ea" font-size="11.5" text-anchor="middle">5</text>
+    <text x="302.5" y="252" fill="#cdd8ea" font-size="11.5" text-anchor="middle">7</text>
+    <text x="380"  y="252" fill="#cdd8ea" font-size="11.5" text-anchor="middle">9</text>
+    <text x="457.5" y="252" fill="#cdd8ea" font-size="11.5" text-anchor="middle">13</text>
+    <text x="535"  y="252" fill="#cdd8ea" font-size="11.5" text-anchor="middle">17</text>
+    <text x="612.5" y="252" fill="#cdd8ea" font-size="11.5" text-anchor="middle">21</text>
+    <text x="690"  y="252" fill="#cdd8ea" font-size="11.5" text-anchor="middle">31</text>
+    <text x="380"  y="272" fill="#9aa7bd" font-size="11.5" text-anchor="middle">gaussFiltSize</text>
+  </svg>
+  <div class="lgd">
+    <span><i style="background:#ff6b6b"></i><code>ubase</code> (before the fix)</span>
+    <span><i style="background:#37d39b"></i><code>ufix</code> (after the border fix)</span>
+  </div>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>gauss</th><th><code>ubase</code> cornMed</th><th><code>ubase</code> dScale</th><th><code>ufix</code> cornMed</th><th><code>ufix</code> dScale (t)</th><th><code>ufix</code> rho</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>0.0019</td><td>+4.8e−07</td><td>0.0019</td><td>+4.8e−07 (0.5)</td><td>0.99815</td></tr>
+<tr><td>3</td><td>0.0232</td><td class="bad">−1.6e−04</td><td>0.0017</td><td>+6.1e−07 (0.7)</td><td>0.99857</td></tr>
+<tr><td>5</td><td>0.0408</td><td class="bad">−2.8e−04</td><td class="best">0.0016</td><td>+6.0e−07 (0.8)</td><td>0.99895</td></tr>
+<tr><td>7</td><td>0.0711</td><td class="bad">−4.9e−04</td><td class="best">0.0016</td><td>+5.9e−07 (1.0)</td><td>0.99942</td></tr>
+<tr><td>9</td><td>0.0965</td><td class="bad">−6.6e−04</td><td class="best">0.0017</td><td>+7.0e−07 (1.3)</td><td>0.99962</td></tr>
+<tr><td>13</td><td>0.1699</td><td class="bad">−1.1e−03</td><td>0.0020</td><td>+6.5e−07 (1.3)</td><td>0.99980</td></tr>
+<tr><td>17</td><td>0.2586</td><td class="bad">−1.7e−03</td><td>0.0023</td><td>+6.2e−07 (1.0)</td><td>0.99984</td></tr>
+<tr><td>21</td><td>0.3678</td><td class="bad">−2.3e−03</td><td>0.0027</td><td>+5.1e−07 (0.6)</td><td>0.99984</td></tr>
+<tr><td>31</td><td class="bad">0.7599</td><td class="bad">−4.8e−03</td><td>0.0043</td><td>+1.4e−06 (0.9)</td><td>0.99983</td></tr>
+</tbody></table></div>
+
+<p><code>uboth</code> matches <code>ufix</code> at every level (largest difference 0.0001 px). <b>The warp reduction does not move the best gauss.</b></p>
+
+<p>Before the fix, the cost of raising <code>gaussFiltSize</code> was <b>a systematic error growing linearly</b>. Afterwards that is gone: accuracy is essentially flat from gauss 1 to 9 at 0.0016-0.0019 px, then degrades slowly. The degradation is the loss of valid pixels to the dropped ring (at window 200 with gauss=31, 170 squared over 200 squared, or 72%).</p>
+
+<h3>3.2 Convergence radius: it grows monotonically with gauss</h3>
+
+<div class="chart">
+  <h4>Blur width against convergence rate (affine, <code>basin</code> x1, trials=200, <code>ufix</code>)</h4>
+  <p class="cap">The stronger the blur, the wider the convergence radius. That is the only thing the pre-filter buys.</p>
+  <svg viewBox="0 0 720 240" role="img" aria-label="gaussFiltSize and convergence rate">
+    <line x1="70" y1="200" x2="690" y2="200" stroke="#3a4763" stroke-width="1"/>
+    <line x1="70" y1="157.5" x2="690" y2="157.5" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="115" x2="690" y2="115" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="72.5" x2="690" y2="72.5" stroke="#27314a" stroke-width="1"/>
+    <line x1="70" y1="30"  x2="690" y2="30"  stroke="#27314a" stroke-width="1"/>
+    <text x="60" y="204" fill="#9aa7bd" font-size="11" text-anchor="end">0%</text>
+    <text x="60" y="161" fill="#9aa7bd" font-size="11" text-anchor="end">25%</text>
+    <text x="60" y="119" fill="#9aa7bd" font-size="11" text-anchor="end">50%</text>
+    <text x="60" y="76"  fill="#9aa7bd" font-size="11" text-anchor="end">75%</text>
+    <text x="60" y="34"  fill="#9aa7bd" font-size="11" text-anchor="end">100%</text>
+    <rect x="91.7"  y="108.2" width="60" height="91.8" fill="#5aa9ff" opacity="0.75" rx="3"/>
+    <rect x="195"   y="91.2"  width="60" height="108.8" fill="#5aa9ff" opacity="0.8" rx="3"/>
+    <rect x="298.3" y="84.4"  width="60" height="115.6" fill="#5aa9ff" opacity="0.85" rx="3"/>
+    <rect x="401.7" y="77.6"  width="60" height="122.4" fill="#37d39b" opacity="0.95" rx="3"/>
+    <rect x="505"   y="74.2"  width="60" height="125.8" fill="#5aa9ff" opacity="0.9" rx="3"/>
+    <rect x="608.3" y="70.8"  width="60" height="129.2" fill="#5aa9ff" opacity="0.9" rx="3"/>
+    <text x="121.7" y="102" fill="#e7ecf3" font-size="12" text-anchor="middle">54%</text>
+    <text x="225"   y="85"  fill="#e7ecf3" font-size="12" text-anchor="middle">64%</text>
+    <text x="328.3" y="78"  fill="#e7ecf3" font-size="12" text-anchor="middle">68%</text>
+    <text x="431.7" y="71"  fill="#37d39b" font-size="12" font-weight="700" text-anchor="middle">72%</text>
+    <text x="535"   y="68"  fill="#e7ecf3" font-size="12" text-anchor="middle">74%</text>
+    <text x="638.3" y="64"  fill="#e7ecf3" font-size="12" text-anchor="middle">76%</text>
+    <text x="121.7" y="219" fill="#cdd8ea" font-size="12" text-anchor="middle">1</text>
+    <text x="225"   y="219" fill="#cdd8ea" font-size="12" text-anchor="middle">3</text>
+    <text x="328.3" y="219" fill="#cdd8ea" font-size="12" text-anchor="middle">5</text>
+    <text x="431.7" y="219" fill="#37d39b" font-size="12" font-weight="700" text-anchor="middle">9</text>
+    <text x="535"   y="219" fill="#cdd8ea" font-size="12" text-anchor="middle">17</text>
+    <text x="638.3" y="219" fill="#cdd8ea" font-size="12" text-anchor="middle">31</text>
+    <text x="380"   y="236" fill="#9aa7bd" font-size="11.5" text-anchor="middle">gaussFiltSize</text>
+  </svg>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>gauss</th><th>×0.25</th><th>×0.5</th><th>×1</th><th>×2</th><th>×4</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>100%</td><td>90%</td><td>54%</td><td>15%</td><td>2%</td></tr>
+<tr><td>3</td><td>100%</td><td>97%</td><td>64%</td><td>25%</td><td>4%</td></tr>
+<tr><td>5</td><td>100%</td><td>98%</td><td>68%</td><td>24%</td><td>4%</td></tr>
+<tr><td>9</td><td>100%</td><td>99%</td><td class="best">72%</td><td>30%</td><td>8%</td></tr>
+<tr><td>17</td><td>100%</td><td>99%</td><td>74%</td><td>36%</td><td>10%</td></tr>
+<tr><td>31</td><td>100%</td><td>99%</td><td>76%</td><td>39%</td><td>11%</td></tr>
+</tbody></table></div>
+
+<p><code>ufix</code>.<code>uboth</code> behaves the same.<code>ubase</code> drops to 84% at gauss=31 and x0.25 -- the 0.74 px bias itself starts eating into the 1 px convergence criterion. Before the fix, large gauss could not be evaluated at all.</p>
+
+<div class="good-note">
+<b>Putting 3.1 and 3.2 together, 5 -> 9 holds accuracy and adds 4 points of convergence rate. It is a pure improvement.</b> Going to 17 buys 6 points at x1 and 12 points at x2, at an accuracy of 0.0023 px -- still 18 times better than current <code>ubase</code>. The pre-filter sits outside the loop, so raising <code>gaussFiltSize</code> does not add to the per-iteration cost. </div>
+
+<h3>3.3 Under noise: more blur is worse, not better</h3>
+
+<p><code>accuracy</code>, affine, window=200, trials=200, <code>ufix</code> cornMed (px):</p>
+
+<div class="tw"><table>
+<thead><tr><th>gauss</th><th>σ=2</th><th>σ=5</th><th>σ=10</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="best">0.0071</td><td class="best">0.0173</td><td>0.0382</td></tr>
+<tr><td>3</td><td>0.0075</td><td>0.0178</td><td class="best">0.0350</td></tr>
+<tr><td>5</td><td>0.0085</td><td>0.0205</td><td>0.0409</td></tr>
+<tr><td>9</td><td>0.0129</td><td>0.0325</td><td>0.0662</td></tr>
+<tr><td>17</td><td>0.0282</td><td>0.0692</td><td class="bad">0.1424</td></tr>
+<tr><td>31</td><td class="bad">0.0984</td><td class="bad">0.3247</td><td class="bad">0.9742</td></tr>
+</tbody></table></div>
+
+<div class="note">
+<b>The pre-filter does not buy robustness to noise.</b>Apart from gauss=3 being marginally best at sigma=10, not blurring is more accurate at every noise level. ECC already averages over forty thousand pixels; the blur adds no information and removes localisation cues (gradient energy).<br><br> So <b><code>gaussFiltSize</code>the reason for gaussFiltSize to exist collapses to the convergence radius</b>. If the default is to move, the argument is 3.2 alone, and not a claim about noise. </div>
+
+<h3>3.4 Small windows: dropping the ring costs little</h3>
+
+<p><code>fixedpoint</code>, affine, trials=300, cornMed (px):</p>
+
+<div class="tw"><table>
+<thead><tr><th>window</th><th>gauss</th><th><code>ubase</code></th><th><code>ufix</code></th><th>improvement</th></tr></thead>
+<tbody>
+<tr><td>64</td><td>5</td><td class="bad">0.1270</td><td>0.0083</td><td class="best">15×</td></tr>
+<tr><td>64</td><td>9</td><td class="bad">0.2940</td><td>0.0088</td><td class="best">33×</td></tr>
+<tr><td>64</td><td>17</td><td class="bad">0.7339</td><td>0.0152</td><td class="best">48×</td></tr>
+<tr><td>128</td><td>5</td><td class="bad">0.0640</td><td>0.0028</td><td class="best">23×</td></tr>
+<tr><td>128</td><td>9</td><td class="bad">0.1489</td><td>0.0030</td><td class="best">50×</td></tr>
+<tr><td>128</td><td>17</td><td class="bad">0.3801</td><td>0.0043</td><td class="best">88×</td></tr>
+</tbody></table></div>
+
+<p>At window 64 with gauss=17, valid pixels fall to 48 squared over 64 squared, or 56%, and it is still 48 times more accurate than <code>ubase</code>. A residual scale bias does show up with a small window and a large gauss, though (window 64, gauss=9: +2.8e-05, t=4.3; gauss=17: +4.9e-05, t=4.0). The sign is reversed (expansion), so it is not overcorrection of the ring removal but a different mechanism. Not chased down.</p>
+
+<h2>4. Conclusions, and what comes next</h2>
+
+<h3>Settled</h3>
+<ol>
+<li><b>The warp reduction sits on top of the border fix unchanged.</b>No loss of accuracy or convergence radius, and 1.24-1.49x faster at windows of 128-256 px. The scale bias left in fast-ecc alone disappears when the two are combined, so the combination is also the most accurate.</li>
+<li><b>The accuracy advantage of fast-ecc alone<code>gaussFiltSize=5</code> was a coincidence that depended on gaussFiltSize=5</b> (2.1.1). It erodes the mask by only 1 px, so the ring is covered exactly when it is 1 px wide (gauss=3) and not otherwise. At gauss=9 the residual bias is back to -1.8e-04 (t=-75), and at gauss=17 to -7.4e-04 (t=-51).</li>
+<li><b>The speed-up disappears above a 384 px window</b> (0.98-1.03x at 768-1024 px, effectively break-even). It never clearly gets slower.</li>
+<li><b>The cause is an asymmetry in OpenCV threading, and it is identified</b> (2.5).<code>warpAffine</code> reaches the thread pool above 384 px (up to 4.5x), while <code>filter2D</code>/<code>addWeighted</code> never does. <b>On a single thread the saving is strictly proportional to pixel count</b> (<code>dt/Mpx</code> stays at 6.8-7.5 across a 64-fold change in pixel count), and the ratio is flat at 1.27-1.31x from 128 to 768 px. Note that the first version of this report wrongly concluded the opposite here -- the control it used, <code>OPENCV_FOR_THREADS_NUM</code>, is ignored by this build.</li>
+<li><b>At large windows the warp is no longer the main cost.</b>At window 768 on 12 threads, 1.12 ms of a 16.2 ms iteration (7%) is removable warp. Even a perfect fused and parallelised replacement caps out near 1.06x; the other nine tenths is the Gauss-Newton algebra.</li>
+<li><b>The border fix is speed-neutral.</b>There is no performance objection to the upstream PR.</li>
+<li><b><code>gaussFiltSize</code> moves from 5 to 9</b> (same accuracy, 4 more points of convergence rate). Before the fix, 5 was close to the ceiling of a compromise.</li>
+<li><b>The pre-filter does not buy robustness to noise.</b>What it buys is convergence radius, and nothing else.</li>
+</ol>
+
+<h3>Not attempted</h3>
+<ul>
+<li><b>Improving large windows means the Gauss-Newton algebra</b> (2.6). Fusing and parallelising the gradient path caps out near 1.06x at window 768 on 12 threads. The place to work is <code>project_onto_jacobian_ECC</code> instead.</li>
+<li><b>A fused kernel for the added side.</b><code>filter2D</code> × 2 + <code>addWeighted</code> × 2 + <code>setTo</code>Folding <code>parallel_for_</code> into a single pass (ten planes read and written down to three) would at least make the 384-768 px trough shallower. It does nothing for single-thread users, who already have 1.27x.</li>
+<li><b><code>gaussFiltSize</code> Proposing a change of default upstream.</b>3.2 is grounds for it, but changing a default changes behaviour for existing users. Better not to raise it until #29775 is merged.</li>
+<li><b>The residual bias at small windows with large gauss</b> (+4.9e-05, t=4.0). The sign is reversed, so the mechanism is different.</li>
+<li><b>Reproduction on real images (<code>synth=resample</code>).</b>Everything here is the analytic scene. Its advantage is exact ground truth; the price is a monotonous band (<code>freq=0.22</code>, 40 components).</li>
+</ul>
+
+<h3>How to reproduce</h3>
+
+<pre><span class="c"># build</span>
+cd eval
+cmake -S . -B build -DOpenCV_DIR=C:/opencv/build/x64/vc15/lib
+cmake --build build --config Release
+
+<span class="c"># accuracy and bias</span>
+./build/Release/eval fixedpoint est=ubase,ufix,ufast,uboth motion=affine trials=300
+<span class="c"># convergence radius</span>
+./build/Release/eval basin      est=ubase,ufix,ufast,uboth motion=affine trials=200
+<span class="c"># per-iteration cost (eps=0 pins the iteration count)</span>
+./build/Release/eval accuracy   est=ubase,ufix,ufast,uboth motion=affine window=256 iters=20 eps=0 trials=30
+<span class="c"># gauss sweep</span>
+for g in 1 3 5 7 9 13 17 21 31; do
+  ./build/Release/eval fixedpoint est=ubase,ufix,uboth motion=affine gauss=$g trials=300
+done
+
+<span class="c"># threading control (threads= calls cv::setNumThreads;</span>
+<span class="c"># OPENCV_FOR_THREADS_NUM has no effect in this build, so do not use it)</span>
+for th in 1 12; do
+  ./build/Release/eval accuracy est=ufix,uboth motion=affine window=768 \
+      threads=$th iters=20 eps=0 trials=12
+done
+
+<span class="c"># per-operation breakdown (-tN pins the thread count)</span>
+./build/Release/opbench -t1  128 192 256 384 512 768 1024
+./build/Release/opbench -t12 128 192 256 384 512 768 1024</pre>
+
+<h3>Raw data</h3>
+
+<div class="tw"><table>
+<thead><tr><th style="text-align:left">file (<code>eval/results/</code>)</th><th style="text-align:left">section</th></tr></thead>
+<tbody>
+<tr><td><code>A1_fixedpoint.txt</code></td><td style="text-align:left">2.1 accuracy and bias</td></tr>
+<tr><td><code>parts/A2_*.txt</code></td><td style="text-align:left">2.1, end (started 1 px off)</td></tr>
+<tr><td><code>parts/A3_*.txt</code></td><td style="text-align:left">2.2 convergence radius</td></tr>
+<tr><td><code>D_ringtest.txt</code></td><td style="text-align:left">2.1.1 ring width and residual bias</td></tr>
+<tr><td><code>C1b_periter.txt</code></td><td style="text-align:left">2.3, upper (per-iteration cost)</td></tr>
+<tr><td><code>C2b_converged.txt</code></td><td style="text-align:left">2.3, lower (wall time to convergence)</td></tr>
+<tr><td><code>E1_bigwindow.txt</code></td><td style="text-align:left">2.4 the ladder up to window 1024</td></tr>
+<tr><td><code>F1_threads.txt</code></td><td style="text-align:left">2.5 threading control (whole ECC)</td></tr>
+<tr><td><code>E2_opbench.txt</code> <code>F2_opthreads.txt</code></td><td style="text-align:left">2.5 per-operation breakdown</td></tr>
+<tr><td><code>C3b_threads.txt</code></td><td style="text-align:left">2.5, the <b>invalid first control</b> (the environment variable had no effect; kept as a record)</td></tr>
+<tr><td><code>C1_periter.txt</code> <code>C2_converged.txt</code></td><td style="text-align:left">the <b>contaminated first measurement</b> of the same (kept for comparison)</td></tr>
+<tr><td><code>B1_gauss_clean.txt</code></td><td style="text-align:left">3.1 gauss sweep</td></tr>
+<tr><td><code>parts/B2_g*.txt</code></td><td style="text-align:left">3.2 gauss and convergence radius</td></tr>
+<tr><td><code>parts/B3_n*.txt</code></td><td style="text-align:left">3.3 under noise</td></tr>
+<tr><td><code>parts/B4_smallwin.txt</code></td><td style="text-align:left">3.4 small windows</td></tr>
+</tbody></table></div>
+
+<pre>python eval/results/tab.py    eval/results/B1_gauss_clean.txt
+python eval/results/speed.py  eval/results/C1b_periter.txt
+python eval/results/bigwin.py eval/results/E1_bigwindow.txt
+python eval/results/thr.py    eval/results/F1_threads.txt
+python eval/results/opthr.py</pre>
+
+<footer> Measured on: Windows 11 / MSVC / OpenCV 4.1.0 prebuilt (<code>opencv_world410</code>) / Intel Core i7-8700K (6C/12T, L2 1.5 MB, L3 12 MB).<br> Speed was re-taken after other work on the same machine was found to have contaminated it. Accuracy, convergence radius and the gauss sweep are deterministic at a fixed seed and were unaffected.<br> Markdown version: <code>ECC_warp_gauss_revisit.md</code> / related: <code>ECC_blur_border_bias.md</code>, <code>ECC_testsuite_audit.md</code>, <code>eval/README.md</code>
+</footer>
+
+</div>
+</body>
+</html>

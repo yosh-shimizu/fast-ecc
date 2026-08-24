@@ -541,6 +541,20 @@ double findTransformECC(InputArray templateImage,
         imageMask.row(0).setTo(0); imageMask.row(imageMask.rows - 1).setTo(0);
         imageMask.col(0).setTo(0); imageMask.col(imageMask.cols - 1).setTo(0);
 
+        // The Gaussian pre-filter above extrapolated the template border
+        // (BORDER_REFLECT_101), so a ring of gaussFiltSize/2 px of
+        // templateFloat is fabricated rather than measured.  Used at full
+        // weight it biases the estimated linear part toward a smaller scale.
+        // Drop it, the same way opencv#29775 does in ecc.cpp.  The single
+        // row/column above already covers a ring of 1.
+        const int blurRing = gaussFiltSize / 2;
+        if (blurRing > 1 && imageMask.rows > 2*blurRing && imageMask.cols > 2*blurRing) {
+            imageMask.rowRange(0, blurRing).setTo(0);
+            imageMask.rowRange(imageMask.rows - blurRing, imageMask.rows).setTo(0);
+            imageMask.colRange(0, blurRing).setTo(0);
+            imageMask.colRange(imageMask.cols - blurRing, imageMask.cols).setTo(0);
+        }
+
         // gradients of the WARPED image (chain rule: d/dx[I(W(x))] = J_W^T grad(I))
         filter2D(imageWarped, imageWarpedGradientX, -1, dx);
         filter2D(imageWarped, imageWarpedGradientY, -1, dx.t());
