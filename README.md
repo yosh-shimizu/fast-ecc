@@ -155,7 +155,7 @@ Gauss–Newton pass. So the two bilinear gradient warps per iteration disappear.
 | | image warp | gradient warps | mask warp |
 |---|:---:|:---:|:---:|
 | `cv::findTransformECC` | 1 | 2 | 1 |
-| `fastecc::findTransformECC` | 1 | **0** (filter2D) | 1 |
+| `fastecc::findTransformECC` | 1 | **0** (filter2D) | **0** (solved for; 1 with a user mask) |
 
 The gain from *this* change is **not** uniform. It is largest at small windows and on a
 single thread, and falls to break-even at large windows with a thread pool — because
@@ -207,14 +207,25 @@ do the masking (a masked pixel is skipped), the `A⁻ᵀ` recombination and the 
 centring per pixel. The arithmetic is the same, only the summation order differs: the
 fixed point agrees with the previous layout to four digits in all four motion types.
 
-Per iteration, one thread, window 200 (best of three interleaved runs):
+The mask warp goes the same way when there is no user mask. `preMask` is then a
+rectangle, and its nearest-neighbour warp is the set of template pixels whose rounded
+warped coordinate lands in it — along a row an interval, for affine and (with a
+positive denominator) projective warps alike. `analyticMask` solves for that interval
+per row instead of resampling; against the warped mask it differs on 0–2 pixels per
+warp (the 1/1024 fixed-point ties of OpenCV's rounding), and the fixed point does not
+move. A user-supplied mask still takes the warp.
 
-| motion | before | after | |
-|---|---:|---:|---:|
-| translation | 0.591 ms | 0.468 ms | 1.26× |
-| euclidean | 0.692 ms | 0.571 ms | 1.21× |
-| affine | 0.811 ms | 0.691 ms | 1.17× |
-| homography | 1.743 ms | 1.556 ms | 1.12× |
+Per iteration against the previous layout, best of three interleaved runs:
+
+| motion | 200 px, 1 thread | | 512 px, 1 thread | 200 px, 4 threads |
+|---|---:|---:|---:|---:|
+| translation | 0.605 → 0.387 ms | 1.56× | | |
+| euclidean | 0.678 → 0.481 ms | 1.41× | | |
+| affine | 0.829 → 0.590 ms | 1.40× | 1.47× | 1.49× |
+| homography | 1.707 → 1.278 ms | 1.34× | 1.35× | 1.88× |
+
+(Of that, folding the normalisation alone is 1.26× / 1.21× / 1.17× / 1.12×; the rest
+is the mask.)
 
 ### Not bit-identical to OpenCV
 
