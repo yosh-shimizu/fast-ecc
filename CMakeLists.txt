@@ -21,12 +21,19 @@ if(MSVC)
   endif()   # sources are UTF-8 (avoids C4819 on Japanese locales)
 endif()
 
+# Hand-vectorised kernels, off by default.  See src/gn_fused_simd.inc: they are
+# evidence of what explicit SIMD is worth, not a dependency of the library.
+option(FASTECC_SIMD "Use the hand-vectorised Gauss-Newton kernels" OFF)
+
 # --- the library -----------------------------------------------------------
 add_library(fast_ecc src/fast_ecc.cpp)
 target_include_directories(fast_ecc PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(fast_ecc PUBLIC ${FASTECC_CV})
+if(FASTECC_SIMD)
+  target_compile_definitions(fast_ecc PRIVATE FASTECC_SIMD)
+endif()
 target_include_directories(fast_ecc PUBLIC ${OpenCV_INCLUDE_DIRS})
 
 # --- tools (optional) ------------------------------------------------------
