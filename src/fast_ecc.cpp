@@ -577,8 +577,7 @@ double findTransformECC(InputArray templateImage,
 
         // The fused path needs only the recombined gradients; building the
         // jacobian is exactly the work it exists to avoid.
-        const bool fused = (motionType == MOTION_AFFINE ||
-                            motionType == MOTION_HOMOGRAPHY);
+        const bool fused = true;   // every motion type has a kernel now
 
         // recombine warped-image gradients into image-domain gradients, then
         // assemble the Jacobian of the image wrt the warp parameters
@@ -595,11 +594,13 @@ double findTransformECC(InputArray templateImage,
                 break;
             case MOTION_TRANSLATION:
                 warp_gradients_translation_ECC(imageWarpedGradientX, imageWarpedGradientY, gradientXWarped, gradientYWarped);
-                image_jacobian_translation_ECC(gradientXWarped, gradientYWarped, jacobian);
+                if (!fused)
+                    image_jacobian_translation_ECC(gradientXWarped, gradientYWarped, jacobian);
                 break;
             case MOTION_EUCLIDEAN:
                 warp_gradients_euclidean_ECC(imageWarpedGradientX, imageWarpedGradientY, map, gradientXWarped, gradientYWarped);
-                image_jacobian_euclidean_ECC(gradientXWarped, gradientYWarped, Xgrid, Ygrid, map, jacobian);
+                if (!fused)
+                    image_jacobian_euclidean_ECC(gradientXWarped, gradientYWarped, Xgrid, Ygrid, map, jacobian);
                 break;
         }
 
@@ -608,6 +609,21 @@ double findTransformECC(InputArray templateImage,
         if (motionType == MOTION_AFFINE)
         {
             GNAffine acc;
+            runFusedGN(acc, gradientXWarped, gradientYWarped, imageWarped, templateZM,
+                       hessian, imageProjection, templateProjection);
+        }
+        else if (motionType == MOTION_TRANSLATION)
+        {
+            GNTranslation acc;
+            runFusedGN(acc, gradientXWarped, gradientYWarped, imageWarped, templateZM,
+                       hessian, imageProjection, templateProjection);
+        }
+        else if (motionType == MOTION_EUCLIDEAN)
+        {
+            const float* h = map.ptr<float>(0);
+            GNEuclidean acc;
+            acc.h0 = h[0];   // cos(theta)
+            acc.h1 = h[3];   // sin(theta)
             runFusedGN(acc, gradientXWarped, gradientYWarped, imageWarped, templateZM,
                        hessian, imageProjection, templateProjection);
         }
