@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>After the fusion: the 5-tap gradient, the folded normalisation, and the laplacian column</title>
+<style>
+  :root{
+    --bg:#0f1420; --card:#171e2e; --ink:#e7ecf3; --muted:#9aa7bd; --line:#27314a;
+    --accent:#5aa9ff; --good:#37d39b; --warn:#ffb454; --bad:#ff6b6b; --mathbg:#0b1018;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.8;font-size:15px}
+  .wrap{max-width:1000px;margin:0 auto;padding:32px 22px 80px}
+  h1{font-size:28px;line-height:1.25;margin:0 0 6px}
+  h2{font-size:22px;margin:46px 0 12px;padding-bottom:8px;border-bottom:2px solid var(--line)}
+  h3{font-size:17px;margin:28px 0 8px;color:#cdd8ea}
+  p{margin:11px 0}
+  ul,ol{margin:11px 0;padding-left:22px}
+  li{margin:6px 0}
+  .sub{color:var(--muted);margin:0 0 24px}
+  a{color:var(--accent)}
+  code{background:#0b0f18;border:1px solid var(--line);border-radius:5px;padding:1px 6px;
+       font-family:"SF Mono",Consolas,Menlo,monospace;font-size:12.8px;color:#d8e2f2}
+  .m{font-family:"Cambria Math","STIX Two Math","Latin Modern Math",Georgia,"Times New Roman",serif;
+     font-style:italic;font-size:1.08em;color:#eaf1fa}
+  math{font-family:"Cambria Math","STIX Two Math","Latin Modern Math",Georgia,"Times New Roman",serif;
+       font-size:1.18em;color:#eaf1fa}
+  .eq{background:var(--mathbg);border:1px solid var(--line);border-radius:8px;padding:10px 16px;margin:12px 0;overflow-x:auto}
+  .tw{overflow-x:auto;margin:12px 0}
+  table{border-collapse:collapse;width:100%;font-size:13.5px}
+  th,td{border-bottom:1px solid var(--line);padding:6px 10px;text-align:right;white-space:nowrap}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--muted);font-weight:600}
+  td b{color:var(--good)}
+  .note{border-left:3px solid var(--line);padding:2px 0 2px 16px;color:var(--muted);font-size:13.5px;margin:14px 0}
+  .key{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:18px 0}
+  footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:13px;line-height:1.7}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>After the fusion: the 5-tap gradient, the folded normalisation, and the laplacian column</h1>
+<p class="sub">Three changes that landed after the fused Gauss–Newton stage (PR #4, #5), and the study they came out of:
+what the first-order model of the ECC paper leaves free, and what the rest of an iteration was spending its time on.</p>
+
+<div class="key">
+<b>In one paragraph.</b> With the Gauss–Newton stage fused, an iteration of <code>fastecc::findTransformECC</code> spent
+45–60 % of its time on bookkeeping (masking, means, norms, the recombination) rather than on the warp or the algebra.
+Folding that bookkeeping into two passes that write nothing made an iteration 1.34–1.56× cheaper, exactly.
+Separately, the forward-additive step of the paper is the <em>exact</em> maximiser of its first-order model, so the only
+estimated quantity left in that model is the image gradient, and its bias sets the convergence rate: the 4th-order 5-tap
+reaches the accuracy floor in 3 iterations instead of 4–5 at no cost. And an experiment on estimating the pre-filter's
+sigma alongside the motion — which cannot work, the objective has no maximum in sigma — left behind a column that does:
+the laplacian of the warped image, carried as a nuisance direction, halves the first step, widens the basin by 10–40 % and
+moves the fixed point on a real image 2.6× closer to the truth. Both are on by default now.
+</div>
+
+<h2>1. Where one iteration spent its time</h2>
+<p>The fused stage had taken the Gauss–Newton algebra from 6.3× to a small share of the iteration. Timing each stage of the
+loop (<code>eval/profbench</code>, window 200, one thread, ms per iteration, median of 7 calls) shows what was left:</p>
+<div class="tw"><table>
+<tr><th>motion</th><th>warp</th><th>mask warp</th><th>gradients</th><th>setTo ×3</th><th>means / norms</th><th>recomb</th><th>GN</th><th>solve</th><th>total</th><th>bookkeeping</th></tr>
+<tr><td>translation</td><td>0.160</td><td>0.095</td><td>0.044</td><td>0.043</td><td>0.127</td><td>0.019</td><td>0.069</td><td>0.008</td><td>0.565</td><td><b>59 %</b></td></tr>
+<tr><td>affine</td><td>0.170</td><td>0.091</td><td>0.045</td><td>0.044</td><td>0.131</td><td>0.028</td><td>0.251</td><td>0.011</td><td>0.771</td><td>45 %</td></tr>
+<tr><td>homography</td><td>0.696</td><td>0.501</td><td>0.098</td><td>0.078</td><td>0.183</td><td>0.057</td><td>0.855</td><td>0.029</td><td>2.497</td><td>38 %</td></tr>
+</table></div>
+<p>"Bookkeeping" is everything but the image warp and the Gauss–Newton pass: the nearest-neighbour warp of the mask, the
+two masked <code>meanStdDev</code>, two masked <code>subtract</code>, two <code>countNonZero</code>, three masked
+<code>setTo</code>, the two <code>addWeighted</code> of the <span class="m">A</span><sup>−T</sup> recombination, and a dot
+product. Each is a masked pass over one to three planes that also writes a plane. For translation the means and norms alone
+cost as much as the warp. Anything that approximates the Hessian could touch at most the 12–34 % that the GN column holds.</p>
+
+<h2>2. The gradient estimate sets the convergence rate</h2>
+<p>The paper's step (its eq. 19) is the closed-form <em>global</em> maximiser of the correlation coefficient of the linearised
+warped image, <math><mrow><msub><mi>i</mi><mi>w</mi></msub><mo>(</mo><mi>p</mi><mo>+</mo><mi>Δp</mi><mo>)</mo><mo>≈</mo>
+<msub><mi>i</mi><mi>w</mi></msub><mo>(</mo><mi>p</mi><mo>)</mo><mo>+</mo><mi>G</mi><mi>Δp</mi></mrow></math>. Within
+that model there is nothing to iterate: the only quantity that is <em>estimated</em> rather than exact is the gradient that
+builds <span class="m">G</span>. If an estimate <math><mrow><mover><mi>G</mi><mo>^</mo></mover><mo>=</mo><mi>G</mi>
+<mo>(</mo><mn>1</mn><mo>+</mo><mi>δ</mi><mo>)</mo></mrow></math> is used, the error near the solution contracts by
+about <span class="m">δ</span> per iteration — linear convergence on a noise-free scene is the signature of a biased
+Jacobian, and the 3-tap central difference is biased at the high frequencies where the gradient energy sits.</p>
+
+<p>Measured on the analytic scene (window 200, <code>gaussFiltSize</code> 5, 100 trials, 1 px initial offset; corner error
+in px after exactly <span class="m">N</span> iterations):</p>
+<div class="tw"><table>
+<tr><th><span class="m">N</span></th><th>affine, 3-tap</th><th>affine, 5-tap</th><th>affine, 7-tap</th><th>affine, Farid–Simoncelli 5-tap</th><th>homography, 3-tap</th><th>homography, 5-tap</th></tr>
+<tr><td>1</td><td>0.183</td><td>0.078</td><td>0.064</td><td>0.438</td><td>0.199</td><td>0.106</td></tr>
+<tr><td>2</td><td>0.028</td><td>0.0047</td><td>0.0030</td><td>0.178</td><td>0.036</td><td>0.012</td></tr>
+<tr><td>3</td><td>0.0049</td><td><b>0.0017</b></td><td>0.0017</td><td>0.072</td><td>0.0088</td><td>0.0037</td></tr>
+<tr><td>4</td><td>0.0019</td><td>0.0017</td><td>0.0018</td><td>0.031</td><td>0.0040</td><td>0.0031</td></tr>
+<tr><td>5</td><td><b>0.0017</b></td><td>0.0017</td><td>0.0017</td><td>0.013</td><td>0.0033</td><td>0.0029</td></tr>
+</table></div>
+<ul>
+<li>The rate goes from ~0.17 (3-tap) to ~0.06 (5-tap) and ~0.05 (7-tap); the floor arrives after 3 iterations instead of 4–5.</li>
+<li>The fixed point does not move: started at the ground truth, corner error and bias <span class="m">t</span>-values agree to four
+digits across the three kernels. The residual is below the floor, so the solution of
+<math><mrow><msup><mover><mi>G</mi><mo>^</mo></mover><mtext>T</mtext></msup><mi>r</mi><mo>=</mo><mn>0</mn></mrow></math> is the same.</li>
+<li>The Farid–Simoncelli kernel is <em>worse</em> (rate 0.4): its smoothing prefilter is applied to the gradient but not to the
+residual, and it is the mismatch between the two that matters, not tap count.</li>
+<li>With the |Δρ| &lt; 10<sup>−6</sup> stop the call gets 1.17–1.19× faster (euclidean, affine, homography); translation
+already reached its floor in 3 iterations.</li>
+<li>Homography stays at rate 0.11 with the 5-tap: the remaining bias is the constant-<span class="m">A</span> recombination of the
+gradient, a first-order-in-space approximation of the projective Jacobian. It does not touch the fixed point either.</li>
+</ul>
+<p>The change is one line, <code>(1, −8, 0, 8, −1)/12</code> for <code>(−1, 0, 1)/2</code>, plus a mask ring wide enough that
+no gradient inside the mask is formed from reflected samples.</p>
+
+<h2>3. Folding the normalisation, and solving for the mask</h2>
+<p>Two passes replace the chain of section 1, and both write nothing. <code>maskedStats()</code> gathers the six masked
+moments (<span class="m">N</span>, ΣI, ΣI², ΣT, ΣT², ΣIT) in one sweep; the means, both norms and the correlation of the centred
+vectors are algebra on those. The generated kernels then read the <em>raw</em> planes and do the masking (a masked pixel is
+skipped), the <span class="m">A</span><sup>−T</sup> recombination and the zero-mean centring per pixel. Eleven OpenCV calls
+and three planes per iteration go away; the arithmetic is unchanged, only the summation order, and the fixed point agrees
+with the previous layout to four digits in all four motion types.</p>
+<p>The mask warp goes the same way when there is no user mask: <code>preMask</code> is then a rectangle, and its
+nearest-neighbour warp is, per row, an interval — for affine warps and for projective ones with a positive denominator alike.
+<code>analyticMask()</code> solves four linear inequalities per row instead of resampling a plane. Against the warped mask it
+differs on 0–2 pixels per warp over 500 random warps per motion type (the 1/1024 fixed-point ties of OpenCV's rounding); the
+homography basin is identical trial for trial.</p>
+<div class="tw"><table>
+<tr><th>ms per iteration, window 200, one thread (best of three interleaved runs)</th><th>before</th><th>normalisation folded</th><th>+ mask solved</th><th></th></tr>
+<tr><td>translation</td><td>0.605</td><td>0.468</td><td><b>0.387</b></td><td>1.56×</td></tr>
+<tr><td>euclidean</td><td>0.678</td><td>0.571</td><td><b>0.481</b></td><td>1.41×</td></tr>
+<tr><td>affine</td><td>0.829</td><td>0.691</td><td><b>0.590</b></td><td>1.40×</td></tr>
+<tr><td>homography</td><td>1.707</td><td>1.556</td><td><b>1.278</b></td><td>1.34×</td></tr>
+</table></div>
+<p>At window 512, one thread: affine 1.47×, homography 1.35×. With four threads at window 200: affine 1.49×, homography
+1.88× — the mask warp did not scale with threads, and the solve is negligible.</p>
+
+<h2>4. Sigma as a parameter: the experiment, and what it left behind</h2>
+<p>The question was whether the pre-filter's sigma could be carried as an optimisation parameter next to the motion, starting
+from a large value so that the early iterations see a smoother objective. The heat equation gives its Jacobian column,
+<math><mrow><mfrac><mi>∂</mi><mrow><mi>∂</mi><mi>σ</mi></mrow></mfrac><mo>(</mo><msub><mi>G</mi><mi>σ</mi></msub>
+<mo>∗</mo><mi>I</mi><mo>)</mo><mo>=</mo><mi>σ</mi><msup><mi>∇</mi><mn>2</mn></msup><mo>(</mo><msub><mi>G</mi><mi>σ</mi></msub>
+<mo>∗</mo><mi>I</mi><mo>)</mo></mrow></math>, so the implementation is one more column. Five variants shared one upstream-layout
+implementation (<code>src/fast_ecc_sigma.cpp</code> on the <code>sigma-param</code> branch): sigma fixed, sigma estimated
+with the input-side column, the same with the template's derivative folded in, a geometric schedule, and the column solved
+for with sigma never moved.</p>
+<ul>
+<li><b>Sigma does not shrink on its own.</b> While the alignment is off, the correlation coefficient rewards blur — the
+autocorrelation broadens — and it is flat in sigma only at the solution. The symmetric formulation runs sigma to its cap;
+the input-side one moves it by +0.1 in the first step and then drifts slowly by a model artefact. "Start large and let it
+shrink" is not in the objective.</li>
+<li><b>The column is what helps, and it helps with sigma fixed.</b> The first step is identical whether or not sigma is
+updated (1 px → 0.070, against 0.183 without the column). <span class="m">σ</span>∇²<span class="m">I</span> has the shape of
+the isotropic second-order term of a misalignment residual, ½<span class="m">δ</span><sup>T</sup>∇²<span class="m">I</span><span class="m">δ</span>,
+and of the bilinear interpolation error, <span class="m">h</span>²∇²<span class="m">I</span>/8 — two things the first-order
+model leaves in the residual and that a nuisance direction takes out of the motion estimate, the way the illumination scalar
+<span class="m">λ</span> takes out a gain.</li>
+<li><b>Sigma should stay near the default.</b> With the column, sigma 0.8–1.1 is level with the plain kernels under 5 grey levels
+of noise (0.0197–0.0225 vs 0.0216 px); sigma 2 doubles the noise floor, column or not — blur costs gradient energy.</li>
+</ul>
+
+<h2>5. The laplacian column in the fused pass</h2>
+<p>Every kernel has a twin, <code>GN&lt;Name&gt;L</code>, with one more column: the 3×3 laplacian of the warped image, scaled
+by the pre-filter's sigma, whose coefficient is discarded. The generator now accumulates only the (u-pair, w-pair) sums the
+Gram matrix needs, which keeps the extra column at +5 to +7 live accumulators (affine 20 → 27). Measured against the plain
+kernels (window 200, one thread, 100 trials; <code>eval</code>):</p>
+<div class="tw"><table>
+<tr><th></th><th>plain</th><th>column</th><th>5-tap</th><th>both (default)</th></tr>
+<tr><td>affine, error after 1 / 3 iterations from 1 px</td><td>0.183 / 0.0049</td><td>0.074 / 0.0033</td><td>0.078 / 0.0017</td><td><b>0.030 / 0.0016</b></td></tr>
+<tr><td>affine floor, analytic scene</td><td>0.0016</td><td>0.0014</td><td>0.0017</td><td>0.0014</td></tr>
+<tr><td>affine floor, real image (fruits, resampled)</td><td>0.0073</td><td><b>0.0027</b></td><td>0.0070</td><td><b>0.0028</b></td></tr>
+<tr><td>homography floor, real image</td><td>0.0129</td><td>0.0062</td><td>0.0123</td><td>0.0061</td></tr>
+<tr><td>affine floor, 5 grey levels of noise</td><td>0.0216</td><td>0.0214</td><td>0.0208</td><td>0.0208</td></tr>
+<tr><td>basin ×1 / ×2, affine</td><td>76 / 23 %</td><td>86 / 30 %</td><td>77 / 26 %</td><td>86 / 31 %</td></tr>
+<tr><td>basin ×1 / ×2, homography</td><td>62 / 21 %</td><td>80 / 29 %</td><td>66 / 21 %</td><td>80 / 28 %</td></tr>
+<tr><td>basin ×1, translation</td><td>82 %</td><td>98 %</td><td>89 %</td><td>98 %</td></tr>
+<tr><td>ms per iteration, affine / homography</td><td>0.580 / 1.218</td><td>0.644 / 1.243</td><td>0.584 / 1.235</td><td>0.647 / 1.243</td></tr>
+<tr><td>ms per call (|Δρ| &lt; 10<sup>−6</sup>), affine / homography</td><td>4.27 / 7.84</td><td>4.44 / 7.94</td><td>3.38 / 6.41</td><td><b>3.42 / 6.38</b></td></tr>
+</table></div>
+<p>The column pays for its 2–19 % per iteration with one iteration fewer, so on its own it is time-neutral and buys accuracy and
+basin; with the 5-tap the call is 1.25× faster and the most accurate of the four. For pure translation the column costs more
+time than it saves — the plain kernel is already at its floor in 3 iterations — while still widening the basin from 82 to
+98 % at ×1. Both flags are on by default; <code>flags = 0</code> restores the plain kernels and their fixed point.</p>
+
+<h2>6. As landed</h2>
+<p>The equivalence test now renders its input with a margin of real data around the template. The previous construction warped
+the template onto an image of its own size, which leaves a zero-filled strip along two edges that the pre-filter smears
+inward by <code>gaussFiltSize/2</code>; the sweep over <code>gaussFiltSize</code> was measuring how far each width's mask
+ring happened to sit from that strip (affine read 0.23 px at width 3, 0.002 px with a margin). With the margin every width
+sits on the floor, the sweep is flat, the tolerances come down to ~3× of it, and the whole sweep runs under all four flag
+sets.</p>
+<p>Against a border-fixed OpenCV (4.15.0-dev with opencv#29775), one thread unless stated:</p>
+<div class="tw"><table>
+<tr><th>affine, ms per iteration (fixed 20 iterations, best of 3)</th><th>window 256</th><th>512</th><th>768</th></tr>
+<tr><td>one thread</td><td>1.90×</td><td>2.10×</td><td>2.29×</td></tr>
+<tr><td>four threads</td><td>2.61×</td><td>2.80×</td><td><b>3.53×</b></td></tr>
+</table></div>
+<div class="tw"><table>
+<tr><th><code>./build/bench 512 20</code>, default thread count (median of 3)</th><th>cv</th><th>fast</th><th></th><th>previous release</th></tr>
+<tr><td>TRANSLATION</td><td>23.4 ms</td><td>8.2 ms</td><td>2.88×</td><td>1.71×</td></tr>
+<tr><td>EUCLIDEAN</td><td>36.0 ms</td><td>11.7 ms</td><td>3.08×</td><td>1.93×</td></tr>
+<tr><td>AFFINE</td><td>46.5 ms</td><td>17.6 ms</td><td>2.64×</td><td>2.11×</td></tr>
+<tr><td>HOMOGRAPHY</td><td>123.9 ms</td><td>27.6 ms</td><td><b>4.46×</b></td><td>3.24×</td></tr>
+</table></div>
+<div class="tw"><table>
+<tr><th>affine, window 200, 200 trials, started at the ground truth</th><th>cv (fixed)</th><th>fast, flags = 0</th><th>fast (default)</th></tr>
+<tr><td>corner RMS, analytic scene</td><td>0.0017 px</td><td>0.0017 px</td><td><b>0.0015 px</b></td></tr>
+<tr><td>corner RMS, real image (fruits, resampled)</td><td>0.0072 px</td><td>0.0072 px</td><td><b>0.0028 px</b></td></tr>
+<tr><td>converged from the no-motion guess, ×1 / ×2 / ×4</td><td>69 / 26 / 4 %</td><td>69 / 26 / 4 %</td><td><b>82 / 33 / 8 %</b></td></tr>
+</table></div>
+
+<h2>7. What was tried, and what is left</h2>
+<ul>
+<li><b>A second-order model in the parameters</b> (the image Hessian, inner iterations without a re-warp) was derived and not
+built. The blurred image's Taylor radius is about a pixel, and within it the first-order model with a good gradient already
+lands at 0.06–0.08 px in one warp; the second-order term would save at most one warp against three extra planes and a heavier
+kernel. The laplacian column is the cheap part of that model — its isotropic term, as one column.</li>
+<li><b>A first-order-in-space approximation of the projective coordinate</b> (a piecewise-affine sampler for homography) is not
+accurate enough for the residual: the chord error of a span <span class="m">S</span> is <span class="m">aεS</span>²/4, first
+order in the projective parameter, 3.5·10<sup>−3</sup> px already at <span class="m">S</span> = 8 against a floor of 2.6·10<sup>−3</sup>.
+A second-order (forward-differenced) coordinate would do, and the per-pixel division itself is only ~3 ns; the in-situ cost of
+<code>warpPerspective</code> and of the mask warp is the larger target, and the mask part is now gone.</li>
+<li><b>The stop criterion</b> |Δρ| &lt; ε spends iterations settling ρ after the motion has reached its floor, which is why
+"3 iterations instead of 5" became 1.2× rather than 1.6× in call time. The paper stops on ‖Δp‖.</li>
+<li><b>Homography's remaining rate</b> (0.11 with the 5-tap, against 0.06 for affine) is the constant-<span class="m">A</span>
+recombination; the fused kernel already has the per-pixel denominator, so a per-pixel Jacobian is a few operations away.</li>
+</ul>
+
+<h2>8. Summary</h2>
+<ol>
+<li><b>The first-order model has exactly one estimated quantity, the gradient, and its bias is the convergence rate.</b> A 5-tap
+takes the floor from 4–5 iterations to 3; nothing else in the model can be improved without leaving the model.</li>
+<li><b>Bookkeeping was half the iteration.</b> Two passes that write nothing take 1.34–1.56× off it, exactly.</li>
+<li><b>Sigma cannot be estimated, but its column can be kept.</b> As a nuisance direction it absorbs the isotropic second-order
+residual and the interpolation error: half the first step, +10–40 % basin, 2.6× lower error on a real image, for +2–19 % per
+iteration.</li>
+<li><b>Together, against a border-fixed OpenCV:</b> 1.9–3.5× per iteration on affine depending on window and threads, 2.6–4.5× per
+call in the bundled bench, and a lower floor rather than an equal one.</li>
+</ol>
+
+<footer>
+Measured on an Intel Core i7-8700K (6C/12T), Windows 11, MSVC, Release, against OpenCV 4.15.0-dev built with the border fix
+applied. Single-thread timings on this machine vary by ±10–30 % between runs; every ratio is taken within one run, and
+per-iteration costs are the best of three interleaved runs.<br>
+Implementation: <code>src/fast_ecc.cpp</code>, <code>src/gn_fused.inc</code> (generated by <code>tools/gen_gn_kernels.py</code>),
+the <code>sigma-param</code> branch for the sigma experiment. Instruments: <code>eval/profbench.cpp</code>,
+<code>eval/xgrad_ecc.cpp</code>, <code>eval/perspbench.cpp</code>, <code>eval/maskcheck.cpp</code>; raw data under
+<code>eval/results/</code> (U1–U4, V1–V3, W1–W4, X1).<br>
+Related: <a href="gauss-newton-fusion.html">Fusing the Gauss–Newton stage</a>,
+<a href="warp-reduction-and-border-fix.html">The warp reduction against the border fix</a>.
+</footer>
+
+</div>
+</body>
+</html>

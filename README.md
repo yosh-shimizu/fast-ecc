@@ -47,6 +47,10 @@ the numbers below are taken against a corrected OpenCV baseline.
 | Accuracy test with a criterion that can fail | landed |
 | Fused Gauss–Newton stage, all four motion types | landed |
 | Row-invariant columns hoisted out of the inner loop | landed |
+| Normalisation folded into the fused pass; mask solved for, not warped | landed |
+| 5-tap image gradient (3 iterations to the floor instead of 4–5) | landed, on by default |
+| Laplacian column (wider basin, 2.6× lower error on a real image) | landed, on by default |
+| Equivalence test with a margin of real data, run under every flag set | landed |
 
 ### What was wrong, and how it is guarded now
 
@@ -68,60 +72,61 @@ fix reverted the suite reports sixteen failures and names the cause.
 Every row states its operating point, because in this code the same change
 measures 1.3x or 1.1x depending on it.
 
-### Accuracy — equal to a fixed OpenCV
+### Accuracy — equal to a fixed OpenCV with the plain kernels, better with the defaults
 
-Measured against an OpenCV that carries the border fix, on the analytic scene,
-affine, window 200, 200 trials, started **at** the ground truth so that any movement
-is bias:
+Measured against an OpenCV that carries the border fix, affine, window 200, 200
+trials, started **at** the ground truth so that any movement is bias:
 
-| | corner RMS | scale bias (t) |
-|---|---:|---:|
-| `cv::findTransformECC` (fixed) | 0.0017 px | +8.7e-07 (1.3) |
-| `fastecc::findTransformECC` | 0.0017 px | +8.7e-07 (1.3) |
+| | analytic scene | real image (fruits, resampled) | scale bias (t), analytic |
+|---|---:|---:|---:|
+| `cv::findTransformECC` (fixed) | 0.0017 px | 0.0072 px | +5.7e-07 (0.6) |
+| `fastecc::findTransformECC`, `flags = 0` | 0.0017 px | 0.0072 px | +5.8e-07 (0.6) |
+| `fastecc::findTransformECC` (default flags) | **0.0015 px** | **0.0028 px** | +3.1e-07 (0.3) |
 
-The fused Gauss–Newton stage does not move these: it is the same algebra evaluated in
-a different order. Convergence counts over 150 trials at five deformation steps match
-`cv` exactly for translation and affine, and differ by one or two borderline trials
-out of 150 for euclidean and homography.
+With the plain kernels the two are statistically indistinguishable and neither shows a
+systematic bias: the warp reduction, the fused stage and the folded normalisation are the
+same algebra evaluated in a different order, and convergence counts over 150 trials at
+five deformation steps match `cv` trial for trial. Before the border fix this fork sat at
+0.0287 px with a −1.8e−04 (t = −63.9) scale bias at `gaussFiltSize=9`.
 
-Statistically indistinguishable, and neither shows a systematic bias. Before the
-border fix this fork sat at 0.0287 px with a −1.8e−04 (t = −63.9) scale bias at
-`gaussFiltSize=9`.
-
-**Accuracy is equal, not better.** Which of the two resampling orders is closer to
-ground truth remains unsettled — see [Not bit-identical](#not-bit-identical-to-opencv).
+The defaults add the [laplacian column](#two-optional-flags-the-laplacian-column-and-the-5-tap-gradient),
+which takes the bilinear interpolation error out of the fixed point: on the real image the
+corner error drops 2.6×, and the fraction of trials that converge from the no-motion guess
+goes from 69 / 26 / 4 % to 82 / 33 / 8 % at ×1 / ×2 / ×4 the default deformation.
 
 ### Speed
 
-Cost of one iteration, affine, analytic scene, best of 3 runs, against a
-border-fixed OpenCV:
+Cost of one iteration, affine, analytic scene, fixed 20 iterations, best of 3 runs,
+default flags, against a border-fixed OpenCV:
 
 | window | 4 threads | 1 thread |
 |---:|---:|---:|
-| 256 | **1.80×** | 1.35× |
-| 512 | 1.68× | 1.38× |
-| 768 | **1.90×** | 1.56× |
+| 256 | **2.61×** | 1.90× |
+| 512 | 2.80× | 2.10× |
+| 768 | **3.53×** | 2.29× |
 
-Two changes contribute, and they cover each other. The **warp reduction** takes the
+Three changes contribute, and they cover each other. The **warp reduction** takes the
 three bilinear warps per iteration down to one; it pays most at small windows and
-decays to nothing at large ones with a thread pool, because OpenCV parallelises the
-`warpAffine` it removes but not the `filter2D` that replaces it. The
-**fused Gauss–Newton stage** does the opposite: it builds the Hessian and both
-projections in one pass without materialising the Jacobian, and the saving grows with
-the parameter count, so it is largest exactly where the warp reduction has given up.
+decays at large ones with a thread pool, because OpenCV parallelises the `warpAffine`
+it removes but not the `filter2D` that replaces it. The **fused Gauss–Newton stage**
+does the opposite: it builds the Hessian and both projections in one pass without
+materialising the Jacobian, and the saving grows with the parameter count. The
+**folded normalisation** removes the eleven masked OpenCV calls and the mask warp that
+sat between the two, which were 45–60 % of an iteration once the other two had landed.
 
-The bundled `./build/bench` (512×512, default thread count) shows the per-motion
-spread, and how much of it is the fused stage:
+The bundled `./build/bench` (512×512, default thread count, median of 3) shows the
+per-motion spread; the last column is the previous release for reference:
 
-| motion | cv | fast | speedup | before fusion |
+| motion | cv | fast | speedup | previous release |
 |---|---:|---:|---:|---:|
-| TRANSLATION | 22.9 ms | 13.4 ms | 1.71× | 1.09× |
-| EUCLIDEAN | 35.4 ms | 18.4 ms | 1.93× | 1.06× |
-| AFFINE | 46.6 ms | 22.1 ms | 2.11× | 1.11× |
-| HOMOGRAPHY | 122.0 ms | 38.4 ms | **3.24×** | 1.21× |
+| TRANSLATION | 23.4 ms | 8.2 ms | 2.88× | 1.71× |
+| EUCLIDEAN | 36.0 ms | 11.7 ms | 3.08× | 1.93× |
+| AFFINE | 46.5 ms | 17.6 ms | 2.64× | 2.11× |
+| HOMOGRAPHY | 123.9 ms | 27.6 ms | **4.46×** | 3.24× |
 
 Homography gains most because the Jacobian path re-reads its blocks P² times for the
-Gram matrix, and P = 8.
+Gram matrix, and P = 8. The bench counts iterations to convergence, so the 5-tap
+gradient (3 iterations to the floor instead of 4–5) is part of these figures.
 
 The fused kernels are generated by [`tools/gen_gn_kernels.py`](tools/gen_gn_kernels.py);
 CI fails if `src/gn_fused.inc` stops matching its output.
@@ -140,6 +145,9 @@ The measurements behind each change, in more depth than the table above, are in
   windows with a thread pool, and the `gaussFiltSize` re-tuning
 - **Fusing the Gauss–Newton stage** — why all four motion types are the same
   face-splitting product, and why the saving grows with the parameter count
+- **After the fusion** — the 5-tap gradient (the first-order model's one estimated
+  quantity), the folded normalisation, the sigma experiment and the laplacian column it
+  left behind
 
 ## Why the warp reduction is faster
 
