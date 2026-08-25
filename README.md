@@ -125,13 +125,6 @@ percent off) shows the per-motion spread against both OpenCV implementations —
 `findTransformECC` (ecc.cpp) and `findTransformECCMultiScale` (eccms.cpp, OpenCV ≥ 4.12,
 with its default 4-level pyramid and single-scale):
 
-| default thread count (12) | cv | eccms, 4 levels | eccms, 1 level | fast | vs cv | vs eccms 4 | vs eccms 1 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| TRANSLATION | 23.6 ms | 6.8 ms | 8.6 ms | 8.1 ms | 2.9× | 0.85× | 1.04× |
-| EUCLIDEAN | 36.5 ms | 7.4 ms | 12.1 ms | 11.7 ms | 3.1× | 0.63× | 1.01× |
-| AFFINE | 47.5 ms | 9.3 ms | 17.5 ms | 15.8 ms | 3.0× | 0.58× | 1.23× |
-| HOMOGRAPHY | 125.2 ms | 10.5 ms | 30.5 ms | 28.1 ms | **4.5×** | 0.37× | 1.01× |
-
 | one thread | cv | eccms, 4 levels | eccms, 1 level | fast | vs cv | vs eccms 4 | vs eccms 1 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | TRANSLATION | 36.4 ms | 9.9 ms | 14.5 ms | 12.3 ms | 2.9× | 0.80× | 1.19× |
@@ -139,8 +132,23 @@ with its default 4-level pyramid and single-scale):
 | AFFINE | 63.3 ms | 15.4 ms | 39.6 ms | 28.9 ms | 2.2× | 0.53× | 1.35× |
 | HOMOGRAPHY | 173.5 ms | 24.8 ms | 106.4 ms | 76.8 ms | 2.3× | 0.32× | **1.37×** |
 
-(Each ratio is taken within one run; the 1-level column comes from a separate run with
-`nlevels = 1`. Run `./build/bench 512 20 <threads> <eccmsLevels>` to reproduce.)
+| two threads | cv | eccms, 4 levels | eccms, 1 level | fast | vs cv | vs eccms 4 | vs eccms 1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| TRANSLATION | 32.4 ms | 7.5 ms | 9.5 ms | 9.7 ms | 3.4× | 0.78× | 0.86× |
+| EUCLIDEAN | 45.3 ms | 8.8 ms | 15.0 ms | 16.3 ms | 2.8× | 0.54× | 0.86× |
+| AFFINE | 56.7 ms | 10.4 ms | 21.8 ms | 21.9 ms | 2.6× | 0.47× | 0.93× |
+| HOMOGRAPHY | 152.0 ms | 15.3 ms | 55.4 ms | 53.7 ms | 2.8× | 0.28× | 1.03× |
+
+| four threads | cv | eccms, 4 levels | eccms, 1 level | fast | vs cv | vs eccms 4 | vs eccms 1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| TRANSLATION | 27.8 ms | 6.1 ms | 6.9 ms | 7.8 ms | 3.6× | 0.78× | 0.87× |
+| EUCLIDEAN | 40.1 ms | 6.5 ms | 10.5 ms | 11.8 ms | 3.4× | 0.55× | 0.87× |
+| AFFINE | 51.2 ms | 8.1 ms | 16.6 ms | 17.3 ms | 3.0× | 0.47× | 0.89× |
+| HOMOGRAPHY | 139.1 ms | 11.2 ms | 36.5 ms | 34.7 ms | **4.0×** | 0.32× | 1.05× |
+
+(Each ratio is taken within one run; the 1-level column and its ratio come from a
+separate run with `nlevels = 1`. Run `./build/bench 512 20 <threads> <eccmsLevels>` to
+reproduce.)
 
 Against `findTransformECC`, homography gains most because the Jacobian path re-reads
 its blocks P² times for the Gram matrix, and P = 8. The bench counts iterations to
@@ -154,18 +162,20 @@ OpenCV 4.12 added `cv::findTransformECCMultiScale`: a fresh implementation with 
 Two things separate it from `findTransformECC`, and only one of them is the speed of the
 implementation.
 
-- **Single-scale, fast-ecc is the faster implementation.** With `nlevels = 1` eccms is
+- **Single-scale, the two implementations are close.** With `nlevels = 1` eccms is
   1.6–2.7× faster than ecc.cpp on one thread, and fast-ecc is a further 1.17–1.37×
-  faster than that. With twelve threads the two are level: the warps dominate and both
-  call the same `warpAffine`.
+  faster than that. With two or four threads eccms's stripes scale better than
+  fast-ecc's mix of OpenCV calls and fused passes, and the two are level to slightly
+  in eccms's favour (fast-ecc at 0.86–1.05× of it).
 - **The pyramid is what makes eccms faster.** With its default four levels it is
-  1.2–3× faster than fast-ecc in this bench, because the start is 3 px and a few percent
-  off and the coarse levels take most of the iterations at 1/16 to 1/64 of the pixels.
-  When the start is within a pixel the pyramid does not pay: on the real image at
-  window 384 with four threads, fast-ecc is 1.14–1.22× faster than eccms *with* its four
-  levels (affine 6.7 vs 8.1 ms, homography 9.5 vs 10.9 ms). Its basin is wider — on the
-  real image 100 % of trials converge at ×4 the default deformation, against 85 % for
-  fast-ecc and 89 % for ecc.cpp.
+  1.3–3.5× faster than fast-ecc in this bench, because the start is 3 px and a few
+  percent off and the coarse levels take most of the iterations at 1/16 to 1/64 of the
+  pixels. When the start is within a pixel the pyramid does not pay: on the real image
+  at window 384, fast-ecc is level with eccms *with* its four levels on two threads
+  (affine 10.6 vs 9.8 ms, homography 14.5 vs 14.9 ms) and 1.14–1.22× faster on four
+  (6.7 vs 8.1 ms, 9.5 vs 10.9 ms). Its basin is wider — on the real image 100 % of
+  trials converge at ×4 the default deformation, against 85 % for fast-ecc and 89 %
+  for ecc.cpp.
 - **Accuracy on the real image:** eccms 0.0078 px, ecc.cpp 0.0072 px, fast-ecc 0.0028 px
   (affine, window 200, started at the truth).
 
