@@ -227,6 +227,48 @@ Per iteration against the previous layout, best of three interleaved runs:
 (Of that, folding the normalisation alone is 1.26× / 1.21× / 1.17× / 1.12×; the rest
 is the mask.)
 
+### Two optional flags: the laplacian column and the 5-tap gradient
+
+`findTransformECC` takes a trailing `flags` argument; both flags are on by default (`FASTECC_DEFAULT_FLAGS`), pass 0 for the plain kernels.
+
+**`FASTECC_LAPLACIAN_COLUMN`** carries the laplacian of the warped image, scaled by the
+pre-filter's sigma, as one more Gauss–Newton column. The coefficient it estimates is
+discarded; the column is a *nuisance direction*. It came out of asking whether sigma
+itself could be estimated alongside the motion (it cannot — the correlation coefficient
+has no maximum in sigma while the images are misaligned, so a joint estimate runs sigma
+up), but the column that estimate would use turns out to have the shape of two things
+the first-order model leaves in the residual: the isotropic second-order term of a
+misalignment, and the error of bilinear interpolation. With it in the system the first
+step from a 1 px offset lands at 0.07 px instead of 0.18, the basin widens, and on a
+real image the fixed point moves toward the truth. It costs one 3×3 filter and a
+larger fused pass (affine 20 → 27 live accumulators).
+
+**`FASTECC_GRAD5`** uses the 4th-order 5-tap finite difference `(1, −8, 0, 8, −1)/12`
+for the image gradient instead of the 3-tap. The forward-additive step is the exact
+maximiser of the paper's first-order model, so the gradient estimate is the only thing in
+that model that is not exact, and its bias sets the convergence rate: the error contracts
+by ~0.06 per iteration instead of ~0.17. The fixed point is unchanged and the cost is nil.
+
+Measured against the plain kernels (window 200, one thread, 100 trials; `eval`):
+
+| | plain | column | 5-tap | both |
+|---|---:|---:|---:|---:|
+| affine, error after 1 / 3 iterations from 1 px | 0.183 / 0.0049 | 0.074 / 0.0033 | 0.078 / 0.0017 | **0.030 / 0.0016** |
+| affine floor, analytic scene | 0.0016 | 0.0014 | 0.0017 | 0.0014 |
+| affine floor, real image (fruits) | 0.0073 | **0.0027** | 0.0070 | **0.0028** |
+| homography floor, real image | 0.0129 | 0.0062 | 0.0123 | 0.0061 |
+| affine floor, 5 grey levels of noise | 0.0216 | 0.0214 | 0.0208 | 0.0208 |
+| basin ×1 / ×2, affine | 76 / 23 % | 86 / 30 % | 77 / 26 % | 86 / 31 % |
+| basin ×1 / ×2, homography | 62 / 21 % | 80 / 29 % | 66 / 21 % | 80 / 28 % |
+| ms per iteration, affine / homography | 0.580 / 1.218 | 0.644 / 1.243 | 0.584 / 1.235 | 0.647 / 1.243 |
+| ms per call (|Δρ| < 1e-6), affine / homography | 4.27 / 7.84 | 4.44 / 7.94 | 3.38 / 6.41 | **3.42 / 6.38** |
+
+The column pays for its 2–19 % per iteration with one iteration fewer, so on its own it
+is time-neutral and buys accuracy and basin; with the 5-tap the call is 1.25× faster
+*and* the most accurate of the four. For pure translation the column costs more time than
+it saves (the plain kernel is already at its floor in 3 iterations) while still widening
+the basin from 82 to 98 % at ×1.
+
 ### Not bit-identical to OpenCV
 
 This method takes gradients **of the warped image**, whereas OpenCV warps gradients **of
