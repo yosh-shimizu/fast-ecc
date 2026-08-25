@@ -80,8 +80,14 @@ trials, started **at** the ground truth so that any movement is bias:
 | | analytic scene | real image (fruits, resampled) | scale bias (t), analytic |
 |---|---:|---:|---:|
 | `cv::findTransformECC` (fixed) | 0.0017 px | 0.0072 px | +5.7e-07 (0.6) |
+| `cv::findTransformECCMultiScale` (fixed, 4 levels) | — | 0.0078 px | — |
 | `fastecc::findTransformECC`, `flags = 0` | 0.0017 px | 0.0072 px | +5.8e-07 (0.6) |
 | `fastecc::findTransformECC` (default flags) | **0.0015 px** | **0.0028 px** | +3.1e-07 (0.3) |
+
+(`findTransformECCMultiScale` has no analytic-scene entry: its 4-level pyramid takes a
+200 px window to 25 px, and the band-limited scene has no content left there. It
+carries the same border defect as `findTransformECC` — opencv#29781 — and is measured
+here with that fix applied locally.)
 
 With the plain kernels the two are statistically indistinguishable and neither shows a
 systematic bias: the warp reduction, the fused stage and the folded normalisation are the
@@ -114,19 +120,57 @@ materialising the Jacobian, and the saving grows with the parameter count. The
 **folded normalisation** removes the eleven masked OpenCV calls and the mask warp that
 sat between the two, which were 45–60 % of an iteration once the other two had landed.
 
-The bundled `./build/bench` (512×512, default thread count, median of 3) shows the
-per-motion spread; the last column is the previous release for reference:
+The bundled `./build/bench` (512×512, best of 20 calls, the start 3 px and a few
+percent off) shows the per-motion spread against both OpenCV implementations —
+`findTransformECC` (ecc.cpp) and `findTransformECCMultiScale` (eccms.cpp, OpenCV ≥ 4.12,
+with its default 4-level pyramid and single-scale):
 
-| motion | cv | fast | speedup | previous release |
-|---|---:|---:|---:|---:|
-| TRANSLATION | 23.4 ms | 8.2 ms | 2.88× | 1.71× |
-| EUCLIDEAN | 36.0 ms | 11.7 ms | 3.08× | 1.93× |
-| AFFINE | 46.5 ms | 17.6 ms | 2.64× | 2.11× |
-| HOMOGRAPHY | 123.9 ms | 27.6 ms | **4.46×** | 3.24× |
+| default thread count (12) | cv | eccms, 4 levels | eccms, 1 level | fast | vs cv | vs eccms 4 | vs eccms 1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| TRANSLATION | 23.6 ms | 6.8 ms | 8.6 ms | 8.1 ms | 2.9× | 0.85× | 1.04× |
+| EUCLIDEAN | 36.5 ms | 7.4 ms | 12.1 ms | 11.7 ms | 3.1× | 0.63× | 1.01× |
+| AFFINE | 47.5 ms | 9.3 ms | 17.5 ms | 15.8 ms | 3.0× | 0.58× | 1.23× |
+| HOMOGRAPHY | 125.2 ms | 10.5 ms | 30.5 ms | 28.1 ms | **4.5×** | 0.37× | 1.01× |
 
-Homography gains most because the Jacobian path re-reads its blocks P² times for the
-Gram matrix, and P = 8. The bench counts iterations to convergence, so the 5-tap
-gradient (3 iterations to the floor instead of 4–5) is part of these figures.
+| one thread | cv | eccms, 4 levels | eccms, 1 level | fast | vs cv | vs eccms 4 | vs eccms 1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| TRANSLATION | 36.4 ms | 9.9 ms | 14.5 ms | 12.3 ms | 2.9× | 0.80× | 1.19× |
+| EUCLIDEAN | 49.6 ms | 11.6 ms | 25.2 ms | 21.7 ms | 2.3× | 0.53× | 1.17× |
+| AFFINE | 63.3 ms | 15.4 ms | 39.6 ms | 28.9 ms | 2.2× | 0.53× | 1.35× |
+| HOMOGRAPHY | 173.5 ms | 24.8 ms | 106.4 ms | 76.8 ms | 2.3× | 0.32× | **1.37×** |
+
+(Each ratio is taken within one run; the 1-level column comes from a separate run with
+`nlevels = 1`. Run `./build/bench 512 20 <threads> <eccmsLevels>` to reproduce.)
+
+Against `findTransformECC`, homography gains most because the Jacobian path re-reads
+its blocks P² times for the Gram matrix, and P = 8. The bench counts iterations to
+convergence, so the 5-tap gradient (3 iterations to the floor instead of 4–5) is part
+of these figures.
+
+### Against `findTransformECCMultiScale`
+
+OpenCV 4.12 added `cv::findTransformECCMultiScale`: a fresh implementation with a
+4-level pyramid by default, 8-bit internally, a CV_64F warp and `parallel_for_` stripes.
+Two things separate it from `findTransformECC`, and only one of them is the speed of the
+implementation.
+
+- **Single-scale, fast-ecc is the faster implementation.** With `nlevels = 1` eccms is
+  1.6–2.7× faster than ecc.cpp on one thread, and fast-ecc is a further 1.17–1.37×
+  faster than that. With twelve threads the two are level: the warps dominate and both
+  call the same `warpAffine`.
+- **The pyramid is what makes eccms faster.** With its default four levels it is
+  1.2–3× faster than fast-ecc in this bench, because the start is 3 px and a few percent
+  off and the coarse levels take most of the iterations at 1/16 to 1/64 of the pixels.
+  When the start is within a pixel the pyramid does not pay: on the real image at
+  window 384 with four threads, fast-ecc is 1.14–1.22× faster than eccms *with* its four
+  levels (affine 6.7 vs 8.1 ms, homography 9.5 vs 10.9 ms). Its basin is wider — on the
+  real image 100 % of trials converge at ×4 the default deformation, against 85 % for
+  fast-ecc and 89 % for ecc.cpp.
+- **Accuracy on the real image:** eccms 0.0078 px, ecc.cpp 0.0072 px, fast-ecc 0.0028 px
+  (affine, window 200, started at the truth).
+
+A pyramid on top of fast-ecc's single-scale iteration is the obvious next step, and it is
+orthogonal to everything above.
 
 The fused kernels are generated by [`tools/gen_gn_kernels.py`](tools/gen_gn_kernels.py);
 CI fails if `src/gn_fused.inc` stops matching its output.
