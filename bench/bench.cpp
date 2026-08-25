@@ -1,11 +1,19 @@
-// bench.cpp — time and accuracy of fastecc::findTransformECC vs cv::findTransformECC.
+// bench.cpp — time and accuracy of fastecc::findTransformECC against
+// cv::findTransformECC (ecc.cpp) and, where the OpenCV at hand has it,
+// cv::findTransformECCMultiScale (eccms.cpp, OpenCV >= 4.12) with its default
+// parameters (nlevels = 4).
 //
 // Generates a synthetic textured image, applies a known warp to make the
-// "input", then recovers the warp with both implementations. Reports per-call
-// time, the recovered correlation rho, and the max |warp difference| between
-// the two implementations (a small number means "same answer, just faster").
+// "input", then recovers the warp with each implementation. Reports the best
+// per-call time over the repeats and the corner error against the ground truth.
+// eccms works in 8-bit internally and takes a CV_64F warp; the conversions sit
+// outside the timed region.
 //
-// Usage: bench [imageSize] [repeats]
+// Usage: bench [imageSize] [repeats] [threads] [eccmsLevels]
+//   threads      0 = OpenCV's default (all cores); the number is what
+//                cv::setNumThreads gets, and applies to every implementation
+//   eccmsLevels  nlevels for findTransformECCMultiScale (its default is 4;
+//                1 makes it single-scale, like the other two)
 #include "fast_ecc.hpp"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/core.hpp>
@@ -13,6 +21,12 @@
 #include <chrono>
 #include <cstdio>
 #include <vector>
+
+#if CV_VERSION_MAJOR > 4 || (CV_VERSION_MAJOR == 4 && CV_VERSION_MINOR >= 12)
+#define BENCH_HAS_ECCMS 1
+#else
+#define BENCH_HAS_ECCMS 0
+#endif
 
 using namespace cv;
 using clock_type = std::chrono::high_resolution_clock;
@@ -56,6 +70,9 @@ static Mat groundTruth(int motionType) {
 int main(int argc, char** argv) {
     const int n = argc > 1 ? std::atoi(argv[1]) : 512;
     const int repeats = argc > 2 ? std::atoi(argv[2]) : 20;
+    const int threads = argc > 3 ? std::atoi(argv[3]) : 0;
+    const int eccmsLevels = argc > 4 ? std::atoi(argv[4]) : 4;
+    if (threads > 0) cv::setNumThreads(threads);
 
     Mat templ = syntheticImage(n);
     auto crit = TermCriteria(TermCriteria::COUNT + TermCriteria::EPS, 50, 1e-4);
@@ -84,9 +101,12 @@ int main(int argc, char** argv) {
         return std::sqrt(se / 4.0);
     };
 
-    std::printf("image %dx%d, %d repeats\n", n, n, repeats);
-    std::printf("%-12s %8s %8s %9s %12s %12s\n",
-                "motion", "cv(ms)", "fast(ms)", "speedup", "errCv(px)", "errFast(px)");
+    std::printf("image %dx%d, %d repeats, %d thread(s), eccms nlevels %d%s\n", n, n, repeats,
+                cv::getNumThreads(), eccmsLevels,
+                BENCH_HAS_ECCMS ? "" : "  (this OpenCV has no findTransformECCMultiScale)");
+    std::printf("%-12s %8s %9s %8s %8s %8s %11s %11s %11s\n",
+                "motion", "cv(ms)", "eccms(ms)", "fast(ms)", "vs cv", "vs eccms",
+                "errCv(px)", "errEccms", "errFast");
 
     for (int m = 0; m < 4; ++m) {
         Mat Wgt = groundTruth(motions[m]);
@@ -118,8 +138,45 @@ int main(int argc, char** argv) {
         double errCv   = cornerRMS(Wcv,   Wgt);
         double errFast = cornerRMS(Wfast, Wgt);
 
-        std::printf("%-12s %8.2f %8.2f %8.2fx %12.4f %12.4f\n",
-                    names[m], tcv, tfast, tcv / tfast, errCv, errFast);
+        // eccms: default parameters (nlevels 4, gaussFiltSize 5), the same stop
+        double teccms = -1, errEccms = -1;
+#if BENCH_HAS_ECCMS
+        {
+            Mat templ8, input8;
+            templ.convertTo(templ8, CV_8U);
+            input.convertTo(input8, CV_8U);
+            ECCParameters prm;
+            prm.motionType = motions[m];
+            prm.criteria = crit;
+            prm.nlevels = eccmsLevels;
+            Mat Wbest;
+            double best = 1e30;
+            for (int r = 0; r < repeats; ++r) {
+                Mat W = Mat::eye(motions[m] == MOTION_HOMOGRAPHY ? 3 : 2, 3, CV_64F);
+                auto t0 = clock_type::now();
+                try {
+                    cv::findTransformECCMultiScale(templ8, input8, W, prm);
+                } catch (const cv::Exception&) {
+                    W.setTo(0);
+                }
+                auto t1 = clock_type::now();
+                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                if (ms < best) { best = ms; Wbest = W.clone(); }
+            }
+            Mat W32;
+            Wbest.convertTo(W32, CV_32F);
+            teccms = best;
+            errEccms = cornerRMS(W32, Wgt);
+        }
+#endif
+
+        if (teccms > 0)
+            std::printf("%-12s %8.2f %9.2f %8.2f %7.2fx %7.2fx %11.4f %11.4f %11.4f\n",
+                        names[m], tcv, teccms, tfast, tcv / tfast, teccms / tfast,
+                        errCv, errEccms, errFast);
+        else
+            std::printf("%-12s %8.2f %9s %8.2f %7.2fx %8s %11.4f %11s %11.4f\n",
+                        names[m], tcv, "-", tfast, tcv / tfast, "-", errCv, "-", errFast);
     }
     return 0;
 }
