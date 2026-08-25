@@ -191,11 +191,11 @@ sets.</p>
 <tr><td>four threads</td><td>2.61×</td><td>2.80×</td><td><b>3.53×</b></td></tr>
 </table></div>
 <div class="tw"><table>
-<tr><th><code>./build/bench 512 20</code>, default thread count, fast vs ecc.cpp</th><th>cv</th><th>fast</th><th></th><th>previous release</th></tr>
-<tr><td>TRANSLATION</td><td>23.6 ms</td><td>8.1 ms</td><td>2.9×</td><td>1.71×</td></tr>
-<tr><td>EUCLIDEAN</td><td>36.5 ms</td><td>11.7 ms</td><td>3.1×</td><td>1.93×</td></tr>
-<tr><td>AFFINE</td><td>47.5 ms</td><td>15.8 ms</td><td>3.0×</td><td>2.11×</td></tr>
-<tr><td>HOMOGRAPHY</td><td>125.2 ms</td><td>28.1 ms</td><td><b>4.5×</b></td><td>3.24×</td></tr>
+<tr><th><code>./build/bench 512 20 4</code>, four threads, fast vs ecc.cpp</th><th>cv</th><th>fast</th><th></th><th>previous release (default threads)</th></tr>
+<tr><td>TRANSLATION</td><td>27.8 ms</td><td>7.8 ms</td><td>3.6×</td><td>1.71×</td></tr>
+<tr><td>EUCLIDEAN</td><td>40.1 ms</td><td>11.8 ms</td><td>3.4×</td><td>1.93×</td></tr>
+<tr><td>AFFINE</td><td>51.2 ms</td><td>17.3 ms</td><td>3.0×</td><td>2.11×</td></tr>
+<tr><td>HOMOGRAPHY</td><td>139.1 ms</td><td>34.7 ms</td><td><b>4.0×</b></td><td>3.24×</td></tr>
 </table></div>
 <h3>6.1 Against <code>findTransformECCMultiScale</code></h3>
 <p>OpenCV 4.12 added a second ECC, <code>findTransformECCMultiScale</code> (eccms.cpp): a fresh implementation with a
@@ -204,27 +204,35 @@ border defect as ecc.cpp (opencv#29781) and is measured here with that fix appli
 cannot be measured at window 200: the pyramid's top level is 25 px and the band-limited scene has no content left there,
 so the comparison is on the real image and in the bench (512², start 3 px and a few percent off, best of 20 calls).</p>
 <div class="tw"><table>
-<tr><th>bench 512², default thread count (12)</th><th>cv</th><th>eccms, 4 levels</th><th>eccms, 1 level</th><th>fast</th><th>fast vs eccms 4</th><th>fast vs eccms 1</th></tr>
-<tr><td>TRANSLATION</td><td>23.6 ms</td><td>6.8</td><td>8.6</td><td>8.1</td><td>0.85×</td><td>1.04×</td></tr>
-<tr><td>EUCLIDEAN</td><td>36.5</td><td>7.4</td><td>12.1</td><td>11.7</td><td>0.63×</td><td>1.01×</td></tr>
-<tr><td>AFFINE</td><td>47.5</td><td>9.3</td><td>17.5</td><td>15.8</td><td>0.58×</td><td>1.23×</td></tr>
-<tr><td>HOMOGRAPHY</td><td>125.2</td><td>10.5</td><td>30.5</td><td>28.1</td><td>0.37×</td><td>1.01×</td></tr>
-</table></div>
-<div class="tw"><table>
 <tr><th>bench 512², one thread</th><th>cv</th><th>eccms, 4 levels</th><th>eccms, 1 level</th><th>fast</th><th>fast vs eccms 4</th><th>fast vs eccms 1</th></tr>
 <tr><td>TRANSLATION</td><td>36.4 ms</td><td>9.9</td><td>14.5</td><td>12.3</td><td>0.80×</td><td>1.19×</td></tr>
 <tr><td>EUCLIDEAN</td><td>49.6</td><td>11.6</td><td>25.2</td><td>21.7</td><td>0.53×</td><td>1.17×</td></tr>
 <tr><td>AFFINE</td><td>63.3</td><td>15.4</td><td>39.6</td><td>28.9</td><td>0.53×</td><td>1.35×</td></tr>
 <tr><td>HOMOGRAPHY</td><td>173.5</td><td>24.8</td><td>106.4</td><td>76.8</td><td>0.32×</td><td><b>1.37×</b></td></tr>
 </table></div>
+<div class="tw"><table>
+<tr><th>bench 512², two threads</th><th>cv</th><th>eccms, 4 levels</th><th>eccms, 1 level</th><th>fast</th><th>fast vs eccms 4</th><th>fast vs eccms 1</th></tr>
+<tr><td>TRANSLATION</td><td>32.4 ms</td><td>7.5</td><td>9.5</td><td>9.7</td><td>0.78×</td><td>0.86×</td></tr>
+<tr><td>EUCLIDEAN</td><td>45.3</td><td>8.8</td><td>15.0</td><td>16.3</td><td>0.54×</td><td>0.86×</td></tr>
+<tr><td>AFFINE</td><td>56.7</td><td>10.4</td><td>21.8</td><td>21.9</td><td>0.47×</td><td>0.93×</td></tr>
+<tr><td>HOMOGRAPHY</td><td>152.0</td><td>15.3</td><td>55.4</td><td>53.7</td><td>0.28×</td><td>1.03×</td></tr>
+</table></div>
+<div class="tw"><table>
+<tr><th>bench 512², four threads</th><th>cv</th><th>eccms, 4 levels</th><th>eccms, 1 level</th><th>fast</th><th>fast vs eccms 4</th><th>fast vs eccms 1</th></tr>
+<tr><td>TRANSLATION</td><td>27.8 ms</td><td>6.1</td><td>6.9</td><td>7.8</td><td>0.78×</td><td>0.87×</td></tr>
+<tr><td>EUCLIDEAN</td><td>40.1</td><td>6.5</td><td>10.5</td><td>11.8</td><td>0.55×</td><td>0.87×</td></tr>
+<tr><td>AFFINE</td><td>51.2</td><td>8.1</td><td>16.6</td><td>17.3</td><td>0.47×</td><td>0.89×</td></tr>
+<tr><td>HOMOGRAPHY</td><td>139.1</td><td>11.2</td><td>36.5</td><td>34.7</td><td>0.32×</td><td>1.05×</td></tr>
+</table></div>
 <ul>
-<li><b>Single-scale, fast-ecc is the faster implementation</b>: 1.17–1.37× over eccms with <code>nlevels = 1</code> on one
-thread, level with it on twelve, where the warps dominate and both call the same <code>warpAffine</code>.</li>
-<li><b>The pyramid is what makes eccms faster</b>, by 1.2–3× in this bench, whose start is far enough off that the coarse
+<li><b>Single-scale, the two implementations are close</b>: fast-ecc is 1.17–1.37× faster than eccms with
+<code>nlevels = 1</code> on one thread; with two or four threads eccms's stripes scale better than fast-ecc's mix of OpenCV
+calls and fused passes, and fast-ecc sits at 0.86–1.05× of it.</li>
+<li><b>The pyramid is what makes eccms faster</b>, by 1.3–3.5× in this bench, whose start is far enough off that the coarse
 levels take most of the iterations at 1/16–1/64 of the pixels. When the start is within a pixel the pyramid does not
-pay: on the real image at window 384 with four threads fast-ecc is 1.14–1.22× faster than eccms with its four levels
-(affine 6.7 vs 8.1 ms, homography 9.5 vs 10.9 ms). Its basin is wider — 100 % at ×4 the default deformation on the real
-image, against 85 % for fast-ecc and 89 % for ecc.cpp.</li>
+pay: on the real image at window 384, fast-ecc is level with eccms with its four levels on two threads (affine 10.6 vs
+9.8 ms, homography 14.5 vs 14.9 ms) and 1.14–1.22× faster on four (6.7 vs 8.1 ms, 9.5 vs 10.9 ms). Its basin is wider —
+100 % at ×4 the default deformation on the real image, against 85 % for fast-ecc and 89 % for ecc.cpp.</li>
 <li><b>Accuracy on the real image</b> (affine, window 200, started at the truth): eccms 0.0078 px with four levels, 0.0076
 with one; ecc.cpp 0.0072; fast-ecc 0.0028.</li>
 </ul>
@@ -265,9 +273,9 @@ residual and the interpolation error: half the first step, +10–40 % basin, 2.6
 iteration.</li>
 <li><b>Together, against a border-fixed ecc.cpp:</b> 1.9–3.5× per iteration on affine depending on window and threads, 2.9–4.5× per
 call in the bundled bench, and a lower floor rather than an equal one. <b>Against eccms.cpp</b> fast-ecc is the faster
-single-scale implementation (1.17–1.37× on one thread) and the more accurate one (0.0028 vs 0.0078 px on the real image),
-but eccms's default pyramid wins by 1.2–3× whenever the start is far enough off for the coarse levels to pay. The pyramid
-is what fast-ecc lacks.</li>
+single-scale implementation on one thread (1.17–1.37×), level with it on two to four, and the more accurate one (0.0028 vs
+0.0078 px on the real image); eccms's default pyramid wins by 1.3–3.5× whenever the start is far enough off for the coarse
+levels to pay. The pyramid is what fast-ecc lacks.</li>
 </ol>
 
 <footer>
