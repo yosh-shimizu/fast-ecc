@@ -276,8 +276,11 @@ double findTransformECC(InputArray templateImage,
                         int motionType,
                         TermCriteria criteria,
                         InputArray inputMask,
-                        int gaussFiltSize)
+                        int gaussFiltSize,
+                        int flags)
 {
+    const bool useLap   = (flags & FASTECC_LAPLACIAN_COLUMN) != 0;
+    const bool useGrad5 = (flags & FASTECC_GRAD5) != 0;
     Mat src = templateImage.getMat();//template image
     Mat dst = inputImage.getMat();  //input image (to be warped)
     Mat map = warpMatrix.getMat();  //warp (transformation)
@@ -334,6 +337,7 @@ double findTransformECC(InputArray templateImage,
     }
 
     const int numberOfParameters = paramTemp;
+    const int numberOfUnknowns   = paramTemp + ((flags & FASTECC_LAPLACIAN_COLUMN) ? 1 : 0);
 
     const int ws = src.cols;
     const int hs = src.rows;
@@ -372,22 +376,33 @@ double findTransformECC(InputArray templateImage,
     dst.convertTo(imageFloat, imageFloat.type());
     GaussianBlur(imageFloat, imageFloat, Size(gaussFiltSize, gaussFiltSize), 0, 0);
 
-    // gradients of the warped image (raw: masked per pixel in the fused pass)
+    // gradients (and, optionally, the laplacian) of the warped image; raw,
+    // masked per pixel in the fused pass
     Mat imageWarpedGradientX = Mat(hs, ws, CV_32FC1);
     Mat imageWarpedGradientY = Mat(hs, ws, CV_32FC1);
+    Mat imageWarpedLaplacian;
+    if (useLap) imageWarpedLaplacian = Mat(hs, ws, CV_32FC1);
 
-    // first order image derivatives (central difference)
-    Matx13f dx(-0.5f, 0.0f, 0.5f);
+    // first order image derivatives: 3-tap central difference, or the 4th-order
+    // 5-tap.  The forward-additive step is the exact maximiser of the paper's
+    // first-order model, so this estimate is the only thing in that model that
+    // is not exact, and its bias sets the convergence rate.
+    const Matx13f dx3(-0.5f, 0.0f, 0.5f);
+    const Matx<float, 1, 5> dx5(1.f/12, -8.f/12, 0.f, 8.f/12, -1.f/12);
+
+    // scale of the laplacian column: the pre-filter's sigma, as GaussianBlur
+    // derives it from the kernel size.  Only conditioning depends on it.
+    const float lapScale = (float)std::max(0.8, 0.3 * ((gaussFiltSize - 1) * 0.5 - 1) + 0.8);
 
     // matrices needed for solving linear equation system for maximizing ECC
-    Mat hessian                 = Mat(numberOfParameters, numberOfParameters, CV_32F);
-    Mat hessianInv              = Mat(numberOfParameters, numberOfParameters, CV_32F);
-    Mat imageProjection         = Mat(numberOfParameters, 1, CV_32F);
-    Mat templateProjection      = Mat(numberOfParameters, 1, CV_32F);
-    Mat imageProjectionHessian  = Mat(numberOfParameters, 1, CV_32F);
-    Mat errorProjection         = Mat(numberOfParameters, 1, CV_32F);
+    Mat hessian                 = Mat(numberOfUnknowns, numberOfUnknowns, CV_32F);
+    Mat hessianInv              = Mat(numberOfUnknowns, numberOfUnknowns, CV_32F);
+    Mat imageProjection         = Mat(numberOfUnknowns, 1, CV_32F);
+    Mat templateProjection      = Mat(numberOfUnknowns, 1, CV_32F);
+    Mat imageProjectionHessian  = Mat(numberOfUnknowns, 1, CV_32F);
+    Mat errorProjection         = Mat(numberOfUnknowns, 1, CV_32F);
 
-    Mat deltaP = Mat(numberOfParameters, 1, CV_32F);//transformation parameter correction
+    Mat deltaP = Mat(numberOfUnknowns, 1, CV_32F);//parameter correction (+ the laplacian coefficient)
 
     const int imageFlags = INTER_LINEAR  + WARP_INVERSE_MAP;
     const int maskFlags  = INTER_NEAREST + WARP_INVERSE_MAP;
@@ -413,8 +428,10 @@ double findTransformECC(InputArray templateImage,
         // weight it biases the estimated linear part toward a smaller scale.
         // Drop it, the same way opencv#29775 does in ecc.cpp; a ring of 1
         // (the border row/column) is dropped in any case.
-        const int ring = (imageMask.rows > gaussFiltSize && imageMask.cols > gaussFiltSize)
-                         ? std::max(1, gaussFiltSize / 2) : 1;
+        int ring = (imageMask.rows > gaussFiltSize && imageMask.cols > gaussFiltSize)
+                   ? std::max(1, gaussFiltSize / 2) : 1;
+        // the 5-tap stencil must not be formed from reflected samples either
+        if (useGrad5 && imageMask.rows > 4 && imageMask.cols > 4) ring = std::max(ring, 2);
 
         // The mask: solved for when there is no user mask (see analyticMask),
         // warped like the image otherwise.
@@ -432,8 +449,15 @@ double findTransformECC(InputArray templateImage,
 
         // gradients of the WARPED image (chain rule: d/dx[I(W(x))] = J_W^T grad(I)).
         // Left as they are: the fused pass masks them per pixel.
-        filter2D(imageWarped, imageWarpedGradientX, -1, dx);
-        filter2D(imageWarped, imageWarpedGradientY, -1, dx.t());
+        if (useGrad5) {
+            filter2D(imageWarped, imageWarpedGradientX, -1, dx5);
+            filter2D(imageWarped, imageWarpedGradientY, -1, dx5.t());
+        } else {
+            filter2D(imageWarped, imageWarpedGradientX, -1, dx3);
+            filter2D(imageWarped, imageWarpedGradientY, -1, dx3.t());
+        }
+        if (useLap)
+            Laplacian(imageWarped, imageWarpedLaplacian, CV_32F, 1);
 
         // The normalisation from one pass of masked moments.  With N pixels in
         // the mask and S1, S2 the masked sums of a plane and its square, the
@@ -456,45 +480,55 @@ double findTransformECC(InputArray templateImage,
         // masked or recombined in memory first.
         float r[4];
         recombination(map, motionType, r);
+        const float* h = map.ptr<float>(0);
+        // each motion type has a kernel with and without the laplacian column;
+        // the coefficients are the same, so one generic lambda fills either
+        auto run = [&](auto& acc) {
+            runFusedGN(acc, imageWarpedGradientX, imageWarpedGradientY, imageWarped,
+                       templateFloat, imageWarpedLaplacian, imageMask,
+                       hessian, imageProjection, templateProjection);
+        };
         if (motionType == MOTION_AFFINE)
         {
-            GNAffine acc;
-            acc.r00 = r[0]; acc.r01 = r[1]; acc.r10 = r[2]; acc.r11 = r[3];
-            acc.muI = (float)imgMean; acc.muT = (float)tmpMean;
-            runFusedGN(acc, imageWarpedGradientX, imageWarpedGradientY, imageWarped, templateFloat,
-                       imageMask, hessian, imageProjection, templateProjection);
+            auto setup = [&](auto& acc) {
+                acc.r00 = r[0]; acc.r01 = r[1]; acc.r10 = r[2]; acc.r11 = r[3];
+                acc.muI = (float)imgMean; acc.muT = (float)tmpMean;
+            };
+            if (useLap) { GNAffineL acc; setup(acc); acc.lsc = lapScale; run(acc); }
+            else        { GNAffine acc;  setup(acc); run(acc); }
         }
         else if (motionType == MOTION_TRANSLATION)
         {
-            GNTranslation acc;
-            acc.muI = (float)imgMean; acc.muT = (float)tmpMean;
-            runFusedGN(acc, imageWarpedGradientX, imageWarpedGradientY, imageWarped, templateFloat,
-                       imageMask, hessian, imageProjection, templateProjection);
+            auto setup = [&](auto& acc) {
+                acc.muI = (float)imgMean; acc.muT = (float)tmpMean;
+            };
+            if (useLap) { GNTranslationL acc; setup(acc); acc.lsc = lapScale; run(acc); }
+            else        { GNTranslation acc;  setup(acc); run(acc); }
         }
         else if (motionType == MOTION_EUCLIDEAN)
         {
-            const float* h = map.ptr<float>(0);
-            GNEuclidean acc;
-            acc.r00 = r[0]; acc.r01 = r[1]; acc.r10 = r[2]; acc.r11 = r[3];
-            acc.muI = (float)imgMean; acc.muT = (float)tmpMean;
-            acc.h0 = h[0];   // cos(theta)
-            acc.h1 = h[3];   // sin(theta)
-            runFusedGN(acc, imageWarpedGradientX, imageWarpedGradientY, imageWarped, templateFloat,
-                       imageMask, hessian, imageProjection, templateProjection);
+            auto setup = [&](auto& acc) {
+                acc.r00 = r[0]; acc.r01 = r[1]; acc.r10 = r[2]; acc.r11 = r[3];
+                acc.muI = (float)imgMean; acc.muT = (float)tmpMean;
+                acc.h0 = h[0];   // cos(theta)
+                acc.h1 = h[3];   // sin(theta)
+            };
+            if (useLap) { GNEuclideanL acc; setup(acc); acc.lsc = lapScale; run(acc); }
+            else        { GNEuclidean acc;  setup(acc); run(acc); }
         }
         else if (motionType == MOTION_HOMOGRAPHY)
         {
             // the per-pixel projective division folds into the gradient side,
             // so the same face-splitting form applies with a third plane
-            const float* h = map.ptr<float>(0);
-            GNHomography acc;
-            acc.r00 = r[0]; acc.r01 = r[1]; acc.r10 = r[2]; acc.r11 = r[3];
-            acc.muI = (float)imgMean; acc.muT = (float)tmpMean;
-            acc.h0 = h[0]; acc.h1 = h[3]; acc.h2 = h[6];
-            acc.h3 = h[1]; acc.h4 = h[4]; acc.h5 = h[7];
-            acc.h6 = h[2]; acc.h7 = h[5];
-            runFusedGN(acc, imageWarpedGradientX, imageWarpedGradientY, imageWarped, templateFloat,
-                       imageMask, hessian, imageProjection, templateProjection);
+            auto setup = [&](auto& acc) {
+                acc.r00 = r[0]; acc.r01 = r[1]; acc.r10 = r[2]; acc.r11 = r[3];
+                acc.muI = (float)imgMean; acc.muT = (float)tmpMean;
+                acc.h0 = h[0]; acc.h1 = h[3]; acc.h2 = h[6];
+                acc.h3 = h[1]; acc.h4 = h[4]; acc.h5 = h[7];
+                acc.h6 = h[2]; acc.h7 = h[5];
+            };
+            if (useLap) { GNHomographyL acc; setup(acc); acc.lsc = lapScale; run(acc); }
+            else        { GNHomography acc;  setup(acc); run(acc); }
         }
         hessianInv = hessian.inv();
 
@@ -521,8 +555,9 @@ double findTransformECC(InputArray templateImage,
         errorProjection = lambda * templateProjection - imageProjection;
         deltaP = hessianInv * errorProjection;
 
-        // update warping matrix
-        update_warping_matrix_ECC( map, deltaP, motionType);
+        // update warping matrix (the laplacian coefficient, if any, is not a
+        // motion parameter and is simply discarded)
+        update_warping_matrix_ECC( map, deltaP.rowRange(0, numberOfParameters), motionType);
     }
 
     // return final correlation coefficient

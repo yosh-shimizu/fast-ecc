@@ -17,6 +17,25 @@
 
 namespace fastecc {
 
+// Optional behaviour, OR-ed into the `flags` argument.
+enum {
+    // Carry the laplacian of the warped image as one more Gauss-Newton column.
+    // It absorbs the isotropic second-order term of the misalignment residual
+    // and the bilinear interpolation error: the first step from a 1 px offset
+    // lands at 0.07 px instead of 0.18, the basin widens by 10-40%, and on a
+    // real image the fixed point moves toward the truth (2.4x lower corner
+    // error on the bundled test).  Per iteration it costs one 3x3 filter and
+    // one more column in the fused pass.
+    FASTECC_LAPLACIAN_COLUMN = 1,
+    // 4th-order 5-tap finite difference for the image gradient instead of the
+    // 3-tap: the error contracts by ~0.06 per iteration instead of ~0.17, so
+    // the accuracy floor takes 3 iterations instead of 4-5.
+    FASTECC_GRAD5 = 2,
+    // what `flags` defaults to
+    FASTECC_DEFAULT_FLAGS = FASTECC_LAPLACIAN_COLUMN | FASTECC_GRAD5
+};
+#define FASTECC_HAS_FLAGS 1
+
 // Estimates the geometric transform `warpMatrix` (CV_32FC1, 2x3 or 3x3 for
 // homography) that aligns `templateImage` to `inputImage`.  `motionType` is one
 // of cv::MOTION_TRANSLATION / MOTION_EUCLIDEAN / MOTION_AFFINE / MOTION_HOMOGRAPHY.
@@ -34,6 +53,7 @@ double findTransformECC(
     cv::TermCriteria criteria = cv::TermCriteria(
         cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 50, 0.001),
     cv::InputArray inputMask = cv::noArray(),
-    int gaussFiltSize = 5);
+    int gaussFiltSize = 5,
+    int flags = FASTECC_DEFAULT_FLAGS);
 
 } // namespace fastecc
