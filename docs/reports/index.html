@@ -58,6 +58,17 @@
   a border-fixed OpenCV.</p>
 </a>
 
+<a class="card" href="after-the-fusion.html">
+  <h2>After the fusion: the 5-tap gradient, the folded normalisation, and the laplacian column<span class="tag">landed</span></h2>
+  <p>What the first-order model of the paper leaves free — only the gradient estimate,
+  whose bias sets the convergence rate — and what the rest of an iteration was spending
+  its time on. Two passes that write nothing take 1.34–1.56× off the iteration; the
+  5-tap reaches the floor in 3 iterations instead of 4–5; and an experiment on estimating
+  sigma, which cannot work, leaves behind a laplacian column that halves the first step,
+  widens the basin and lowers the real-image error 2.6×. Together, 2.6–4.5× against a
+  border-fixed OpenCV in the bundled bench.</p>
+</a>
+
 <p class="note">
 These reports reference the measuring harness under <code>eval/</code>, which lives in
 a separate working tree and is not part of this repository; reproducing the figures
