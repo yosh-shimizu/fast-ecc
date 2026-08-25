@@ -30,7 +30,9 @@ enum {
     // 4th-order 5-tap finite difference for the image gradient instead of the
     // 3-tap: the error contracts by ~0.06 per iteration instead of ~0.17, so
     // the accuracy floor takes 3 iterations instead of 4-5.
-    FASTECC_GRAD5 = 2
+    FASTECC_GRAD5 = 2,
+    // what `flags` defaults to
+    FASTECC_DEFAULT_FLAGS = FASTECC_LAPLACIAN_COLUMN | FASTECC_GRAD5
 };
 #define FASTECC_HAS_FLAGS 1
 
@@ -52,6 +54,6 @@ double findTransformECC(
         cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 50, 0.001),
     cv::InputArray inputMask = cv::noArray(),
     int gaussFiltSize = 5,
-    int flags = 0);
+    int flags = FASTECC_DEFAULT_FLAGS);
 
 } // namespace fastecc
