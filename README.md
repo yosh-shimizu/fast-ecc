@@ -229,7 +229,7 @@ is the mask.)
 
 ### Two optional flags: the laplacian column and the 5-tap gradient
 
-`findTransformECC` takes a trailing `flags` argument (default 0).
+`findTransformECC` takes a trailing `flags` argument; both flags are on by default (`FASTECC_DEFAULT_FLAGS`), pass 0 for the plain kernels.
 
 **`FASTECC_LAPLACIAN_COLUMN`** carries the laplacian of the warped image, scaled by the
 pre-filter's sigma, as one more Gauss–Newton column. The coefficient it estimates is

@@ -20,7 +20,10 @@
 //      default width and the sweep is checked for trend instead.)
 //   3. SEVERAL sub-pixel phases per case, averaged.  One alignment is one draw
 //      from a distribution whose spread is comparable to the quantity measured.
-//   4. a MARGIN of real data around the template.  The input is rendered from a
+//   4. every combination of the optional flags.  The defaults (laplacian
+//      column + 5-tap gradient) are what a caller gets, but the plain kernels
+//      must keep working too, and each flag on its own.
+//   5. a MARGIN of real data around the template.  The input is rendered from a
 //      source larger than the template, so the template's support in the input
 //      is surrounded by kMargin px of genuine content.  Without that, an input
 //      made by warping the template onto itself carries a zero-filled strip
@@ -127,10 +130,19 @@ Mat groundTruth(int motion, double shiftX, double shiftY) {
 
 }  // namespace
 
+struct FlagSet { int flags; const char* name; };
+
 int main() {
     const Mat source = syntheticImage(kSize + 2 * kMargin);
     const Mat templ  = source(Rect(kMargin, kMargin, kSize, kSize)).clone();
     const TermCriteria crit(TermCriteria::COUNT + TermCriteria::EPS, 100, 1e-6);
+
+    const FlagSet flagSets[] = {
+        {fastecc::FASTECC_DEFAULT_FLAGS,                          "default (laplacian column + 5-tap)"},
+        {0,                                                       "plain"},
+        {fastecc::FASTECC_LAPLACIAN_COLUMN,                       "laplacian column"},
+        {fastecc::FASTECC_GRAD5,                                  "5-tap"},
+    };
 
     const MotionCase cases[] = {
         // ~3x what the margin test measures (0.016 / 0.002 / 0.0036 / 0.005 px
@@ -144,10 +156,13 @@ int main() {
     const int gaussSizes[] = {3, 5, 9};
     const int kNGauss = 3;
 
+    int failures = 0;
+    for (int fi = 0; fi < 4; ++fi) {
+    const int flags = flagSets[fi].flags;
+    std::printf("\n== flags = %d: %s ==\n", flags, flagSets[fi].name);
     std::printf("%-12s %6s %11s %11s %9s %8s   %s\n",
                 "motion", "gauss", "errCv px", "errFast px", "rho", "tol px", "verdict");
 
-    int failures = 0;
     for (int ci = 0; ci < 4; ++ci) {
         const MotionCase& c = cases[ci];
         double errFastByGauss[3] = {0, 0, 0};
@@ -189,7 +204,7 @@ int main() {
                 try {
                     cv::findTransformECC(templ, input, Wcv, c.motion, crit, noArray(), gauss);
                     rho = fastecc::findTransformECC(templ, input, Wfast, c.motion, crit,
-                                                    noArray(), gauss);
+                                                    noArray(), gauss, flags);
                 } catch (const cv::Exception& e) {
                     std::printf("%-12s %6d   EXCEPTION: %s\n", c.name, gauss, e.what());
                     ++failures;
@@ -240,7 +255,8 @@ int main() {
             }
         }
     }
+    }
 
-    std::printf("%s\n", failures == 0 ? "ALL PASS" : "FAILURES PRESENT");
+    std::printf("\n%s\n", failures == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return failures == 0 ? 0 : 1;
 }
