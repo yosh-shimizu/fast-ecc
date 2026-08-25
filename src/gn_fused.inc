@@ -43,12 +43,21 @@
 // and the two addWeighted of the previous layout are gone, and with them the
 // three planes they produced.
 //
+// Every kernel has a twin, GN<Name>L, with one more column: the laplacian of
+// the warped image (scaled by the pre-filter's sigma).  It is the nuisance
+// direction for the isotropic second-order term of a misalignment residual
+// and for the bilinear interpolation error, both of which have that shape;
+// with it in the system the first step from 1 px lands at 0.07 px instead of
+// 0.18, the basin widens and the fixed point on a real image moves toward
+// the truth (see README.md).  sigma itself is not estimated: the objective
+// has no minimum in it.
+//
 // All four are here.  translation and euclidean gain least: with w = (1) their
 // Hessians have only 3 and 6 entries, so this stage is a small share of their
 // work to begin with.
 
 
-// ---- translation: K=2 L=1 P=2, 3 Gram sums + 4 projection sums ----
+// ---- translation: K=2 L=1 P=2, 3 Gram sums (3 live) + 4 projection sums ----
 struct GNTranslation {
     enum { P = 2 };
     float muI, muT;             // masked means of warped image and template
@@ -60,8 +69,9 @@ struct GNTranslation {
     }
 
     void rows(const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,
-              const Mat& mask, int y0, int y1) {
+              const Mat& lp, const Mat& mask, int y0, int y1) {
         const int w = gx.cols;
+        (void)lp;
         double t_m0_0 = 0, t_m1_0 = 0, t_m2_0 = 0;
         double t_pi0 = 0, t_pi1 = 0, t_pt0 = 0, t_pt1 = 0;
 
@@ -102,7 +112,69 @@ struct GNTranslation {
     }
 };
 
-// ---- euclidean: K=3 L=1 P=3, 6 Gram sums + 6 projection sums ----
+// ---- translationl: K=3 L=1 P=3, 6 Gram sums (6 live) + 6 projection sums ----
+struct GNTranslationL {
+    enum { P = 3 };
+    float muI, muT;             // masked means of warped image and template
+    float lsc;                  // scale of the laplacian column (the pre-filter sigma)
+    double H[6], VI[3], VT[3];
+    GNTranslationL() { std::fill(H, H + 6, 0.0); std::fill(VI, VI + 3, 0.0); std::fill(VT, VT + 3, 0.0); }
+    void add(const GNTranslationL& o) {
+        for (int i = 0; i < 6; ++i) H[i] += o.H[i];
+        for (int i = 0; i < 3; ++i) { VI[i] += o.VI[i]; VT[i] += o.VT[i]; }
+    }
+
+    void rows(const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,
+              const Mat& lp, const Mat& mask, int y0, int y1) {
+        const int w = gx.cols;
+        double t_m0_0 = 0, t_m1_0 = 0, t_m2_0 = 0, t_m3_0 = 0, t_m4_0 = 0, t_m5_0 = 0;
+        double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0;
+
+        for (int y = y0; y < y1; ++y) {
+            const float* pgx = gx.ptr<float>(y);
+            const float* pgy = gy.ptr<float>(y);
+            const float* pim = im.ptr<float>(y);
+            const float* ptm = tm.ptr<float>(y);
+            const float* pl = lp.ptr<float>(y);
+            const uchar* pmk = mask.ptr<uchar>(y);
+            const float fy = (float)y;
+            float m0_0 = 0, m1_0 = 0, m2_0 = 0, m3_0 = 0, m4_0 = 0, m5_0 = 0;
+            float pi0 = 0, pi1 = 0, pi2 = 0, pt0 = 0, pt1 = 0, pt2 = 0;
+
+            for (int x = 0; x < w; ++x) {
+                if (pmk[x] != 0) {
+                    const float a = pgx[x], b = pgy[x];
+                    const float l = lsc * pl[x];
+                    const float uu0 = a * a, uu1 = a * b, uu2 = a * l, uu3 = b * b, uu4 = b * l, uu5 = l * l;
+                    m0_0 += uu0;
+                    m1_0 += uu1;
+                    m2_0 += uu2;
+                    m3_0 += uu3;
+                    m4_0 += uu4;
+                    m5_0 += uu5;
+                    const float ii = pim[x] - muI, tt = ptm[x] - muT;
+                    const float j0 = a;
+                    const float j1 = b;
+                    const float j2 = l;
+                    pi0 += j0 * ii;  pi1 += j1 * ii;  pi2 += j2 * ii;
+                    pt0 += j0 * tt;  pt1 += j1 * tt;  pt2 += j2 * tt;
+                }
+            }
+
+            t_m0_0 += m0_0;  t_m1_0 += m1_0;  t_m2_0 += m2_0;  t_m3_0 += m3_0;  t_m4_0 += m4_0;  t_m5_0 += m5_0;
+            t_pi0 += pi0;  t_pi1 += pi1;  t_pi2 += pi2;  t_pt0 += pt0;  t_pt1 += pt1;  t_pt2 += pt2;
+        }
+
+        int n = 0;
+        H[n++] += t_m0_0;  H[n++] += t_m1_0;  H[n++] += t_m2_0;
+        H[n++] += t_m3_0;  H[n++] += t_m4_0;
+        H[n++] += t_m5_0;
+        VI[0] += t_pi0;  VI[1] += t_pi1;  VI[2] += t_pi2;
+        VT[0] += t_pt0;  VT[1] += t_pt1;  VT[2] += t_pt2;
+    }
+};
+
+// ---- euclidean: K=3 L=1 P=3, 6 Gram sums (6 live) + 6 projection sums ----
 struct GNEuclidean {
     enum { P = 3 };
     float r00, r01, r10, r11;   // A^-T of the current warp
@@ -116,8 +188,9 @@ struct GNEuclidean {
     }
 
     void rows(const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,
-              const Mat& mask, int y0, int y1) {
+              const Mat& lp, const Mat& mask, int y0, int y1) {
         const int w = gx.cols;
+        (void)lp;
         double t_m0_0 = 0, t_m1_0 = 0, t_m2_0 = 0, t_m3_0 = 0, t_m4_0 = 0, t_m5_0 = 0;
         double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0;
 
@@ -169,7 +242,83 @@ struct GNEuclidean {
     }
 };
 
-// ---- affine: K=2 L=3 P=6, 18 Gram sums + 12 projection sums ----
+// ---- euclideanl: K=4 L=1 P=4, 10 Gram sums (10 live) + 8 projection sums ----
+struct GNEuclideanL {
+    enum { P = 4 };
+    float r00, r01, r10, r11;   // A^-T of the current warp
+    float muI, muT;             // masked means of warped image and template
+    float h0, h1;
+    float lsc;                  // scale of the laplacian column (the pre-filter sigma)
+    double H[10], VI[4], VT[4];
+    GNEuclideanL() { std::fill(H, H + 10, 0.0); std::fill(VI, VI + 4, 0.0); std::fill(VT, VT + 4, 0.0); }
+    void add(const GNEuclideanL& o) {
+        for (int i = 0; i < 10; ++i) H[i] += o.H[i];
+        for (int i = 0; i < 4; ++i) { VI[i] += o.VI[i]; VT[i] += o.VT[i]; }
+    }
+
+    void rows(const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,
+              const Mat& lp, const Mat& mask, int y0, int y1) {
+        const int w = gx.cols;
+        double t_m0_0 = 0, t_m1_0 = 0, t_m2_0 = 0, t_m3_0 = 0, t_m4_0 = 0, t_m5_0 = 0, t_m6_0 = 0, t_m7_0 = 0, t_m8_0 = 0, t_m9_0 = 0;
+        double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pi3 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0, t_pt3 = 0;
+
+        for (int y = y0; y < y1; ++y) {
+            const float* pgx = gx.ptr<float>(y);
+            const float* pgy = gy.ptr<float>(y);
+            const float* pim = im.ptr<float>(y);
+            const float* ptm = tm.ptr<float>(y);
+            const float* pl = lp.ptr<float>(y);
+            const uchar* pmk = mask.ptr<uchar>(y);
+            const float fy = (float)y;
+            // hatX, hatY are affine in (x, y): step them along the row
+            float hatX = -(0.f * h1) - (fy * h0);
+            float hatY =  (0.f * h0) - (fy * h1);
+            float m0_0 = 0, m1_0 = 0, m2_0 = 0, m3_0 = 0, m4_0 = 0, m5_0 = 0, m6_0 = 0, m7_0 = 0, m8_0 = 0, m9_0 = 0;
+            float pi0 = 0, pi1 = 0, pi2 = 0, pi3 = 0, pt0 = 0, pt1 = 0, pt2 = 0, pt3 = 0;
+
+            for (int x = 0; x < w; ++x) {
+                if (pmk[x] != 0) {
+                    const float a = r00 * pgx[x] + r01 * pgy[x];
+                    const float b = r10 * pgx[x] + r11 * pgy[x];
+                    const float r = a * hatX + b * hatY;
+                    const float l = lsc * pl[x];
+                    const float uu0 = r * r, uu1 = r * a, uu2 = r * b, uu3 = r * l, uu4 = a * a, uu5 = a * b, uu6 = a * l, uu7 = b * b, uu8 = b * l, uu9 = l * l;
+                    m0_0 += uu0;
+                    m1_0 += uu1;
+                    m2_0 += uu2;
+                    m3_0 += uu3;
+                    m4_0 += uu4;
+                    m5_0 += uu5;
+                    m6_0 += uu6;
+                    m7_0 += uu7;
+                    m8_0 += uu8;
+                    m9_0 += uu9;
+                    const float ii = pim[x] - muI, tt = ptm[x] - muT;
+                    const float j0 = r;
+                    const float j1 = a;
+                    const float j2 = b;
+                    const float j3 = l;
+                    pi0 += j0 * ii;  pi1 += j1 * ii;  pi2 += j2 * ii;  pi3 += j3 * ii;
+                    pt0 += j0 * tt;  pt1 += j1 * tt;  pt2 += j2 * tt;  pt3 += j3 * tt;
+                }
+                hatX -= h1;  hatY += h0;
+            }
+
+            t_m0_0 += m0_0;  t_m1_0 += m1_0;  t_m2_0 += m2_0;  t_m3_0 += m3_0;  t_m4_0 += m4_0;  t_m5_0 += m5_0;  t_m6_0 += m6_0;  t_m7_0 += m7_0;  t_m8_0 += m8_0;  t_m9_0 += m9_0;
+            t_pi0 += pi0;  t_pi1 += pi1;  t_pi2 += pi2;  t_pi3 += pi3;  t_pt0 += pt0;  t_pt1 += pt1;  t_pt2 += pt2;  t_pt3 += pt3;
+        }
+
+        int n = 0;
+        H[n++] += t_m0_0;  H[n++] += t_m1_0;  H[n++] += t_m2_0;  H[n++] += t_m3_0;
+        H[n++] += t_m4_0;  H[n++] += t_m5_0;  H[n++] += t_m6_0;
+        H[n++] += t_m7_0;  H[n++] += t_m8_0;
+        H[n++] += t_m9_0;
+        VI[0] += t_pi0;  VI[1] += t_pi1;  VI[2] += t_pi2;  VI[3] += t_pi3;
+        VT[0] += t_pt0;  VT[1] += t_pt1;  VT[2] += t_pt2;  VT[3] += t_pt3;
+    }
+};
+
+// ---- affine: K=2 L=3 P=6, 18 Gram sums (12 live) + 12 projection sums ----
 struct GNAffine {
     enum { P = 6 };
     float r00, r01, r10, r11;   // A^-T of the current warp
@@ -182,8 +331,9 @@ struct GNAffine {
     }
 
     void rows(const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,
-              const Mat& mask, int y0, int y1) {
+              const Mat& lp, const Mat& mask, int y0, int y1) {
         const int w = gx.cols;
+        (void)lp;
         double t_m0_0 = 0, t_m0_1 = 0, t_m0_2 = 0, t_m0_3 = 0, t_m0_4 = 0, t_m0_5 = 0, t_m1_0 = 0, t_m1_1 = 0, t_m1_2 = 0, t_m1_3 = 0, t_m1_4 = 0, t_m1_5 = 0, t_m2_0 = 0, t_m2_1 = 0, t_m2_2 = 0, t_m2_3 = 0, t_m2_4 = 0, t_m2_5 = 0;
         double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pi3 = 0, t_pi4 = 0, t_pi5 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0, t_pt3 = 0, t_pt4 = 0, t_pt5 = 0;
 
@@ -237,7 +387,86 @@ struct GNAffine {
     }
 };
 
-// ---- homography: K=3 L=3 P=8, 36 Gram sums + 16 projection sums ----
+// ---- affinel: K=3 L=3 P=7, 25 Gram sums (17 live) + 14 projection sums ----
+struct GNAffineL {
+    enum { P = 7 };
+    float r00, r01, r10, r11;   // A^-T of the current warp
+    float muI, muT;             // masked means of warped image and template
+    float lsc;                  // scale of the laplacian column (the pre-filter sigma)
+    double H[28], VI[7], VT[7];
+    GNAffineL() { std::fill(H, H + 28, 0.0); std::fill(VI, VI + 7, 0.0); std::fill(VT, VT + 7, 0.0); }
+    void add(const GNAffineL& o) {
+        for (int i = 0; i < 28; ++i) H[i] += o.H[i];
+        for (int i = 0; i < 7; ++i) { VI[i] += o.VI[i]; VT[i] += o.VT[i]; }
+    }
+
+    void rows(const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,
+              const Mat& lp, const Mat& mask, int y0, int y1) {
+        const int w = gx.cols;
+        double t_m0_0 = 0, t_m0_1 = 0, t_m0_2 = 0, t_m0_3 = 0, t_m0_4 = 0, t_m0_5 = 0, t_m1_0 = 0, t_m1_1 = 0, t_m1_2 = 0, t_m1_3 = 0, t_m1_4 = 0, t_m1_5 = 0, t_m2_2 = 0, t_m2_4 = 0, t_m2_5 = 0, t_m3_0 = 0, t_m3_1 = 0, t_m3_2 = 0, t_m3_3 = 0, t_m3_4 = 0, t_m3_5 = 0, t_m4_2 = 0, t_m4_4 = 0, t_m4_5 = 0, t_m5_5 = 0;
+        double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pi3 = 0, t_pi4 = 0, t_pi5 = 0, t_pi6 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0, t_pt3 = 0, t_pt4 = 0, t_pt5 = 0, t_pt6 = 0;
+
+        for (int y = y0; y < y1; ++y) {
+            const float* pgx = gx.ptr<float>(y);
+            const float* pgy = gy.ptr<float>(y);
+            const float* pim = im.ptr<float>(y);
+            const float* ptm = tm.ptr<float>(y);
+            const float* pl = lp.ptr<float>(y);
+            const uchar* pmk = mask.ptr<uchar>(y);
+            const float fy = (float)y;
+            float m0_0 = 0, m0_1 = 0, m0_2 = 0, m0_5 = 0, m1_0 = 0, m1_1 = 0, m1_2 = 0, m1_5 = 0, m2_2 = 0, m2_5 = 0, m3_0 = 0, m3_1 = 0, m3_2 = 0, m3_5 = 0, m4_2 = 0, m4_5 = 0, m5_5 = 0;
+            float pi0 = 0, pi1 = 0, pi4 = 0, pi5 = 0, pi6 = 0, pt0 = 0, pt1 = 0, pt4 = 0, pt5 = 0, pt6 = 0;
+
+            for (int x = 0; x < w; ++x) {
+                if (pmk[x] != 0) {
+                    const float fx = (float)x;
+                    const float a = r00 * pgx[x] + r01 * pgy[x];
+                    const float b = r10 * pgx[x] + r11 * pgy[x];
+                    const float l = lsc * pl[x];
+                    const float uu0 = a * a, uu1 = a * b, uu2 = a * l, uu3 = b * b, uu4 = b * l, uu5 = l * l;
+                    const float ww0 = fx * fx, ww1 = fx * fy, ww2 = fx;
+                    m0_0 += uu0 * ww0;  m0_1 += uu0 * ww1;  m0_2 += uu0 * ww2;  m0_5 += uu0;
+                    m1_0 += uu1 * ww0;  m1_1 += uu1 * ww1;  m1_2 += uu1 * ww2;  m1_5 += uu1;
+                    m2_2 += uu2 * ww2;  m2_5 += uu2;
+                    m3_0 += uu3 * ww0;  m3_1 += uu3 * ww1;  m3_2 += uu3 * ww2;  m3_5 += uu3;
+                    m4_2 += uu4 * ww2;  m4_5 += uu4;
+                    m5_5 += uu5;
+                    const float ii = pim[x] - muI, tt = ptm[x] - muT;
+                    const float j0 = a * fx;
+                    const float j1 = b * fx;
+                    const float j4 = a;
+                    const float j5 = b;
+                    const float j6 = l;
+                    pi0 += j0 * ii;  pi1 += j1 * ii;  pi4 += j4 * ii;  pi5 += j5 * ii;  pi6 += j6 * ii;
+                    pt0 += j0 * tt;  pt1 += j1 * tt;  pt4 += j4 * tt;  pt5 += j5 * tt;  pt6 += j6 * tt;
+                }
+            }
+
+            const double dy = (double)fy, dyy = (double)fy * (double)fy;
+            t_m0_0 += m0_0;  t_m0_1 += m0_1;  t_m0_2 += m0_2;  t_m0_3 += m0_5 * dyy;  t_m0_4 += m0_5 * dy;  t_m0_5 += m0_5;
+            t_m1_0 += m1_0;  t_m1_1 += m1_1;  t_m1_2 += m1_2;  t_m1_3 += m1_5 * dyy;  t_m1_4 += m1_5 * dy;  t_m1_5 += m1_5;
+            t_m2_2 += m2_2;  t_m2_4 += m2_5 * dy;  t_m2_5 += m2_5;
+            t_m3_0 += m3_0;  t_m3_1 += m3_1;  t_m3_2 += m3_2;  t_m3_3 += m3_5 * dyy;  t_m3_4 += m3_5 * dy;  t_m3_5 += m3_5;
+            t_m4_2 += m4_2;  t_m4_4 += m4_5 * dy;  t_m4_5 += m4_5;
+            t_m5_5 += m5_5;
+            t_pi0 += pi0;  t_pi1 += pi1;  t_pi2 += pi4 * dy;  t_pi3 += pi5 * dy;  t_pi4 += pi4;  t_pi5 += pi5;  t_pi6 += pi6;
+            t_pt0 += pt0;  t_pt1 += pt1;  t_pt2 += pt4 * dy;  t_pt3 += pt5 * dy;  t_pt4 += pt4;  t_pt5 += pt5;  t_pt6 += pt6;
+        }
+
+        int n = 0;
+        H[n++] += t_m0_0;  H[n++] += t_m1_0;  H[n++] += t_m0_1;  H[n++] += t_m1_1;  H[n++] += t_m0_2;  H[n++] += t_m1_2;  H[n++] += t_m2_2;
+        H[n++] += t_m3_0;  H[n++] += t_m1_1;  H[n++] += t_m3_1;  H[n++] += t_m1_2;  H[n++] += t_m3_2;  H[n++] += t_m4_2;
+        H[n++] += t_m0_3;  H[n++] += t_m1_3;  H[n++] += t_m0_4;  H[n++] += t_m1_4;  H[n++] += t_m2_4;
+        H[n++] += t_m3_3;  H[n++] += t_m1_4;  H[n++] += t_m3_4;  H[n++] += t_m4_4;
+        H[n++] += t_m0_5;  H[n++] += t_m1_5;  H[n++] += t_m2_5;
+        H[n++] += t_m3_5;  H[n++] += t_m4_5;
+        H[n++] += t_m5_5;
+        VI[0] += t_pi0;  VI[1] += t_pi1;  VI[2] += t_pi2;  VI[3] += t_pi3;  VI[4] += t_pi4;  VI[5] += t_pi5;  VI[6] += t_pi6;
+        VT[0] += t_pt0;  VT[1] += t_pt1;  VT[2] += t_pt2;  VT[3] += t_pt3;  VT[4] += t_pt4;  VT[5] += t_pt5;  VT[6] += t_pt6;
+    }
+};
+
+// ---- homography: K=3 L=3 P=8, 31 Gram sums (23 live) + 16 projection sums ----
 struct GNHomography {
     enum { P = 8 };
     float r00, r01, r10, r11;   // A^-T of the current warp
@@ -251,9 +480,10 @@ struct GNHomography {
     }
 
     void rows(const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,
-              const Mat& mask, int y0, int y1) {
+              const Mat& lp, const Mat& mask, int y0, int y1) {
         const int w = gx.cols;
-        double t_m0_0 = 0, t_m0_1 = 0, t_m0_2 = 0, t_m0_3 = 0, t_m0_4 = 0, t_m0_5 = 0, t_m1_0 = 0, t_m1_1 = 0, t_m1_2 = 0, t_m1_3 = 0, t_m1_4 = 0, t_m1_5 = 0, t_m2_0 = 0, t_m2_1 = 0, t_m2_2 = 0, t_m2_3 = 0, t_m2_4 = 0, t_m2_5 = 0, t_m3_0 = 0, t_m3_1 = 0, t_m3_2 = 0, t_m3_3 = 0, t_m3_4 = 0, t_m3_5 = 0, t_m4_0 = 0, t_m4_1 = 0, t_m4_2 = 0, t_m4_3 = 0, t_m4_4 = 0, t_m4_5 = 0, t_m5_0 = 0, t_m5_1 = 0, t_m5_2 = 0, t_m5_3 = 0, t_m5_4 = 0, t_m5_5 = 0;
+        (void)lp;
+        double t_m0_0 = 0, t_m0_1 = 0, t_m0_2 = 0, t_m0_3 = 0, t_m0_4 = 0, t_m0_5 = 0, t_m1_0 = 0, t_m1_1 = 0, t_m1_2 = 0, t_m1_3 = 0, t_m1_4 = 0, t_m1_5 = 0, t_m2_0 = 0, t_m2_1 = 0, t_m2_2 = 0, t_m2_3 = 0, t_m2_4 = 0, t_m3_0 = 0, t_m3_1 = 0, t_m3_2 = 0, t_m3_3 = 0, t_m3_4 = 0, t_m3_5 = 0, t_m4_0 = 0, t_m4_1 = 0, t_m4_2 = 0, t_m4_3 = 0, t_m4_4 = 0, t_m5_0 = 0, t_m5_1 = 0, t_m5_3 = 0;
         double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pi3 = 0, t_pi4 = 0, t_pi5 = 0, t_pi6 = 0, t_pi7 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0, t_pt3 = 0, t_pt4 = 0, t_pt5 = 0, t_pt6 = 0, t_pt7 = 0;
 
         for (int y = y0; y < y1; ++y) {
@@ -263,7 +493,7 @@ struct GNHomography {
             const float* ptm = tm.ptr<float>(y);
             const uchar* pmk = mask.ptr<uchar>(y);
             const float fy = (float)y;
-            float m0_0 = 0, m0_1 = 0, m0_2 = 0, m0_5 = 0, m1_0 = 0, m1_1 = 0, m1_2 = 0, m1_5 = 0, m2_0 = 0, m2_1 = 0, m2_2 = 0, m2_5 = 0, m3_0 = 0, m3_1 = 0, m3_2 = 0, m3_5 = 0, m4_0 = 0, m4_1 = 0, m4_2 = 0, m4_5 = 0, m5_0 = 0, m5_1 = 0, m5_2 = 0, m5_5 = 0;
+            float m0_0 = 0, m0_1 = 0, m0_2 = 0, m0_5 = 0, m1_0 = 0, m1_1 = 0, m1_2 = 0, m1_5 = 0, m2_0 = 0, m2_1 = 0, m2_2 = 0, m2_5 = 0, m3_0 = 0, m3_1 = 0, m3_2 = 0, m3_5 = 0, m4_0 = 0, m4_1 = 0, m4_2 = 0, m4_5 = 0, m5_0 = 0, m5_1 = 0, m5_5 = 0;
             float pi0 = 0, pi1 = 0, pi2 = 0, pi6 = 0, pi7 = 0, pie2 = 0, pt0 = 0, pt1 = 0, pt2 = 0, pt6 = 0, pt7 = 0, pte2 = 0;
 
             for (int x = 0; x < w; ++x) {
@@ -286,7 +516,7 @@ struct GNHomography {
                     m2_0 += uu2 * ww0;  m2_1 += uu2 * ww1;  m2_2 += uu2 * ww2;  m2_5 += uu2;
                     m3_0 += uu3 * ww0;  m3_1 += uu3 * ww1;  m3_2 += uu3 * ww2;  m3_5 += uu3;
                     m4_0 += uu4 * ww0;  m4_1 += uu4 * ww1;  m4_2 += uu4 * ww2;  m4_5 += uu4;
-                    m5_0 += uu5 * ww0;  m5_1 += uu5 * ww1;  m5_2 += uu5 * ww2;  m5_5 += uu5;
+                    m5_0 += uu5 * ww0;  m5_1 += uu5 * ww1;  m5_5 += uu5;
                     const float ii = pim[x] - muI, tt = ptm[x] - muT;
                     const float j0 = a * fx;
                     const float j1 = b * fx;
@@ -301,10 +531,10 @@ struct GNHomography {
             const double dy = (double)fy, dyy = (double)fy * (double)fy;
             t_m0_0 += m0_0;  t_m0_1 += m0_1;  t_m0_2 += m0_2;  t_m0_3 += m0_5 * dyy;  t_m0_4 += m0_5 * dy;  t_m0_5 += m0_5;
             t_m1_0 += m1_0;  t_m1_1 += m1_1;  t_m1_2 += m1_2;  t_m1_3 += m1_5 * dyy;  t_m1_4 += m1_5 * dy;  t_m1_5 += m1_5;
-            t_m2_0 += m2_0;  t_m2_1 += m2_1;  t_m2_2 += m2_2;  t_m2_3 += m2_5 * dyy;  t_m2_4 += m2_5 * dy;  t_m2_5 += m2_5;
+            t_m2_0 += m2_0;  t_m2_1 += m2_1;  t_m2_2 += m2_2;  t_m2_3 += m2_5 * dyy;  t_m2_4 += m2_5 * dy;
             t_m3_0 += m3_0;  t_m3_1 += m3_1;  t_m3_2 += m3_2;  t_m3_3 += m3_5 * dyy;  t_m3_4 += m3_5 * dy;  t_m3_5 += m3_5;
-            t_m4_0 += m4_0;  t_m4_1 += m4_1;  t_m4_2 += m4_2;  t_m4_3 += m4_5 * dyy;  t_m4_4 += m4_5 * dy;  t_m4_5 += m4_5;
-            t_m5_0 += m5_0;  t_m5_1 += m5_1;  t_m5_2 += m5_2;  t_m5_3 += m5_5 * dyy;  t_m5_4 += m5_5 * dy;  t_m5_5 += m5_5;
+            t_m4_0 += m4_0;  t_m4_1 += m4_1;  t_m4_2 += m4_2;  t_m4_3 += m4_5 * dyy;  t_m4_4 += m4_5 * dy;
+            t_m5_0 += m5_0;  t_m5_1 += m5_1;  t_m5_3 += m5_5 * dyy;
             t_pi0 += pi0;  t_pi1 += pi1;  t_pi2 += pi2;  t_pi3 += pi6 * dy;  t_pi4 += pi7 * dy;  t_pi5 += pie2 * dy;  t_pi6 += pi6;  t_pi7 += pi7;
             t_pt0 += pt0;  t_pt1 += pt1;  t_pt2 += pt2;  t_pt3 += pt6 * dy;  t_pt4 += pt7 * dy;  t_pt5 += pte2 * dy;  t_pt6 += pt6;  t_pt7 += pt7;
         }
@@ -323,33 +553,134 @@ struct GNHomography {
     }
 };
 
+// ---- homographyl: K=4 L=3 P=9, 40 Gram sums (30 live) + 18 projection sums ----
+struct GNHomographyL {
+    enum { P = 9 };
+    float r00, r01, r10, r11;   // A^-T of the current warp
+    float muI, muT;             // masked means of warped image and template
+    float h0, h1, h2, h3, h4, h5, h6, h7;
+    float lsc;                  // scale of the laplacian column (the pre-filter sigma)
+    double H[45], VI[9], VT[9];
+    GNHomographyL() { std::fill(H, H + 45, 0.0); std::fill(VI, VI + 9, 0.0); std::fill(VT, VT + 9, 0.0); }
+    void add(const GNHomographyL& o) {
+        for (int i = 0; i < 45; ++i) H[i] += o.H[i];
+        for (int i = 0; i < 9; ++i) { VI[i] += o.VI[i]; VT[i] += o.VT[i]; }
+    }
+
+    void rows(const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,
+              const Mat& lp, const Mat& mask, int y0, int y1) {
+        const int w = gx.cols;
+        double t_m0_0 = 0, t_m0_1 = 0, t_m0_2 = 0, t_m0_3 = 0, t_m0_4 = 0, t_m0_5 = 0, t_m1_0 = 0, t_m1_1 = 0, t_m1_2 = 0, t_m1_3 = 0, t_m1_4 = 0, t_m1_5 = 0, t_m2_0 = 0, t_m2_1 = 0, t_m2_2 = 0, t_m2_3 = 0, t_m2_4 = 0, t_m3_2 = 0, t_m3_4 = 0, t_m3_5 = 0, t_m4_0 = 0, t_m4_1 = 0, t_m4_2 = 0, t_m4_3 = 0, t_m4_4 = 0, t_m4_5 = 0, t_m5_0 = 0, t_m5_1 = 0, t_m5_2 = 0, t_m5_3 = 0, t_m5_4 = 0, t_m6_2 = 0, t_m6_4 = 0, t_m6_5 = 0, t_m7_0 = 0, t_m7_1 = 0, t_m7_3 = 0, t_m8_2 = 0, t_m8_4 = 0, t_m9_5 = 0;
+        double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pi3 = 0, t_pi4 = 0, t_pi5 = 0, t_pi6 = 0, t_pi7 = 0, t_pi8 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0, t_pt3 = 0, t_pt4 = 0, t_pt5 = 0, t_pt6 = 0, t_pt7 = 0, t_pt8 = 0;
+
+        for (int y = y0; y < y1; ++y) {
+            const float* pgx = gx.ptr<float>(y);
+            const float* pgy = gy.ptr<float>(y);
+            const float* pim = im.ptr<float>(y);
+            const float* ptm = tm.ptr<float>(y);
+            const float* pl = lp.ptr<float>(y);
+            const uchar* pmk = mask.ptr<uchar>(y);
+            const float fy = (float)y;
+            float m0_0 = 0, m0_1 = 0, m0_2 = 0, m0_5 = 0, m1_0 = 0, m1_1 = 0, m1_2 = 0, m1_5 = 0, m2_0 = 0, m2_1 = 0, m2_2 = 0, m2_5 = 0, m3_2 = 0, m3_5 = 0, m4_0 = 0, m4_1 = 0, m4_2 = 0, m4_5 = 0, m5_0 = 0, m5_1 = 0, m5_2 = 0, m5_5 = 0, m6_2 = 0, m6_5 = 0, m7_0 = 0, m7_1 = 0, m7_5 = 0, m8_2 = 0, m8_5 = 0, m9_5 = 0;
+            float pi0 = 0, pi1 = 0, pi2 = 0, pi6 = 0, pi7 = 0, pi8 = 0, pie2 = 0, pt0 = 0, pt1 = 0, pt2 = 0, pt6 = 0, pt7 = 0, pt8 = 0, pte2 = 0;
+
+            for (int x = 0; x < w; ++x) {
+                if (pmk[x] != 0) {
+                    const float fx = (float)x;
+                    const float gxv = r00 * pgx[x] + r01 * pgy[x];
+                    const float gyv = r10 * pgx[x] + r11 * pgy[x];
+                    const float den = fx * h2 + fy * h5 + 1.f;
+                    // cv::divide yields 0 where the denominator is 0; match that
+                    const float inv = den != 0.f ? 1.f / den : 0.f;
+                    const float a = gxv * inv;
+                    const float b = gyv * inv;
+                    const float hatX = (-fx * h0 - fy * h3 - h6) * inv;
+                    const float hatY = (-fx * h1 - fy * h4 - h7) * inv;
+                    const float e = hatX * a + hatY * b;
+                    const float l = lsc * pl[x];
+                    const float uu0 = a * a, uu1 = a * b, uu2 = a * e, uu3 = a * l, uu4 = b * b, uu5 = b * e, uu6 = b * l, uu7 = e * e, uu8 = e * l, uu9 = l * l;
+                    const float ww0 = fx * fx, ww1 = fx * fy, ww2 = fx;
+                    m0_0 += uu0 * ww0;  m0_1 += uu0 * ww1;  m0_2 += uu0 * ww2;  m0_5 += uu0;
+                    m1_0 += uu1 * ww0;  m1_1 += uu1 * ww1;  m1_2 += uu1 * ww2;  m1_5 += uu1;
+                    m2_0 += uu2 * ww0;  m2_1 += uu2 * ww1;  m2_2 += uu2 * ww2;  m2_5 += uu2;
+                    m3_2 += uu3 * ww2;  m3_5 += uu3;
+                    m4_0 += uu4 * ww0;  m4_1 += uu4 * ww1;  m4_2 += uu4 * ww2;  m4_5 += uu4;
+                    m5_0 += uu5 * ww0;  m5_1 += uu5 * ww1;  m5_2 += uu5 * ww2;  m5_5 += uu5;
+                    m6_2 += uu6 * ww2;  m6_5 += uu6;
+                    m7_0 += uu7 * ww0;  m7_1 += uu7 * ww1;  m7_5 += uu7;
+                    m8_2 += uu8 * ww2;  m8_5 += uu8;
+                    m9_5 += uu9;
+                    const float ii = pim[x] - muI, tt = ptm[x] - muT;
+                    const float j0 = a * fx;
+                    const float j1 = b * fx;
+                    const float j2 = e * fx;
+                    const float j6 = a;
+                    const float j7 = b;
+                    const float j8 = l;
+                    pi0 += j0 * ii;  pi1 += j1 * ii;  pi2 += j2 * ii;  pi6 += j6 * ii;  pi7 += j7 * ii;  pi8 += j8 * ii;  pie2 += e * ii;
+                    pt0 += j0 * tt;  pt1 += j1 * tt;  pt2 += j2 * tt;  pt6 += j6 * tt;  pt7 += j7 * tt;  pt8 += j8 * tt;  pte2 += e * tt;
+                }
+            }
+
+            const double dy = (double)fy, dyy = (double)fy * (double)fy;
+            t_m0_0 += m0_0;  t_m0_1 += m0_1;  t_m0_2 += m0_2;  t_m0_3 += m0_5 * dyy;  t_m0_4 += m0_5 * dy;  t_m0_5 += m0_5;
+            t_m1_0 += m1_0;  t_m1_1 += m1_1;  t_m1_2 += m1_2;  t_m1_3 += m1_5 * dyy;  t_m1_4 += m1_5 * dy;  t_m1_5 += m1_5;
+            t_m2_0 += m2_0;  t_m2_1 += m2_1;  t_m2_2 += m2_2;  t_m2_3 += m2_5 * dyy;  t_m2_4 += m2_5 * dy;
+            t_m3_2 += m3_2;  t_m3_4 += m3_5 * dy;  t_m3_5 += m3_5;
+            t_m4_0 += m4_0;  t_m4_1 += m4_1;  t_m4_2 += m4_2;  t_m4_3 += m4_5 * dyy;  t_m4_4 += m4_5 * dy;  t_m4_5 += m4_5;
+            t_m5_0 += m5_0;  t_m5_1 += m5_1;  t_m5_2 += m5_2;  t_m5_3 += m5_5 * dyy;  t_m5_4 += m5_5 * dy;
+            t_m6_2 += m6_2;  t_m6_4 += m6_5 * dy;  t_m6_5 += m6_5;
+            t_m7_0 += m7_0;  t_m7_1 += m7_1;  t_m7_3 += m7_5 * dyy;
+            t_m8_2 += m8_2;  t_m8_4 += m8_5 * dy;
+            t_m9_5 += m9_5;
+            t_pi0 += pi0;  t_pi1 += pi1;  t_pi2 += pi2;  t_pi3 += pi6 * dy;  t_pi4 += pi7 * dy;  t_pi5 += pie2 * dy;  t_pi6 += pi6;  t_pi7 += pi7;  t_pi8 += pi8;
+            t_pt0 += pt0;  t_pt1 += pt1;  t_pt2 += pt2;  t_pt3 += pt6 * dy;  t_pt4 += pt7 * dy;  t_pt5 += pte2 * dy;  t_pt6 += pt6;  t_pt7 += pt7;  t_pt8 += pt8;
+        }
+
+        int n = 0;
+        H[n++] += t_m0_0;  H[n++] += t_m1_0;  H[n++] += t_m2_0;  H[n++] += t_m0_1;  H[n++] += t_m1_1;  H[n++] += t_m2_1;  H[n++] += t_m0_2;  H[n++] += t_m1_2;  H[n++] += t_m3_2;
+        H[n++] += t_m4_0;  H[n++] += t_m5_0;  H[n++] += t_m1_1;  H[n++] += t_m4_1;  H[n++] += t_m5_1;  H[n++] += t_m1_2;  H[n++] += t_m4_2;  H[n++] += t_m6_2;
+        H[n++] += t_m7_0;  H[n++] += t_m2_1;  H[n++] += t_m5_1;  H[n++] += t_m7_1;  H[n++] += t_m2_2;  H[n++] += t_m5_2;  H[n++] += t_m8_2;
+        H[n++] += t_m0_3;  H[n++] += t_m1_3;  H[n++] += t_m2_3;  H[n++] += t_m0_4;  H[n++] += t_m1_4;  H[n++] += t_m3_4;
+        H[n++] += t_m4_3;  H[n++] += t_m5_3;  H[n++] += t_m1_4;  H[n++] += t_m4_4;  H[n++] += t_m6_4;
+        H[n++] += t_m7_3;  H[n++] += t_m2_4;  H[n++] += t_m5_4;  H[n++] += t_m8_4;
+        H[n++] += t_m0_5;  H[n++] += t_m1_5;  H[n++] += t_m3_5;
+        H[n++] += t_m4_5;  H[n++] += t_m6_5;
+        H[n++] += t_m9_5;
+        VI[0] += t_pi0;  VI[1] += t_pi1;  VI[2] += t_pi2;  VI[3] += t_pi3;  VI[4] += t_pi4;  VI[5] += t_pi5;  VI[6] += t_pi6;  VI[7] += t_pi7;  VI[8] += t_pi8;
+        VT[0] += t_pt0;  VT[1] += t_pt1;  VT[2] += t_pt2;  VT[3] += t_pt3;  VT[4] += t_pt4;  VT[5] += t_pt5;  VT[6] += t_pt6;  VT[7] += t_pt7;  VT[8] += t_pt8;
+    }
+};
+
 // --- drivers --------------------------------------------------------------
 
 template <class Acc>
 class GNBody : public ParallelLoopBody {
 public:
     GNBody(const Acc& proto, const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,
-           const Mat& mask, std::vector<Acc>& out, Mutex& m)
-        : proto_(proto), gx_(gx), gy_(gy), im_(im), tm_(tm), mask_(mask), out_(out), mtx_(m) {}
+           const Mat& lp, const Mat& mask, std::vector<Acc>& out, Mutex& m)
+        : proto_(proto), gx_(gx), gy_(gy), im_(im), tm_(tm), lp_(lp), mask_(mask), out_(out), mtx_(m) {}
     void operator()(const Range& r) const CV_OVERRIDE {
         Acc s = proto_;                      // carries the warp coefficients and the means
-        s.rows(gx_, gy_, im_, tm_, mask_, r.start, r.end);
+        s.rows(gx_, gy_, im_, tm_, lp_, mask_, r.start, r.end);
         AutoLock lk(mtx_);
         out_.push_back(s);
     }
 private:
     Acc proto_;
-    const Mat &gx_, &gy_, &im_, &tm_, &mask_;
+    const Mat &gx_, &gy_, &im_, &tm_, &lp_, &mask_;
     std::vector<Acc>& out_;
     Mutex& mtx_;
 };
 
+// lp is the laplacian plane; the plain kernels ignore it (pass an empty Mat).
 template <class Acc>
 void runFusedGN(const Acc& proto, const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,
-                const Mat& mask, Mat& hessian, Mat& imageProjection, Mat& templateProjection) {
+                const Mat& lp, const Mat& mask,
+                Mat& hessian, Mat& imageProjection, Mat& templateProjection) {
     std::vector<Acc> parts;
     Mutex m;
-    GNBody<Acc> body(proto, gx, gy, im, tm, mask, parts, m);
+    GNBody<Acc> body(proto, gx, gy, im, tm, lp, mask, parts, m);
     parallel_for_(Range(0, gx.rows), body);
 
     Acc s = proto;
