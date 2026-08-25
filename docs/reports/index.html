@@ -65,8 +65,9 @@
   its time on. Two passes that write nothing take 1.34–1.56× off the iteration; the
   5-tap reaches the floor in 3 iterations instead of 4–5; and an experiment on estimating
   sigma, which cannot work, leaves behind a laplacian column that halves the first step,
-  widens the basin and lowers the real-image error 2.6×. Together, 2.6–4.5× against a
-  border-fixed OpenCV in the bundled bench.</p>
+  widens the basin and lowers the real-image error 2.6×. Together, 2.9–4.5× against a
+  border-fixed ecc.cpp in the bundled bench; against eccms.cpp the faster single-scale
+  implementation, but its pyramid still wins when the start is far off.</p>
 </a>
 
 <p class="note">
