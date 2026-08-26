@@ -26,6 +26,21 @@ target_include_directories(fast_ecc PUBLIC
 target_link_libraries(fast_ecc PUBLIC ${FASTECC_CV})
 target_include_directories(fast_ecc PUBLIC ${OpenCV_INCLUDE_DIRS})
 
+# The vector paths are written for OpenCV's universal intrinsics at whatever
+# width the headers expose, which outside OpenCV's own build is 128 bits
+# (SSE2 / NEON).  This option compiles them for AVX2 with FMA instead --
+# eight lanes, fused multiply-adds, gathers -- and makes the library require
+# an AVX2 CPU (2013 on).  See the top of src/fast_ecc.cpp.
+option(FAST_ECC_AVX2 "Compile the vector paths for AVX2 + FMA (needs an AVX2 CPU)" OFF)
+if(FAST_ECC_AVX2)
+  target_compile_definitions(fast_ecc PRIVATE FASTECC_AVX2=1)
+  if(MSVC)
+    target_compile_options(fast_ecc PRIVATE /arch:AVX2)
+  else()
+    target_compile_options(fast_ecc PRIVATE -mavx2 -mfma)
+  endif()
+endif()
+
 # --- tools (optional) ------------------------------------------------------
 option(FAST_ECC_BUILD_BENCH    "Build the benchmark"        ON)
 option(FAST_ECC_BUILD_EXAMPLES "Build the examples"         ON)
