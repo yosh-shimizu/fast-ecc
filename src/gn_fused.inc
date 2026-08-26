@@ -58,10 +58,26 @@
 // of the planes it is given (`base`), so that it can run on stripe buffers as
 // well as on full planes.
 //
+// Vector path.  Under FASTECC_SIMD_GN (set by fast_ecc.cpp when OpenCV's
+// universal intrinsics are available in their function form, OpenCV >= 4.7,
+// and neither FASTECC_NO_SIMD nor FASTECC_NO_SIMD_GN is defined) each row is
+// first run VL pixels at a time with one partial sum per lane for every
+// live accumulator, reduced into the scalar row accumulators before the
+// scalar loop takes the tail.  The mask is a bitwise AND on the gradient
+// inputs: everything downstream of a zeroed gradient is zero, so a masked
+// lane contributes nothing.  MSVC will not vectorise these reductions on
+// its own under /fp:precise; the lanes are the same reassociation the
+// scalar kernels already make (float within a row, double at row end),
+// one level down, and four shorter chains lose less than one long one.
+//
 // All four are here.  translation and euclidean gain least: with w = (1) their
 // Hessians have only 3 and 6 entries, so this stage is a small share of their
 // work to begin with.
 
+
+#ifndef FASTECC_SIMD_GN
+#define FASTECC_SIMD_GN 0
+#endif
 
 // ---- translation: K=2 L=1 P=2, 3 Gram sums (3 live) + 6 projection sums ----
 struct GNTranslation {
@@ -80,6 +96,14 @@ struct GNTranslation {
         (void)lp;
         double t_m0_0 = 0, t_m1_0 = 0, t_m2_0 = 0;
         double t_pi0 = 0, t_pi1 = 0, t_pt0 = 0, t_pt1 = 0, t_pj0 = 0, t_pj1 = 0;
+#if FASTECC_SIMD_GN
+        const int VL = VTraits<v_float32>::vlanes();
+        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];
+        for (int k = 0; k < VL; ++k) lane[k] = (float)k;
+        const v_float32 vlane = v_load_aligned(lane), vVL = v_setall_f32((float)VL);
+        const v_float32 vmuI = v_setall_f32(muI), vmuT = v_setall_f32(muT);
+        const v_int32 vzi = v_setzero_s32();
+#endif
 
         for (int y = y0; y < y1; ++y) {
             const float* pgx = gx.ptr<float>(y - base);
@@ -90,8 +114,34 @@ struct GNTranslation {
             const float fy = (float)y;
             float m0_0 = 0, m1_0 = 0, m2_0 = 0;
             float pi0 = 0, pi1 = 0, pt0 = 0, pt1 = 0, pj0 = 0, pj1 = 0;
+            int x = 0;
+#if FASTECC_SIMD_GN
+            {
+                v_float32 vm0_0 = v_setzero_f32(), vm1_0 = v_setzero_f32(), vm2_0 = v_setzero_f32();
+                v_float32 vpi0 = v_setzero_f32(), vpi1 = v_setzero_f32(), vpt0 = v_setzero_f32(), vpt1 = v_setzero_f32(), vpj0 = v_setzero_f32(), vpj1 = v_setzero_f32();
+                v_float32 vx = vlane;
+                for (; x + VL <= w; x += VL) {
+                    const v_float32 mf = v_reinterpret_as_f32(v_ne(v_reinterpret_as_s32(v_load_expand_q(pmk + x)), vzi));
+                    const v_float32 gxv = v_and(v_load(pgx + x), mf), gyv = v_and(v_load(pgy + x), mf);
+                    const v_float32 a = gxv, b = gyv;
+                    const v_float32 uu0 = v_mul(a, a), uu1 = v_mul(a, b), uu2 = v_mul(b, b);
+                    vm0_0 = v_add(vm0_0, uu0);
+                    vm1_0 = v_add(vm1_0, uu1);
+                    vm2_0 = v_add(vm2_0, uu2);
+                    const v_float32 ii = v_sub(v_load(pim + x), vmuI), tt = v_sub(v_load(ptm + x), vmuT);
+                    const v_float32 j0 = a;
+                    const v_float32 j1 = b;
+                    vpi0 = v_fma(j0, ii, vpi0);  vpi1 = v_fma(j1, ii, vpi1);
+                    vpt0 = v_fma(j0, tt, vpt0);  vpt1 = v_fma(j1, tt, vpt1);
+                    vpj0 = v_add(vpj0, j0);  vpj1 = v_add(vpj1, j1);
+                    vx = v_add(vx, vVL);
+                }
+                m0_0 = v_reduce_sum(vm0_0);  m1_0 = v_reduce_sum(vm1_0);  m2_0 = v_reduce_sum(vm2_0);
+                pi0 = v_reduce_sum(vpi0);  pi1 = v_reduce_sum(vpi1);  pt0 = v_reduce_sum(vpt0);  pt1 = v_reduce_sum(vpt1);  pj0 = v_reduce_sum(vpj0);  pj1 = v_reduce_sum(vpj1);
+            }
+#endif
 
-            for (int x = 0; x < w; ++x) {
+            for (; x < w; ++x) {
                 if (pmk[x] != 0) {
                     const float a = pgx[x], b = pgy[x];
                     const float uu0 = a * a, uu1 = a * b, uu2 = b * b;
@@ -137,6 +187,15 @@ struct GNTranslationL {
         const int w = gx.cols;
         double t_m0_0 = 0, t_m1_0 = 0, t_m2_0 = 0, t_m3_0 = 0, t_m4_0 = 0, t_m5_0 = 0;
         double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0, t_pj0 = 0, t_pj1 = 0, t_pj2 = 0;
+#if FASTECC_SIMD_GN
+        const int VL = VTraits<v_float32>::vlanes();
+        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];
+        for (int k = 0; k < VL; ++k) lane[k] = (float)k;
+        const v_float32 vlane = v_load_aligned(lane), vVL = v_setall_f32((float)VL);
+        const v_float32 vmuI = v_setall_f32(muI), vmuT = v_setall_f32(muT);
+        const v_int32 vzi = v_setzero_s32();
+        const v_float32 vlsc = v_setall_f32(lsc);
+#endif
 
         for (int y = y0; y < y1; ++y) {
             const float* pgx = gx.ptr<float>(y - base);
@@ -148,8 +207,42 @@ struct GNTranslationL {
             const float fy = (float)y;
             float m0_0 = 0, m1_0 = 0, m2_0 = 0, m3_0 = 0, m4_0 = 0, m5_0 = 0;
             float pi0 = 0, pi1 = 0, pi2 = 0, pt0 = 0, pt1 = 0, pt2 = 0, pj0 = 0, pj1 = 0, pj2 = 0;
+            int x = 0;
+#if FASTECC_SIMD_GN
+            {
+                v_float32 vm0_0 = v_setzero_f32(), vm1_0 = v_setzero_f32(), vm2_0 = v_setzero_f32(), vm3_0 = v_setzero_f32(), vm4_0 = v_setzero_f32(), vm5_0 = v_setzero_f32();
+                v_float32 vpi0 = v_setzero_f32(), vpi1 = v_setzero_f32(), vpi2 = v_setzero_f32(), vpt0 = v_setzero_f32(), vpt1 = v_setzero_f32(), vpt2 = v_setzero_f32();
+                v_float32 vpj0 = v_setzero_f32(), vpj1 = v_setzero_f32(), vpj2 = v_setzero_f32();
+                v_float32 vx = vlane;
+                for (; x + VL <= w; x += VL) {
+                    const v_float32 mf = v_reinterpret_as_f32(v_ne(v_reinterpret_as_s32(v_load_expand_q(pmk + x)), vzi));
+                    const v_float32 gxv = v_and(v_load(pgx + x), mf), gyv = v_and(v_load(pgy + x), mf);
+                    const v_float32 lv = v_and(v_load(pl + x), mf);
+                    const v_float32 a = gxv, b = gyv;
+                    const v_float32 l = v_mul(vlsc, lv);
+                    const v_float32 uu0 = v_mul(a, a), uu1 = v_mul(a, b), uu2 = v_mul(a, l), uu3 = v_mul(b, b), uu4 = v_mul(b, l), uu5 = v_mul(l, l);
+                    vm0_0 = v_add(vm0_0, uu0);
+                    vm1_0 = v_add(vm1_0, uu1);
+                    vm2_0 = v_add(vm2_0, uu2);
+                    vm3_0 = v_add(vm3_0, uu3);
+                    vm4_0 = v_add(vm4_0, uu4);
+                    vm5_0 = v_add(vm5_0, uu5);
+                    const v_float32 ii = v_sub(v_load(pim + x), vmuI), tt = v_sub(v_load(ptm + x), vmuT);
+                    const v_float32 j0 = a;
+                    const v_float32 j1 = b;
+                    const v_float32 j2 = l;
+                    vpi0 = v_fma(j0, ii, vpi0);  vpi1 = v_fma(j1, ii, vpi1);  vpi2 = v_fma(j2, ii, vpi2);
+                    vpt0 = v_fma(j0, tt, vpt0);  vpt1 = v_fma(j1, tt, vpt1);  vpt2 = v_fma(j2, tt, vpt2);
+                    vpj0 = v_add(vpj0, j0);  vpj1 = v_add(vpj1, j1);  vpj2 = v_add(vpj2, j2);
+                    vx = v_add(vx, vVL);
+                }
+                m0_0 = v_reduce_sum(vm0_0);  m1_0 = v_reduce_sum(vm1_0);  m2_0 = v_reduce_sum(vm2_0);  m3_0 = v_reduce_sum(vm3_0);  m4_0 = v_reduce_sum(vm4_0);  m5_0 = v_reduce_sum(vm5_0);
+                pi0 = v_reduce_sum(vpi0);  pi1 = v_reduce_sum(vpi1);  pi2 = v_reduce_sum(vpi2);  pt0 = v_reduce_sum(vpt0);  pt1 = v_reduce_sum(vpt1);  pt2 = v_reduce_sum(vpt2);
+                pj0 = v_reduce_sum(vpj0);  pj1 = v_reduce_sum(vpj1);  pj2 = v_reduce_sum(vpj2);
+            }
+#endif
 
-            for (int x = 0; x < w; ++x) {
+            for (; x < w; ++x) {
                 if (pmk[x] != 0) {
                     const float a = pgx[x], b = pgy[x];
                     const float l = lsc * pl[x];
@@ -203,6 +296,16 @@ struct GNEuclidean {
         (void)lp;
         double t_m0_0 = 0, t_m1_0 = 0, t_m2_0 = 0, t_m3_0 = 0, t_m4_0 = 0, t_m5_0 = 0;
         double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0, t_pj0 = 0, t_pj1 = 0, t_pj2 = 0;
+#if FASTECC_SIMD_GN
+        const int VL = VTraits<v_float32>::vlanes();
+        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];
+        for (int k = 0; k < VL; ++k) lane[k] = (float)k;
+        const v_float32 vlane = v_load_aligned(lane), vVL = v_setall_f32((float)VL);
+        const v_float32 vmuI = v_setall_f32(muI), vmuT = v_setall_f32(muT);
+        const v_int32 vzi = v_setzero_s32();
+        const v_float32 vr00 = v_setall_f32(r00), vr01 = v_setall_f32(r01), vr10 = v_setall_f32(r10), vr11 = v_setall_f32(r11);
+        const v_float32 vh0 = v_setall_f32(h0), vh1 = v_setall_f32(h1);
+#endif
 
         for (int y = y0; y < y1; ++y) {
             const float* pgx = gx.ptr<float>(y - base);
@@ -211,13 +314,50 @@ struct GNEuclidean {
             const float* ptm = tm.ptr<float>(y);
             const uchar* pmk = mask.ptr<uchar>(y - base);
             const float fy = (float)y;
-            // hatX, hatY are affine in (x, y): step them along the row
-            float hatX = -(0.f * h1) - (fy * h0);
-            float hatY =  (0.f * h0) - (fy * h1);
             float m0_0 = 0, m1_0 = 0, m2_0 = 0, m3_0 = 0, m4_0 = 0, m5_0 = 0;
             float pi0 = 0, pi1 = 0, pi2 = 0, pt0 = 0, pt1 = 0, pt2 = 0, pj0 = 0, pj1 = 0, pj2 = 0;
+            int x = 0;
+#if FASTECC_SIMD_GN
+            {
+                const v_float32 vnfyh0 = v_setall_f32(-(fy * h0)), vfyh1 = v_setall_f32(fy * h1);
+                v_float32 vm0_0 = v_setzero_f32(), vm1_0 = v_setzero_f32(), vm2_0 = v_setzero_f32(), vm3_0 = v_setzero_f32(), vm4_0 = v_setzero_f32(), vm5_0 = v_setzero_f32();
+                v_float32 vpi0 = v_setzero_f32(), vpi1 = v_setzero_f32(), vpi2 = v_setzero_f32(), vpt0 = v_setzero_f32(), vpt1 = v_setzero_f32(), vpt2 = v_setzero_f32();
+                v_float32 vpj0 = v_setzero_f32(), vpj1 = v_setzero_f32(), vpj2 = v_setzero_f32();
+                v_float32 vx = vlane;
+                for (; x + VL <= w; x += VL) {
+                    const v_float32 mf = v_reinterpret_as_f32(v_ne(v_reinterpret_as_s32(v_load_expand_q(pmk + x)), vzi));
+                    const v_float32 gxv = v_and(v_load(pgx + x), mf), gyv = v_and(v_load(pgy + x), mf);
+                    const v_float32 a = v_add(v_mul(vr00, gxv), v_mul(vr01, gyv));
+                    const v_float32 b = v_add(v_mul(vr10, gxv), v_mul(vr11, gyv));
+                    const v_float32 hatX = v_sub(vnfyh0, v_mul(vx, vh1));
+                    const v_float32 hatY = v_sub(v_mul(vx, vh0), vfyh1);
+                    const v_float32 r = v_add(v_mul(a, hatX), v_mul(b, hatY));
+                    const v_float32 uu0 = v_mul(r, r), uu1 = v_mul(r, a), uu2 = v_mul(r, b), uu3 = v_mul(a, a), uu4 = v_mul(a, b), uu5 = v_mul(b, b);
+                    vm0_0 = v_add(vm0_0, uu0);
+                    vm1_0 = v_add(vm1_0, uu1);
+                    vm2_0 = v_add(vm2_0, uu2);
+                    vm3_0 = v_add(vm3_0, uu3);
+                    vm4_0 = v_add(vm4_0, uu4);
+                    vm5_0 = v_add(vm5_0, uu5);
+                    const v_float32 ii = v_sub(v_load(pim + x), vmuI), tt = v_sub(v_load(ptm + x), vmuT);
+                    const v_float32 j0 = r;
+                    const v_float32 j1 = a;
+                    const v_float32 j2 = b;
+                    vpi0 = v_fma(j0, ii, vpi0);  vpi1 = v_fma(j1, ii, vpi1);  vpi2 = v_fma(j2, ii, vpi2);
+                    vpt0 = v_fma(j0, tt, vpt0);  vpt1 = v_fma(j1, tt, vpt1);  vpt2 = v_fma(j2, tt, vpt2);
+                    vpj0 = v_add(vpj0, j0);  vpj1 = v_add(vpj1, j1);  vpj2 = v_add(vpj2, j2);
+                    vx = v_add(vx, vVL);
+                }
+                m0_0 = v_reduce_sum(vm0_0);  m1_0 = v_reduce_sum(vm1_0);  m2_0 = v_reduce_sum(vm2_0);  m3_0 = v_reduce_sum(vm3_0);  m4_0 = v_reduce_sum(vm4_0);  m5_0 = v_reduce_sum(vm5_0);
+                pi0 = v_reduce_sum(vpi0);  pi1 = v_reduce_sum(vpi1);  pi2 = v_reduce_sum(vpi2);  pt0 = v_reduce_sum(vpt0);  pt1 = v_reduce_sum(vpt1);  pt2 = v_reduce_sum(vpt2);
+                pj0 = v_reduce_sum(vpj0);  pj1 = v_reduce_sum(vpj1);  pj2 = v_reduce_sum(vpj2);
+            }
+#endif
+            // hatX, hatY are affine in (x, y): step them along the row
+            float hatX = -((float)x * h1) - (fy * h0);
+            float hatY =  ((float)x * h0) - (fy * h1);
 
-            for (int x = 0; x < w; ++x) {
+            for (; x < w; ++x) {
                 if (pmk[x] != 0) {
                     const float a = r00 * pgx[x] + r01 * pgy[x];
                     const float b = r10 * pgx[x] + r11 * pgy[x];
@@ -273,6 +413,17 @@ struct GNEuclideanL {
         const int w = gx.cols;
         double t_m0_0 = 0, t_m1_0 = 0, t_m2_0 = 0, t_m3_0 = 0, t_m4_0 = 0, t_m5_0 = 0, t_m6_0 = 0, t_m7_0 = 0, t_m8_0 = 0, t_m9_0 = 0;
         double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pi3 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0, t_pt3 = 0, t_pj0 = 0, t_pj1 = 0, t_pj2 = 0, t_pj3 = 0;
+#if FASTECC_SIMD_GN
+        const int VL = VTraits<v_float32>::vlanes();
+        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];
+        for (int k = 0; k < VL; ++k) lane[k] = (float)k;
+        const v_float32 vlane = v_load_aligned(lane), vVL = v_setall_f32((float)VL);
+        const v_float32 vmuI = v_setall_f32(muI), vmuT = v_setall_f32(muT);
+        const v_int32 vzi = v_setzero_s32();
+        const v_float32 vr00 = v_setall_f32(r00), vr01 = v_setall_f32(r01), vr10 = v_setall_f32(r10), vr11 = v_setall_f32(r11);
+        const v_float32 vh0 = v_setall_f32(h0), vh1 = v_setall_f32(h1);
+        const v_float32 vlsc = v_setall_f32(lsc);
+#endif
 
         for (int y = y0; y < y1; ++y) {
             const float* pgx = gx.ptr<float>(y - base);
@@ -282,13 +433,59 @@ struct GNEuclideanL {
             const float* pl = lp.ptr<float>(y - base);
             const uchar* pmk = mask.ptr<uchar>(y - base);
             const float fy = (float)y;
-            // hatX, hatY are affine in (x, y): step them along the row
-            float hatX = -(0.f * h1) - (fy * h0);
-            float hatY =  (0.f * h0) - (fy * h1);
             float m0_0 = 0, m1_0 = 0, m2_0 = 0, m3_0 = 0, m4_0 = 0, m5_0 = 0, m6_0 = 0, m7_0 = 0, m8_0 = 0, m9_0 = 0;
             float pi0 = 0, pi1 = 0, pi2 = 0, pi3 = 0, pt0 = 0, pt1 = 0, pt2 = 0, pt3 = 0, pj0 = 0, pj1 = 0, pj2 = 0, pj3 = 0;
+            int x = 0;
+#if FASTECC_SIMD_GN
+            {
+                const v_float32 vnfyh0 = v_setall_f32(-(fy * h0)), vfyh1 = v_setall_f32(fy * h1);
+                v_float32 vm0_0 = v_setzero_f32(), vm1_0 = v_setzero_f32(), vm2_0 = v_setzero_f32(), vm3_0 = v_setzero_f32(), vm4_0 = v_setzero_f32(), vm5_0 = v_setzero_f32();
+                v_float32 vm6_0 = v_setzero_f32(), vm7_0 = v_setzero_f32(), vm8_0 = v_setzero_f32(), vm9_0 = v_setzero_f32();
+                v_float32 vpi0 = v_setzero_f32(), vpi1 = v_setzero_f32(), vpi2 = v_setzero_f32(), vpi3 = v_setzero_f32(), vpt0 = v_setzero_f32(), vpt1 = v_setzero_f32();
+                v_float32 vpt2 = v_setzero_f32(), vpt3 = v_setzero_f32(), vpj0 = v_setzero_f32(), vpj1 = v_setzero_f32(), vpj2 = v_setzero_f32(), vpj3 = v_setzero_f32();
+                v_float32 vx = vlane;
+                for (; x + VL <= w; x += VL) {
+                    const v_float32 mf = v_reinterpret_as_f32(v_ne(v_reinterpret_as_s32(v_load_expand_q(pmk + x)), vzi));
+                    const v_float32 gxv = v_and(v_load(pgx + x), mf), gyv = v_and(v_load(pgy + x), mf);
+                    const v_float32 lv = v_and(v_load(pl + x), mf);
+                    const v_float32 a = v_add(v_mul(vr00, gxv), v_mul(vr01, gyv));
+                    const v_float32 b = v_add(v_mul(vr10, gxv), v_mul(vr11, gyv));
+                    const v_float32 hatX = v_sub(vnfyh0, v_mul(vx, vh1));
+                    const v_float32 hatY = v_sub(v_mul(vx, vh0), vfyh1);
+                    const v_float32 r = v_add(v_mul(a, hatX), v_mul(b, hatY));
+                    const v_float32 l = v_mul(vlsc, lv);
+                    const v_float32 uu0 = v_mul(r, r), uu1 = v_mul(r, a), uu2 = v_mul(r, b), uu3 = v_mul(r, l), uu4 = v_mul(a, a), uu5 = v_mul(a, b), uu6 = v_mul(a, l), uu7 = v_mul(b, b), uu8 = v_mul(b, l), uu9 = v_mul(l, l);
+                    vm0_0 = v_add(vm0_0, uu0);
+                    vm1_0 = v_add(vm1_0, uu1);
+                    vm2_0 = v_add(vm2_0, uu2);
+                    vm3_0 = v_add(vm3_0, uu3);
+                    vm4_0 = v_add(vm4_0, uu4);
+                    vm5_0 = v_add(vm5_0, uu5);
+                    vm6_0 = v_add(vm6_0, uu6);
+                    vm7_0 = v_add(vm7_0, uu7);
+                    vm8_0 = v_add(vm8_0, uu8);
+                    vm9_0 = v_add(vm9_0, uu9);
+                    const v_float32 ii = v_sub(v_load(pim + x), vmuI), tt = v_sub(v_load(ptm + x), vmuT);
+                    const v_float32 j0 = r;
+                    const v_float32 j1 = a;
+                    const v_float32 j2 = b;
+                    const v_float32 j3 = l;
+                    vpi0 = v_fma(j0, ii, vpi0);  vpi1 = v_fma(j1, ii, vpi1);  vpi2 = v_fma(j2, ii, vpi2);  vpi3 = v_fma(j3, ii, vpi3);
+                    vpt0 = v_fma(j0, tt, vpt0);  vpt1 = v_fma(j1, tt, vpt1);  vpt2 = v_fma(j2, tt, vpt2);  vpt3 = v_fma(j3, tt, vpt3);
+                    vpj0 = v_add(vpj0, j0);  vpj1 = v_add(vpj1, j1);  vpj2 = v_add(vpj2, j2);  vpj3 = v_add(vpj3, j3);
+                    vx = v_add(vx, vVL);
+                }
+                m0_0 = v_reduce_sum(vm0_0);  m1_0 = v_reduce_sum(vm1_0);  m2_0 = v_reduce_sum(vm2_0);  m3_0 = v_reduce_sum(vm3_0);  m4_0 = v_reduce_sum(vm4_0);  m5_0 = v_reduce_sum(vm5_0);
+                m6_0 = v_reduce_sum(vm6_0);  m7_0 = v_reduce_sum(vm7_0);  m8_0 = v_reduce_sum(vm8_0);  m9_0 = v_reduce_sum(vm9_0);
+                pi0 = v_reduce_sum(vpi0);  pi1 = v_reduce_sum(vpi1);  pi2 = v_reduce_sum(vpi2);  pi3 = v_reduce_sum(vpi3);  pt0 = v_reduce_sum(vpt0);  pt1 = v_reduce_sum(vpt1);
+                pt2 = v_reduce_sum(vpt2);  pt3 = v_reduce_sum(vpt3);  pj0 = v_reduce_sum(vpj0);  pj1 = v_reduce_sum(vpj1);  pj2 = v_reduce_sum(vpj2);  pj3 = v_reduce_sum(vpj3);
+            }
+#endif
+            // hatX, hatY are affine in (x, y): step them along the row
+            float hatX = -((float)x * h1) - (fy * h0);
+            float hatY =  ((float)x * h0) - (fy * h1);
 
-            for (int x = 0; x < w; ++x) {
+            for (; x < w; ++x) {
                 if (pmk[x] != 0) {
                     const float a = r00 * pgx[x] + r01 * pgy[x];
                     const float b = r10 * pgx[x] + r11 * pgy[x];
@@ -350,6 +547,15 @@ struct GNAffine {
         (void)lp;
         double t_m0_0 = 0, t_m0_1 = 0, t_m0_2 = 0, t_m0_3 = 0, t_m0_4 = 0, t_m0_5 = 0, t_m1_0 = 0, t_m1_1 = 0, t_m1_2 = 0, t_m1_3 = 0, t_m1_4 = 0, t_m1_5 = 0, t_m2_0 = 0, t_m2_1 = 0, t_m2_2 = 0, t_m2_3 = 0, t_m2_4 = 0, t_m2_5 = 0;
         double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pi3 = 0, t_pi4 = 0, t_pi5 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0, t_pt3 = 0, t_pt4 = 0, t_pt5 = 0, t_pj0 = 0, t_pj1 = 0, t_pj2 = 0, t_pj3 = 0, t_pj4 = 0, t_pj5 = 0;
+#if FASTECC_SIMD_GN
+        const int VL = VTraits<v_float32>::vlanes();
+        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];
+        for (int k = 0; k < VL; ++k) lane[k] = (float)k;
+        const v_float32 vlane = v_load_aligned(lane), vVL = v_setall_f32((float)VL);
+        const v_float32 vmuI = v_setall_f32(muI), vmuT = v_setall_f32(muT);
+        const v_int32 vzi = v_setzero_s32();
+        const v_float32 vr00 = v_setall_f32(r00), vr01 = v_setall_f32(r01), vr10 = v_setall_f32(r10), vr11 = v_setall_f32(r11);
+#endif
 
         for (int y = y0; y < y1; ++y) {
             const float* pgx = gx.ptr<float>(y - base);
@@ -360,8 +566,43 @@ struct GNAffine {
             const float fy = (float)y;
             float m0_0 = 0, m0_1 = 0, m0_2 = 0, m0_5 = 0, m1_0 = 0, m1_1 = 0, m1_2 = 0, m1_5 = 0, m2_0 = 0, m2_1 = 0, m2_2 = 0, m2_5 = 0;
             float pi0 = 0, pi1 = 0, pi4 = 0, pi5 = 0, pt0 = 0, pt1 = 0, pt4 = 0, pt5 = 0, pj0 = 0, pj1 = 0, pj4 = 0, pj5 = 0;
+            int x = 0;
+#if FASTECC_SIMD_GN
+            {
+                const v_float32 vfy = v_setall_f32(fy);
+                v_float32 vm0_0 = v_setzero_f32(), vm0_1 = v_setzero_f32(), vm0_2 = v_setzero_f32(), vm0_5 = v_setzero_f32(), vm1_0 = v_setzero_f32(), vm1_1 = v_setzero_f32();
+                v_float32 vm1_2 = v_setzero_f32(), vm1_5 = v_setzero_f32(), vm2_0 = v_setzero_f32(), vm2_1 = v_setzero_f32(), vm2_2 = v_setzero_f32(), vm2_5 = v_setzero_f32();
+                v_float32 vpi0 = v_setzero_f32(), vpi1 = v_setzero_f32(), vpi4 = v_setzero_f32(), vpi5 = v_setzero_f32(), vpt0 = v_setzero_f32(), vpt1 = v_setzero_f32();
+                v_float32 vpt4 = v_setzero_f32(), vpt5 = v_setzero_f32(), vpj0 = v_setzero_f32(), vpj1 = v_setzero_f32(), vpj4 = v_setzero_f32(), vpj5 = v_setzero_f32();
+                v_float32 vx = vlane;
+                for (; x + VL <= w; x += VL) {
+                    const v_float32 mf = v_reinterpret_as_f32(v_ne(v_reinterpret_as_s32(v_load_expand_q(pmk + x)), vzi));
+                    const v_float32 gxv = v_and(v_load(pgx + x), mf), gyv = v_and(v_load(pgy + x), mf);
+                    const v_float32 a = v_add(v_mul(vr00, gxv), v_mul(vr01, gyv));
+                    const v_float32 b = v_add(v_mul(vr10, gxv), v_mul(vr11, gyv));
+                    const v_float32 uu0 = v_mul(a, a), uu1 = v_mul(a, b), uu2 = v_mul(b, b);
+                    const v_float32 ww0 = v_mul(vx, vx), ww1 = v_mul(vx, vfy), ww2 = vx;
+                    vm0_0 = v_fma(uu0, ww0, vm0_0);  vm0_1 = v_fma(uu0, ww1, vm0_1);  vm0_2 = v_fma(uu0, ww2, vm0_2);  vm0_5 = v_add(vm0_5, uu0);
+                    vm1_0 = v_fma(uu1, ww0, vm1_0);  vm1_1 = v_fma(uu1, ww1, vm1_1);  vm1_2 = v_fma(uu1, ww2, vm1_2);  vm1_5 = v_add(vm1_5, uu1);
+                    vm2_0 = v_fma(uu2, ww0, vm2_0);  vm2_1 = v_fma(uu2, ww1, vm2_1);  vm2_2 = v_fma(uu2, ww2, vm2_2);  vm2_5 = v_add(vm2_5, uu2);
+                    const v_float32 ii = v_sub(v_load(pim + x), vmuI), tt = v_sub(v_load(ptm + x), vmuT);
+                    const v_float32 j0 = v_mul(a, vx);
+                    const v_float32 j1 = v_mul(b, vx);
+                    const v_float32 j4 = a;
+                    const v_float32 j5 = b;
+                    vpi0 = v_fma(j0, ii, vpi0);  vpi1 = v_fma(j1, ii, vpi1);  vpi4 = v_fma(j4, ii, vpi4);  vpi5 = v_fma(j5, ii, vpi5);
+                    vpt0 = v_fma(j0, tt, vpt0);  vpt1 = v_fma(j1, tt, vpt1);  vpt4 = v_fma(j4, tt, vpt4);  vpt5 = v_fma(j5, tt, vpt5);
+                    vpj0 = v_add(vpj0, j0);  vpj1 = v_add(vpj1, j1);  vpj4 = v_add(vpj4, j4);  vpj5 = v_add(vpj5, j5);
+                    vx = v_add(vx, vVL);
+                }
+                m0_0 = v_reduce_sum(vm0_0);  m0_1 = v_reduce_sum(vm0_1);  m0_2 = v_reduce_sum(vm0_2);  m0_5 = v_reduce_sum(vm0_5);  m1_0 = v_reduce_sum(vm1_0);  m1_1 = v_reduce_sum(vm1_1);
+                m1_2 = v_reduce_sum(vm1_2);  m1_5 = v_reduce_sum(vm1_5);  m2_0 = v_reduce_sum(vm2_0);  m2_1 = v_reduce_sum(vm2_1);  m2_2 = v_reduce_sum(vm2_2);  m2_5 = v_reduce_sum(vm2_5);
+                pi0 = v_reduce_sum(vpi0);  pi1 = v_reduce_sum(vpi1);  pi4 = v_reduce_sum(vpi4);  pi5 = v_reduce_sum(vpi5);  pt0 = v_reduce_sum(vpt0);  pt1 = v_reduce_sum(vpt1);
+                pt4 = v_reduce_sum(vpt4);  pt5 = v_reduce_sum(vpt5);  pj0 = v_reduce_sum(vpj0);  pj1 = v_reduce_sum(vpj1);  pj4 = v_reduce_sum(vpj4);  pj5 = v_reduce_sum(vpj5);
+            }
+#endif
 
-            for (int x = 0; x < w; ++x) {
+            for (; x < w; ++x) {
                 if (pmk[x] != 0) {
                     const float fx = (float)x;
                     const float a = r00 * pgx[x] + r01 * pgy[x];
@@ -422,6 +663,16 @@ struct GNAffineL {
         const int w = gx.cols;
         double t_m0_0 = 0, t_m0_1 = 0, t_m0_2 = 0, t_m0_3 = 0, t_m0_4 = 0, t_m0_5 = 0, t_m1_0 = 0, t_m1_1 = 0, t_m1_2 = 0, t_m1_3 = 0, t_m1_4 = 0, t_m1_5 = 0, t_m2_2 = 0, t_m2_4 = 0, t_m2_5 = 0, t_m3_0 = 0, t_m3_1 = 0, t_m3_2 = 0, t_m3_3 = 0, t_m3_4 = 0, t_m3_5 = 0, t_m4_2 = 0, t_m4_4 = 0, t_m4_5 = 0, t_m5_5 = 0;
         double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pi3 = 0, t_pi4 = 0, t_pi5 = 0, t_pi6 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0, t_pt3 = 0, t_pt4 = 0, t_pt5 = 0, t_pt6 = 0, t_pj0 = 0, t_pj1 = 0, t_pj2 = 0, t_pj3 = 0, t_pj4 = 0, t_pj5 = 0, t_pj6 = 0;
+#if FASTECC_SIMD_GN
+        const int VL = VTraits<v_float32>::vlanes();
+        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];
+        for (int k = 0; k < VL; ++k) lane[k] = (float)k;
+        const v_float32 vlane = v_load_aligned(lane), vVL = v_setall_f32((float)VL);
+        const v_float32 vmuI = v_setall_f32(muI), vmuT = v_setall_f32(muT);
+        const v_int32 vzi = v_setzero_s32();
+        const v_float32 vr00 = v_setall_f32(r00), vr01 = v_setall_f32(r01), vr10 = v_setall_f32(r10), vr11 = v_setall_f32(r11);
+        const v_float32 vlsc = v_setall_f32(lsc);
+#endif
 
         for (int y = y0; y < y1; ++y) {
             const float* pgx = gx.ptr<float>(y - base);
@@ -433,8 +684,53 @@ struct GNAffineL {
             const float fy = (float)y;
             float m0_0 = 0, m0_1 = 0, m0_2 = 0, m0_5 = 0, m1_0 = 0, m1_1 = 0, m1_2 = 0, m1_5 = 0, m2_2 = 0, m2_5 = 0, m3_0 = 0, m3_1 = 0, m3_2 = 0, m3_5 = 0, m4_2 = 0, m4_5 = 0, m5_5 = 0;
             float pi0 = 0, pi1 = 0, pi4 = 0, pi5 = 0, pi6 = 0, pt0 = 0, pt1 = 0, pt4 = 0, pt5 = 0, pt6 = 0, pj0 = 0, pj1 = 0, pj4 = 0, pj5 = 0, pj6 = 0;
+            int x = 0;
+#if FASTECC_SIMD_GN
+            {
+                const v_float32 vfy = v_setall_f32(fy);
+                v_float32 vm0_0 = v_setzero_f32(), vm0_1 = v_setzero_f32(), vm0_2 = v_setzero_f32(), vm0_5 = v_setzero_f32(), vm1_0 = v_setzero_f32(), vm1_1 = v_setzero_f32();
+                v_float32 vm1_2 = v_setzero_f32(), vm1_5 = v_setzero_f32(), vm2_2 = v_setzero_f32(), vm2_5 = v_setzero_f32(), vm3_0 = v_setzero_f32(), vm3_1 = v_setzero_f32();
+                v_float32 vm3_2 = v_setzero_f32(), vm3_5 = v_setzero_f32(), vm4_2 = v_setzero_f32(), vm4_5 = v_setzero_f32(), vm5_5 = v_setzero_f32();
+                v_float32 vpi0 = v_setzero_f32(), vpi1 = v_setzero_f32(), vpi4 = v_setzero_f32(), vpi5 = v_setzero_f32(), vpi6 = v_setzero_f32(), vpt0 = v_setzero_f32();
+                v_float32 vpt1 = v_setzero_f32(), vpt4 = v_setzero_f32(), vpt5 = v_setzero_f32(), vpt6 = v_setzero_f32(), vpj0 = v_setzero_f32(), vpj1 = v_setzero_f32();
+                v_float32 vpj4 = v_setzero_f32(), vpj5 = v_setzero_f32(), vpj6 = v_setzero_f32();
+                v_float32 vx = vlane;
+                for (; x + VL <= w; x += VL) {
+                    const v_float32 mf = v_reinterpret_as_f32(v_ne(v_reinterpret_as_s32(v_load_expand_q(pmk + x)), vzi));
+                    const v_float32 gxv = v_and(v_load(pgx + x), mf), gyv = v_and(v_load(pgy + x), mf);
+                    const v_float32 lv = v_and(v_load(pl + x), mf);
+                    const v_float32 a = v_add(v_mul(vr00, gxv), v_mul(vr01, gyv));
+                    const v_float32 b = v_add(v_mul(vr10, gxv), v_mul(vr11, gyv));
+                    const v_float32 l = v_mul(vlsc, lv);
+                    const v_float32 uu0 = v_mul(a, a), uu1 = v_mul(a, b), uu2 = v_mul(a, l), uu3 = v_mul(b, b), uu4 = v_mul(b, l), uu5 = v_mul(l, l);
+                    const v_float32 ww0 = v_mul(vx, vx), ww1 = v_mul(vx, vfy), ww2 = vx;
+                    vm0_0 = v_fma(uu0, ww0, vm0_0);  vm0_1 = v_fma(uu0, ww1, vm0_1);  vm0_2 = v_fma(uu0, ww2, vm0_2);  vm0_5 = v_add(vm0_5, uu0);
+                    vm1_0 = v_fma(uu1, ww0, vm1_0);  vm1_1 = v_fma(uu1, ww1, vm1_1);  vm1_2 = v_fma(uu1, ww2, vm1_2);  vm1_5 = v_add(vm1_5, uu1);
+                    vm2_2 = v_fma(uu2, ww2, vm2_2);  vm2_5 = v_add(vm2_5, uu2);
+                    vm3_0 = v_fma(uu3, ww0, vm3_0);  vm3_1 = v_fma(uu3, ww1, vm3_1);  vm3_2 = v_fma(uu3, ww2, vm3_2);  vm3_5 = v_add(vm3_5, uu3);
+                    vm4_2 = v_fma(uu4, ww2, vm4_2);  vm4_5 = v_add(vm4_5, uu4);
+                    vm5_5 = v_add(vm5_5, uu5);
+                    const v_float32 ii = v_sub(v_load(pim + x), vmuI), tt = v_sub(v_load(ptm + x), vmuT);
+                    const v_float32 j0 = v_mul(a, vx);
+                    const v_float32 j1 = v_mul(b, vx);
+                    const v_float32 j4 = a;
+                    const v_float32 j5 = b;
+                    const v_float32 j6 = l;
+                    vpi0 = v_fma(j0, ii, vpi0);  vpi1 = v_fma(j1, ii, vpi1);  vpi4 = v_fma(j4, ii, vpi4);  vpi5 = v_fma(j5, ii, vpi5);  vpi6 = v_fma(j6, ii, vpi6);
+                    vpt0 = v_fma(j0, tt, vpt0);  vpt1 = v_fma(j1, tt, vpt1);  vpt4 = v_fma(j4, tt, vpt4);  vpt5 = v_fma(j5, tt, vpt5);  vpt6 = v_fma(j6, tt, vpt6);
+                    vpj0 = v_add(vpj0, j0);  vpj1 = v_add(vpj1, j1);  vpj4 = v_add(vpj4, j4);  vpj5 = v_add(vpj5, j5);  vpj6 = v_add(vpj6, j6);
+                    vx = v_add(vx, vVL);
+                }
+                m0_0 = v_reduce_sum(vm0_0);  m0_1 = v_reduce_sum(vm0_1);  m0_2 = v_reduce_sum(vm0_2);  m0_5 = v_reduce_sum(vm0_5);  m1_0 = v_reduce_sum(vm1_0);  m1_1 = v_reduce_sum(vm1_1);
+                m1_2 = v_reduce_sum(vm1_2);  m1_5 = v_reduce_sum(vm1_5);  m2_2 = v_reduce_sum(vm2_2);  m2_5 = v_reduce_sum(vm2_5);  m3_0 = v_reduce_sum(vm3_0);  m3_1 = v_reduce_sum(vm3_1);
+                m3_2 = v_reduce_sum(vm3_2);  m3_5 = v_reduce_sum(vm3_5);  m4_2 = v_reduce_sum(vm4_2);  m4_5 = v_reduce_sum(vm4_5);  m5_5 = v_reduce_sum(vm5_5);
+                pi0 = v_reduce_sum(vpi0);  pi1 = v_reduce_sum(vpi1);  pi4 = v_reduce_sum(vpi4);  pi5 = v_reduce_sum(vpi5);  pi6 = v_reduce_sum(vpi6);  pt0 = v_reduce_sum(vpt0);
+                pt1 = v_reduce_sum(vpt1);  pt4 = v_reduce_sum(vpt4);  pt5 = v_reduce_sum(vpt5);  pt6 = v_reduce_sum(vpt6);  pj0 = v_reduce_sum(vpj0);  pj1 = v_reduce_sum(vpj1);
+                pj4 = v_reduce_sum(vpj4);  pj5 = v_reduce_sum(vpj5);  pj6 = v_reduce_sum(vpj6);
+            }
+#endif
 
-            for (int x = 0; x < w; ++x) {
+            for (; x < w; ++x) {
                 if (pmk[x] != 0) {
                     const float fx = (float)x;
                     const float a = r00 * pgx[x] + r01 * pgy[x];
@@ -505,6 +801,18 @@ struct GNHomography {
         (void)lp;
         double t_m0_0 = 0, t_m0_1 = 0, t_m0_2 = 0, t_m0_3 = 0, t_m0_4 = 0, t_m0_5 = 0, t_m1_0 = 0, t_m1_1 = 0, t_m1_2 = 0, t_m1_3 = 0, t_m1_4 = 0, t_m1_5 = 0, t_m2_0 = 0, t_m2_1 = 0, t_m2_2 = 0, t_m2_3 = 0, t_m2_4 = 0, t_m3_0 = 0, t_m3_1 = 0, t_m3_2 = 0, t_m3_3 = 0, t_m3_4 = 0, t_m3_5 = 0, t_m4_0 = 0, t_m4_1 = 0, t_m4_2 = 0, t_m4_3 = 0, t_m4_4 = 0, t_m5_0 = 0, t_m5_1 = 0, t_m5_3 = 0;
         double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pi3 = 0, t_pi4 = 0, t_pi5 = 0, t_pi6 = 0, t_pi7 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0, t_pt3 = 0, t_pt4 = 0, t_pt5 = 0, t_pt6 = 0, t_pt7 = 0, t_pj0 = 0, t_pj1 = 0, t_pj2 = 0, t_pj3 = 0, t_pj4 = 0, t_pj5 = 0, t_pj6 = 0, t_pj7 = 0;
+#if FASTECC_SIMD_GN
+        const int VL = VTraits<v_float32>::vlanes();
+        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];
+        for (int k = 0; k < VL; ++k) lane[k] = (float)k;
+        const v_float32 vlane = v_load_aligned(lane), vVL = v_setall_f32((float)VL);
+        const v_float32 vmuI = v_setall_f32(muI), vmuT = v_setall_f32(muT);
+        const v_int32 vzi = v_setzero_s32();
+        const v_float32 vr00 = v_setall_f32(r00), vr01 = v_setall_f32(r01), vr10 = v_setall_f32(r10), vr11 = v_setall_f32(r11);
+        const v_float32 vh2 = v_setall_f32(h2), vh6 = v_setall_f32(h6), vh7 = v_setall_f32(h7);
+        const v_float32 vnh0 = v_setall_f32(-h0), vnh1 = v_setall_f32(-h1);
+        const v_float32 vone = v_setall_f32(1.f), vzf = v_setzero_f32();
+#endif
 
         for (int y = y0; y < y1; ++y) {
             const float* pgx = gx.ptr<float>(y - base);
@@ -515,8 +823,61 @@ struct GNHomography {
             const float fy = (float)y;
             float m0_0 = 0, m0_1 = 0, m0_2 = 0, m0_5 = 0, m1_0 = 0, m1_1 = 0, m1_2 = 0, m1_5 = 0, m2_0 = 0, m2_1 = 0, m2_2 = 0, m2_5 = 0, m3_0 = 0, m3_1 = 0, m3_2 = 0, m3_5 = 0, m4_0 = 0, m4_1 = 0, m4_2 = 0, m4_5 = 0, m5_0 = 0, m5_1 = 0, m5_5 = 0;
             float pi0 = 0, pi1 = 0, pi2 = 0, pi6 = 0, pi7 = 0, pie2 = 0, pt0 = 0, pt1 = 0, pt2 = 0, pt6 = 0, pt7 = 0, pte2 = 0, pj0 = 0, pj1 = 0, pj2 = 0, pj6 = 0, pj7 = 0, pje2 = 0;
+            int x = 0;
+#if FASTECC_SIMD_GN
+            {
+                const v_float32 vfy = v_setall_f32(fy);
+                const v_float32 vfyh3 = v_setall_f32(fy * h3), vfyh4 = v_setall_f32(fy * h4), vfyh5 = v_setall_f32(fy * h5);
+                v_float32 vm0_0 = v_setzero_f32(), vm0_1 = v_setzero_f32(), vm0_2 = v_setzero_f32(), vm0_5 = v_setzero_f32(), vm1_0 = v_setzero_f32(), vm1_1 = v_setzero_f32();
+                v_float32 vm1_2 = v_setzero_f32(), vm1_5 = v_setzero_f32(), vm2_0 = v_setzero_f32(), vm2_1 = v_setzero_f32(), vm2_2 = v_setzero_f32(), vm2_5 = v_setzero_f32();
+                v_float32 vm3_0 = v_setzero_f32(), vm3_1 = v_setzero_f32(), vm3_2 = v_setzero_f32(), vm3_5 = v_setzero_f32(), vm4_0 = v_setzero_f32(), vm4_1 = v_setzero_f32();
+                v_float32 vm4_2 = v_setzero_f32(), vm4_5 = v_setzero_f32(), vm5_0 = v_setzero_f32(), vm5_1 = v_setzero_f32(), vm5_5 = v_setzero_f32();
+                v_float32 vpi0 = v_setzero_f32(), vpi1 = v_setzero_f32(), vpi2 = v_setzero_f32(), vpi6 = v_setzero_f32(), vpi7 = v_setzero_f32(), vpie2 = v_setzero_f32();
+                v_float32 vpt0 = v_setzero_f32(), vpt1 = v_setzero_f32(), vpt2 = v_setzero_f32(), vpt6 = v_setzero_f32(), vpt7 = v_setzero_f32(), vpte2 = v_setzero_f32();
+                v_float32 vpj0 = v_setzero_f32(), vpj1 = v_setzero_f32(), vpj2 = v_setzero_f32(), vpj6 = v_setzero_f32(), vpj7 = v_setzero_f32(), vpje2 = v_setzero_f32();
+                v_float32 vx = vlane;
+                for (; x + VL <= w; x += VL) {
+                    const v_float32 mf = v_reinterpret_as_f32(v_ne(v_reinterpret_as_s32(v_load_expand_q(pmk + x)), vzi));
+                    const v_float32 gxv = v_and(v_load(pgx + x), mf), gyv = v_and(v_load(pgy + x), mf);
+                    const v_float32 gxr = v_add(v_mul(vr00, gxv), v_mul(vr01, gyv));
+                    const v_float32 gyr = v_add(v_mul(vr10, gxv), v_mul(vr11, gyv));
+                    const v_float32 den = v_add(v_add(v_mul(vx, vh2), vfyh5), vone);
+                    const v_float32 inv = v_select(v_ne(den, vzf), v_div(vone, den), vzf);
+                    const v_float32 a = v_mul(gxr, inv);
+                    const v_float32 b = v_mul(gyr, inv);
+                    const v_float32 hatX = v_mul(v_sub(v_sub(v_mul(vx, vnh0), vfyh3), vh6), inv);
+                    const v_float32 hatY = v_mul(v_sub(v_sub(v_mul(vx, vnh1), vfyh4), vh7), inv);
+                    const v_float32 e = v_add(v_mul(hatX, a), v_mul(hatY, b));
+                    const v_float32 uu0 = v_mul(a, a), uu1 = v_mul(a, b), uu2 = v_mul(a, e), uu3 = v_mul(b, b), uu4 = v_mul(b, e), uu5 = v_mul(e, e);
+                    const v_float32 ww0 = v_mul(vx, vx), ww1 = v_mul(vx, vfy), ww2 = vx;
+                    vm0_0 = v_fma(uu0, ww0, vm0_0);  vm0_1 = v_fma(uu0, ww1, vm0_1);  vm0_2 = v_fma(uu0, ww2, vm0_2);  vm0_5 = v_add(vm0_5, uu0);
+                    vm1_0 = v_fma(uu1, ww0, vm1_0);  vm1_1 = v_fma(uu1, ww1, vm1_1);  vm1_2 = v_fma(uu1, ww2, vm1_2);  vm1_5 = v_add(vm1_5, uu1);
+                    vm2_0 = v_fma(uu2, ww0, vm2_0);  vm2_1 = v_fma(uu2, ww1, vm2_1);  vm2_2 = v_fma(uu2, ww2, vm2_2);  vm2_5 = v_add(vm2_5, uu2);
+                    vm3_0 = v_fma(uu3, ww0, vm3_0);  vm3_1 = v_fma(uu3, ww1, vm3_1);  vm3_2 = v_fma(uu3, ww2, vm3_2);  vm3_5 = v_add(vm3_5, uu3);
+                    vm4_0 = v_fma(uu4, ww0, vm4_0);  vm4_1 = v_fma(uu4, ww1, vm4_1);  vm4_2 = v_fma(uu4, ww2, vm4_2);  vm4_5 = v_add(vm4_5, uu4);
+                    vm5_0 = v_fma(uu5, ww0, vm5_0);  vm5_1 = v_fma(uu5, ww1, vm5_1);  vm5_5 = v_add(vm5_5, uu5);
+                    const v_float32 ii = v_sub(v_load(pim + x), vmuI), tt = v_sub(v_load(ptm + x), vmuT);
+                    const v_float32 j0 = v_mul(a, vx);
+                    const v_float32 j1 = v_mul(b, vx);
+                    const v_float32 j2 = v_mul(e, vx);
+                    const v_float32 j6 = a;
+                    const v_float32 j7 = b;
+                    vpi0 = v_fma(j0, ii, vpi0);  vpi1 = v_fma(j1, ii, vpi1);  vpi2 = v_fma(j2, ii, vpi2);  vpi6 = v_fma(j6, ii, vpi6);  vpi7 = v_fma(j7, ii, vpi7);  vpie2 = v_fma(e, ii, vpie2);
+                    vpt0 = v_fma(j0, tt, vpt0);  vpt1 = v_fma(j1, tt, vpt1);  vpt2 = v_fma(j2, tt, vpt2);  vpt6 = v_fma(j6, tt, vpt6);  vpt7 = v_fma(j7, tt, vpt7);  vpte2 = v_fma(e, tt, vpte2);
+                    vpj0 = v_add(vpj0, j0);  vpj1 = v_add(vpj1, j1);  vpj2 = v_add(vpj2, j2);  vpj6 = v_add(vpj6, j6);  vpj7 = v_add(vpj7, j7);  vpje2 = v_add(vpje2, e);
+                    vx = v_add(vx, vVL);
+                }
+                m0_0 = v_reduce_sum(vm0_0);  m0_1 = v_reduce_sum(vm0_1);  m0_2 = v_reduce_sum(vm0_2);  m0_5 = v_reduce_sum(vm0_5);  m1_0 = v_reduce_sum(vm1_0);  m1_1 = v_reduce_sum(vm1_1);
+                m1_2 = v_reduce_sum(vm1_2);  m1_5 = v_reduce_sum(vm1_5);  m2_0 = v_reduce_sum(vm2_0);  m2_1 = v_reduce_sum(vm2_1);  m2_2 = v_reduce_sum(vm2_2);  m2_5 = v_reduce_sum(vm2_5);
+                m3_0 = v_reduce_sum(vm3_0);  m3_1 = v_reduce_sum(vm3_1);  m3_2 = v_reduce_sum(vm3_2);  m3_5 = v_reduce_sum(vm3_5);  m4_0 = v_reduce_sum(vm4_0);  m4_1 = v_reduce_sum(vm4_1);
+                m4_2 = v_reduce_sum(vm4_2);  m4_5 = v_reduce_sum(vm4_5);  m5_0 = v_reduce_sum(vm5_0);  m5_1 = v_reduce_sum(vm5_1);  m5_5 = v_reduce_sum(vm5_5);
+                pi0 = v_reduce_sum(vpi0);  pi1 = v_reduce_sum(vpi1);  pi2 = v_reduce_sum(vpi2);  pi6 = v_reduce_sum(vpi6);  pi7 = v_reduce_sum(vpi7);  pie2 = v_reduce_sum(vpie2);
+                pt0 = v_reduce_sum(vpt0);  pt1 = v_reduce_sum(vpt1);  pt2 = v_reduce_sum(vpt2);  pt6 = v_reduce_sum(vpt6);  pt7 = v_reduce_sum(vpt7);  pte2 = v_reduce_sum(vpte2);
+                pj0 = v_reduce_sum(vpj0);  pj1 = v_reduce_sum(vpj1);  pj2 = v_reduce_sum(vpj2);  pj6 = v_reduce_sum(vpj6);  pj7 = v_reduce_sum(vpj7);  pje2 = v_reduce_sum(vpje2);
+            }
+#endif
 
-            for (int x = 0; x < w; ++x) {
+            for (; x < w; ++x) {
                 if (pmk[x] != 0) {
                     const float fx = (float)x;
                     const float gxv = r00 * pgx[x] + r01 * pgy[x];
@@ -595,6 +956,19 @@ struct GNHomographyL {
         const int w = gx.cols;
         double t_m0_0 = 0, t_m0_1 = 0, t_m0_2 = 0, t_m0_3 = 0, t_m0_4 = 0, t_m0_5 = 0, t_m1_0 = 0, t_m1_1 = 0, t_m1_2 = 0, t_m1_3 = 0, t_m1_4 = 0, t_m1_5 = 0, t_m2_0 = 0, t_m2_1 = 0, t_m2_2 = 0, t_m2_3 = 0, t_m2_4 = 0, t_m3_2 = 0, t_m3_4 = 0, t_m3_5 = 0, t_m4_0 = 0, t_m4_1 = 0, t_m4_2 = 0, t_m4_3 = 0, t_m4_4 = 0, t_m4_5 = 0, t_m5_0 = 0, t_m5_1 = 0, t_m5_2 = 0, t_m5_3 = 0, t_m5_4 = 0, t_m6_2 = 0, t_m6_4 = 0, t_m6_5 = 0, t_m7_0 = 0, t_m7_1 = 0, t_m7_3 = 0, t_m8_2 = 0, t_m8_4 = 0, t_m9_5 = 0;
         double t_pi0 = 0, t_pi1 = 0, t_pi2 = 0, t_pi3 = 0, t_pi4 = 0, t_pi5 = 0, t_pi6 = 0, t_pi7 = 0, t_pi8 = 0, t_pt0 = 0, t_pt1 = 0, t_pt2 = 0, t_pt3 = 0, t_pt4 = 0, t_pt5 = 0, t_pt6 = 0, t_pt7 = 0, t_pt8 = 0, t_pj0 = 0, t_pj1 = 0, t_pj2 = 0, t_pj3 = 0, t_pj4 = 0, t_pj5 = 0, t_pj6 = 0, t_pj7 = 0, t_pj8 = 0;
+#if FASTECC_SIMD_GN
+        const int VL = VTraits<v_float32>::vlanes();
+        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];
+        for (int k = 0; k < VL; ++k) lane[k] = (float)k;
+        const v_float32 vlane = v_load_aligned(lane), vVL = v_setall_f32((float)VL);
+        const v_float32 vmuI = v_setall_f32(muI), vmuT = v_setall_f32(muT);
+        const v_int32 vzi = v_setzero_s32();
+        const v_float32 vr00 = v_setall_f32(r00), vr01 = v_setall_f32(r01), vr10 = v_setall_f32(r10), vr11 = v_setall_f32(r11);
+        const v_float32 vh2 = v_setall_f32(h2), vh6 = v_setall_f32(h6), vh7 = v_setall_f32(h7);
+        const v_float32 vnh0 = v_setall_f32(-h0), vnh1 = v_setall_f32(-h1);
+        const v_float32 vone = v_setall_f32(1.f), vzf = v_setzero_f32();
+        const v_float32 vlsc = v_setall_f32(lsc);
+#endif
 
         for (int y = y0; y < y1; ++y) {
             const float* pgx = gx.ptr<float>(y - base);
@@ -606,8 +980,72 @@ struct GNHomographyL {
             const float fy = (float)y;
             float m0_0 = 0, m0_1 = 0, m0_2 = 0, m0_5 = 0, m1_0 = 0, m1_1 = 0, m1_2 = 0, m1_5 = 0, m2_0 = 0, m2_1 = 0, m2_2 = 0, m2_5 = 0, m3_2 = 0, m3_5 = 0, m4_0 = 0, m4_1 = 0, m4_2 = 0, m4_5 = 0, m5_0 = 0, m5_1 = 0, m5_2 = 0, m5_5 = 0, m6_2 = 0, m6_5 = 0, m7_0 = 0, m7_1 = 0, m7_5 = 0, m8_2 = 0, m8_5 = 0, m9_5 = 0;
             float pi0 = 0, pi1 = 0, pi2 = 0, pi6 = 0, pi7 = 0, pi8 = 0, pie2 = 0, pt0 = 0, pt1 = 0, pt2 = 0, pt6 = 0, pt7 = 0, pt8 = 0, pte2 = 0, pj0 = 0, pj1 = 0, pj2 = 0, pj6 = 0, pj7 = 0, pj8 = 0, pje2 = 0;
+            int x = 0;
+#if FASTECC_SIMD_GN
+            {
+                const v_float32 vfy = v_setall_f32(fy);
+                const v_float32 vfyh3 = v_setall_f32(fy * h3), vfyh4 = v_setall_f32(fy * h4), vfyh5 = v_setall_f32(fy * h5);
+                v_float32 vm0_0 = v_setzero_f32(), vm0_1 = v_setzero_f32(), vm0_2 = v_setzero_f32(), vm0_5 = v_setzero_f32(), vm1_0 = v_setzero_f32(), vm1_1 = v_setzero_f32();
+                v_float32 vm1_2 = v_setzero_f32(), vm1_5 = v_setzero_f32(), vm2_0 = v_setzero_f32(), vm2_1 = v_setzero_f32(), vm2_2 = v_setzero_f32(), vm2_5 = v_setzero_f32();
+                v_float32 vm3_2 = v_setzero_f32(), vm3_5 = v_setzero_f32(), vm4_0 = v_setzero_f32(), vm4_1 = v_setzero_f32(), vm4_2 = v_setzero_f32(), vm4_5 = v_setzero_f32();
+                v_float32 vm5_0 = v_setzero_f32(), vm5_1 = v_setzero_f32(), vm5_2 = v_setzero_f32(), vm5_5 = v_setzero_f32(), vm6_2 = v_setzero_f32(), vm6_5 = v_setzero_f32();
+                v_float32 vm7_0 = v_setzero_f32(), vm7_1 = v_setzero_f32(), vm7_5 = v_setzero_f32(), vm8_2 = v_setzero_f32(), vm8_5 = v_setzero_f32(), vm9_5 = v_setzero_f32();
+                v_float32 vpi0 = v_setzero_f32(), vpi1 = v_setzero_f32(), vpi2 = v_setzero_f32(), vpi6 = v_setzero_f32(), vpi7 = v_setzero_f32(), vpi8 = v_setzero_f32();
+                v_float32 vpie2 = v_setzero_f32(), vpt0 = v_setzero_f32(), vpt1 = v_setzero_f32(), vpt2 = v_setzero_f32(), vpt6 = v_setzero_f32(), vpt7 = v_setzero_f32();
+                v_float32 vpt8 = v_setzero_f32(), vpte2 = v_setzero_f32(), vpj0 = v_setzero_f32(), vpj1 = v_setzero_f32(), vpj2 = v_setzero_f32(), vpj6 = v_setzero_f32();
+                v_float32 vpj7 = v_setzero_f32(), vpj8 = v_setzero_f32(), vpje2 = v_setzero_f32();
+                v_float32 vx = vlane;
+                for (; x + VL <= w; x += VL) {
+                    const v_float32 mf = v_reinterpret_as_f32(v_ne(v_reinterpret_as_s32(v_load_expand_q(pmk + x)), vzi));
+                    const v_float32 gxv = v_and(v_load(pgx + x), mf), gyv = v_and(v_load(pgy + x), mf);
+                    const v_float32 lv = v_and(v_load(pl + x), mf);
+                    const v_float32 gxr = v_add(v_mul(vr00, gxv), v_mul(vr01, gyv));
+                    const v_float32 gyr = v_add(v_mul(vr10, gxv), v_mul(vr11, gyv));
+                    const v_float32 den = v_add(v_add(v_mul(vx, vh2), vfyh5), vone);
+                    const v_float32 inv = v_select(v_ne(den, vzf), v_div(vone, den), vzf);
+                    const v_float32 a = v_mul(gxr, inv);
+                    const v_float32 b = v_mul(gyr, inv);
+                    const v_float32 hatX = v_mul(v_sub(v_sub(v_mul(vx, vnh0), vfyh3), vh6), inv);
+                    const v_float32 hatY = v_mul(v_sub(v_sub(v_mul(vx, vnh1), vfyh4), vh7), inv);
+                    const v_float32 e = v_add(v_mul(hatX, a), v_mul(hatY, b));
+                    const v_float32 l = v_mul(vlsc, lv);
+                    const v_float32 uu0 = v_mul(a, a), uu1 = v_mul(a, b), uu2 = v_mul(a, e), uu3 = v_mul(a, l), uu4 = v_mul(b, b), uu5 = v_mul(b, e), uu6 = v_mul(b, l), uu7 = v_mul(e, e), uu8 = v_mul(e, l), uu9 = v_mul(l, l);
+                    const v_float32 ww0 = v_mul(vx, vx), ww1 = v_mul(vx, vfy), ww2 = vx;
+                    vm0_0 = v_fma(uu0, ww0, vm0_0);  vm0_1 = v_fma(uu0, ww1, vm0_1);  vm0_2 = v_fma(uu0, ww2, vm0_2);  vm0_5 = v_add(vm0_5, uu0);
+                    vm1_0 = v_fma(uu1, ww0, vm1_0);  vm1_1 = v_fma(uu1, ww1, vm1_1);  vm1_2 = v_fma(uu1, ww2, vm1_2);  vm1_5 = v_add(vm1_5, uu1);
+                    vm2_0 = v_fma(uu2, ww0, vm2_0);  vm2_1 = v_fma(uu2, ww1, vm2_1);  vm2_2 = v_fma(uu2, ww2, vm2_2);  vm2_5 = v_add(vm2_5, uu2);
+                    vm3_2 = v_fma(uu3, ww2, vm3_2);  vm3_5 = v_add(vm3_5, uu3);
+                    vm4_0 = v_fma(uu4, ww0, vm4_0);  vm4_1 = v_fma(uu4, ww1, vm4_1);  vm4_2 = v_fma(uu4, ww2, vm4_2);  vm4_5 = v_add(vm4_5, uu4);
+                    vm5_0 = v_fma(uu5, ww0, vm5_0);  vm5_1 = v_fma(uu5, ww1, vm5_1);  vm5_2 = v_fma(uu5, ww2, vm5_2);  vm5_5 = v_add(vm5_5, uu5);
+                    vm6_2 = v_fma(uu6, ww2, vm6_2);  vm6_5 = v_add(vm6_5, uu6);
+                    vm7_0 = v_fma(uu7, ww0, vm7_0);  vm7_1 = v_fma(uu7, ww1, vm7_1);  vm7_5 = v_add(vm7_5, uu7);
+                    vm8_2 = v_fma(uu8, ww2, vm8_2);  vm8_5 = v_add(vm8_5, uu8);
+                    vm9_5 = v_add(vm9_5, uu9);
+                    const v_float32 ii = v_sub(v_load(pim + x), vmuI), tt = v_sub(v_load(ptm + x), vmuT);
+                    const v_float32 j0 = v_mul(a, vx);
+                    const v_float32 j1 = v_mul(b, vx);
+                    const v_float32 j2 = v_mul(e, vx);
+                    const v_float32 j6 = a;
+                    const v_float32 j7 = b;
+                    const v_float32 j8 = l;
+                    vpi0 = v_fma(j0, ii, vpi0);  vpi1 = v_fma(j1, ii, vpi1);  vpi2 = v_fma(j2, ii, vpi2);  vpi6 = v_fma(j6, ii, vpi6);  vpi7 = v_fma(j7, ii, vpi7);  vpi8 = v_fma(j8, ii, vpi8);  vpie2 = v_fma(e, ii, vpie2);
+                    vpt0 = v_fma(j0, tt, vpt0);  vpt1 = v_fma(j1, tt, vpt1);  vpt2 = v_fma(j2, tt, vpt2);  vpt6 = v_fma(j6, tt, vpt6);  vpt7 = v_fma(j7, tt, vpt7);  vpt8 = v_fma(j8, tt, vpt8);  vpte2 = v_fma(e, tt, vpte2);
+                    vpj0 = v_add(vpj0, j0);  vpj1 = v_add(vpj1, j1);  vpj2 = v_add(vpj2, j2);  vpj6 = v_add(vpj6, j6);  vpj7 = v_add(vpj7, j7);  vpj8 = v_add(vpj8, j8);  vpje2 = v_add(vpje2, e);
+                    vx = v_add(vx, vVL);
+                }
+                m0_0 = v_reduce_sum(vm0_0);  m0_1 = v_reduce_sum(vm0_1);  m0_2 = v_reduce_sum(vm0_2);  m0_5 = v_reduce_sum(vm0_5);  m1_0 = v_reduce_sum(vm1_0);  m1_1 = v_reduce_sum(vm1_1);
+                m1_2 = v_reduce_sum(vm1_2);  m1_5 = v_reduce_sum(vm1_5);  m2_0 = v_reduce_sum(vm2_0);  m2_1 = v_reduce_sum(vm2_1);  m2_2 = v_reduce_sum(vm2_2);  m2_5 = v_reduce_sum(vm2_5);
+                m3_2 = v_reduce_sum(vm3_2);  m3_5 = v_reduce_sum(vm3_5);  m4_0 = v_reduce_sum(vm4_0);  m4_1 = v_reduce_sum(vm4_1);  m4_2 = v_reduce_sum(vm4_2);  m4_5 = v_reduce_sum(vm4_5);
+                m5_0 = v_reduce_sum(vm5_0);  m5_1 = v_reduce_sum(vm5_1);  m5_2 = v_reduce_sum(vm5_2);  m5_5 = v_reduce_sum(vm5_5);  m6_2 = v_reduce_sum(vm6_2);  m6_5 = v_reduce_sum(vm6_5);
+                m7_0 = v_reduce_sum(vm7_0);  m7_1 = v_reduce_sum(vm7_1);  m7_5 = v_reduce_sum(vm7_5);  m8_2 = v_reduce_sum(vm8_2);  m8_5 = v_reduce_sum(vm8_5);  m9_5 = v_reduce_sum(vm9_5);
+                pi0 = v_reduce_sum(vpi0);  pi1 = v_reduce_sum(vpi1);  pi2 = v_reduce_sum(vpi2);  pi6 = v_reduce_sum(vpi6);  pi7 = v_reduce_sum(vpi7);  pi8 = v_reduce_sum(vpi8);
+                pie2 = v_reduce_sum(vpie2);  pt0 = v_reduce_sum(vpt0);  pt1 = v_reduce_sum(vpt1);  pt2 = v_reduce_sum(vpt2);  pt6 = v_reduce_sum(vpt6);  pt7 = v_reduce_sum(vpt7);
+                pt8 = v_reduce_sum(vpt8);  pte2 = v_reduce_sum(vpte2);  pj0 = v_reduce_sum(vpj0);  pj1 = v_reduce_sum(vpj1);  pj2 = v_reduce_sum(vpj2);  pj6 = v_reduce_sum(vpj6);
+                pj7 = v_reduce_sum(vpj7);  pj8 = v_reduce_sum(vpj8);  pje2 = v_reduce_sum(vpje2);
+            }
+#endif
 
-            for (int x = 0; x < w; ++x) {
+            for (; x < w; ++x) {
                 if (pmk[x] != 0) {
                     const float fx = (float)x;
                     const float gxv = r00 * pgx[x] + r01 * pgy[x];

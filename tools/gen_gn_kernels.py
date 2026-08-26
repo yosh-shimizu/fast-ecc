@@ -47,6 +47,19 @@
 # and mask planes.  The full-plane driver passes 0; the single-pass driver
 # hands it stripe buffers whose row 0 is image row y0.  The template plane is
 # always full-size and is indexed by the image row.
+#
+# Vector path.  Under FASTECC_SIMD_GN each row is first run in vectors of
+# VL pixels with OpenCV's universal intrinsics (function form, OpenCV >= 4.7):
+# one partial sum per lane for every live accumulator, reduced into the scalar
+# row accumulators before the scalar loop takes the tail.  Float within a
+# row, double at row end, as before -- the lanes are the same reassociation
+# one level down, and four shorter chains lose less than one long one.  The
+# mask is applied as a bitwise AND on the gradient inputs: every u, j and
+# product downstream of a zeroed gradient is zero, so a masked lane
+# contributes nothing to any sum, and the AND is safe on whatever the
+# gradient planes hold outside the mask.  MSVC will not vectorise these
+# reductions itself under /fp:precise (see the explicit-simd notes), which is
+# why the lanes are written out.
 import io
 import sys
 
@@ -60,13 +73,14 @@ MOTIONS = [
                                               (0, 2), (1, 2)]),
 ]
 
-# per-motion preamble inside the row loop (before the x loop) and per-pixel u
+# per-motion preamble of the scalar loop (after the vector part, so `x` is
+# where the tail starts) and per-pixel u
 PRE = {
     'Translation': '',
     'Euclidean': (
         '        // hatX, hatY are affine in (x, y): step them along the row\n'
-        '        float hatX = -(0.f * h1) - (fy * h0);\n'
-        '        float hatY =  (0.f * h0) - (fy * h1);\n'),
+        '        float hatX = -((float)x * h1) - (fy * h0);\n'
+        '        float hatY =  ((float)x * h0) - (fy * h1);\n'),
     'Affine': '',
     'Homography': '',
 }
@@ -100,6 +114,54 @@ POST = {
     'Euclidean': '            hatX -= h1;  hatY += h0;\n',
 }
 
+# the same per pixel, VL pixels at a time.  gxv, gyv (and lv) are the masked
+# gradient loads; vx the pixel column as float, vfy the row.
+VPIX = {
+    'Translation':
+        '                const v_float32 a = gxv, b = gyv;\n',
+    'Euclidean':
+        '                const v_float32 a = v_add(v_mul(vr00, gxv), v_mul(vr01, gyv));\n'
+        '                const v_float32 b = v_add(v_mul(vr10, gxv), v_mul(vr11, gyv));\n'
+        '                const v_float32 hatX = v_sub(vnfyh0, v_mul(vx, vh1));\n'
+        '                const v_float32 hatY = v_sub(v_mul(vx, vh0), vfyh1);\n'
+        '                const v_float32 r = v_add(v_mul(a, hatX), v_mul(b, hatY));\n',
+    'Affine':
+        '                const v_float32 a = v_add(v_mul(vr00, gxv), v_mul(vr01, gyv));\n'
+        '                const v_float32 b = v_add(v_mul(vr10, gxv), v_mul(vr11, gyv));\n',
+    'Homography':
+        '                const v_float32 gxr = v_add(v_mul(vr00, gxv), v_mul(vr01, gyv));\n'
+        '                const v_float32 gyr = v_add(v_mul(vr10, gxv), v_mul(vr11, gyv));\n'
+        '                const v_float32 den = v_add(v_add(v_mul(vx, vh2), vfyh5), vone);\n'
+        '                const v_float32 inv = v_select(v_ne(den, vzf), v_div(vone, den), vzf);\n'
+        '                const v_float32 a = v_mul(gxr, inv);\n'
+        '                const v_float32 b = v_mul(gyr, inv);\n'
+        '                const v_float32 hatX = v_mul(v_sub(v_sub(v_mul(vx, vnh0), vfyh3), vh6), inv);\n'
+        '                const v_float32 hatY = v_mul(v_sub(v_sub(v_mul(vx, vnh1), vfyh4), vh7), inv);\n'
+        '                const v_float32 e = v_add(v_mul(hatX, a), v_mul(hatY, b));\n',
+}
+VLAPPIX = '                const v_float32 l = v_mul(vlsc, lv);\n'
+
+# broadcast once per rows() call (the warp coefficients) and once per row
+# (what depends on fy)
+VRECOMB = ('        const v_float32 vr00 = v_setall_f32(r00), vr01 = v_setall_f32(r01), '
+           'vr10 = v_setall_f32(r10), vr11 = v_setall_f32(r11);\n')
+VCONST = {
+    'Translation': '',
+    'Euclidean':   VRECOMB + '        const v_float32 vh0 = v_setall_f32(h0), vh1 = v_setall_f32(h1);\n',
+    'Affine':      VRECOMB,
+    'Homography':  VRECOMB +
+        '        const v_float32 vh2 = v_setall_f32(h2), vh6 = v_setall_f32(h6), vh7 = v_setall_f32(h7);\n'
+        '        const v_float32 vnh0 = v_setall_f32(-h0), vnh1 = v_setall_f32(-h1);\n'
+        '        const v_float32 vone = v_setall_f32(1.f), vzf = v_setzero_f32();\n',
+}
+VPRE = {
+    'Translation': '',
+    'Euclidean':   '                const v_float32 vnfyh0 = v_setall_f32(-(fy * h0)), vfyh1 = v_setall_f32(fy * h1);\n',
+    'Affine':      '',
+    'Homography':  '                const v_float32 vfyh3 = v_setall_f32(fy * h3), vfyh4 = v_setall_f32(fy * h4), '
+                   'vfyh5 = v_setall_f32(fy * h5);\n',
+}
+
 RECOMB = '    float r00, r01, r10, r11;   // A^-T of the current warp\n'
 MEANS  = '    float muI, muT;             // masked means of warped image and template\n'
 LAPSC  = '    float lsc;                  // scale of the laplacian column (the pre-filter sigma)\n'
@@ -115,6 +177,23 @@ def tri(n):
     return [(i, j) for i in range(n) for j in range(i, n)]
 
 
+def vdecl(names, per_line=6):
+    """v_float32 declarations of zeroed lane accumulators, a few per line"""
+    lines = []
+    for i in range(0, len(names), per_line):
+        chunk = names[i:i + per_line]
+        lines.append('                v_float32 ' + ', '.join('v%s = v_setzero_f32()' % n for n in chunk) + ';')
+    return lines
+
+
+def vreduce(names, per_line=6):
+    lines = []
+    for i in range(0, len(names), per_line):
+        chunk = names[i:i + per_line]
+        lines.append('                ' + '  '.join('%s = v_reduce_sum(v%s);' % (n, n) for n in chunk))
+    return lines
+
+
 out = []
 for base, K0, L, U0, cols0 in MOTIONS:
     for lap in (False, True):
@@ -126,6 +205,7 @@ for base, K0, L, U0, cols0 in MOTIONS:
         kp = tri(K)
         lp = tri(L)
         wn = ['fx', 'fy', '1.f'] if L == 3 else ['1.f']
+        vwn = ['vx', 'vfy', '1.f'] if L == 3 else ['1.f']
 
         # lp indices whose w-pair does not involve fx are constant along a row.
         # For L == 3 those are (fy,fy), (fy,1) and (1,1); the last is the one
@@ -178,6 +258,7 @@ for base, K0, L, U0, cols0 in MOTIONS:
                     ['pt' + e for e in extra] +
                     ['pj%d' % s for s in range(P) if s not in hoistp] +
                     ['pj' + e for e in extra])
+        kept = [s for s in range(P) if s not in hoistp]
 
         o = []
         o.append('// ---- %s: K=%d L=%d P=%d, %d Gram sums (%d live) + %d projection sums ----'
@@ -204,6 +285,19 @@ for base, K0, L, U0, cols0 in MOTIONS:
         # double totals
         o.append('        double ' + ', '.join('t_%s = 0' % a for a in acc) + ';')
         o.append('        double ' + ', '.join('t_%s = 0' % p for p in proj) + ';')
+        # vector constants of the call
+        o.append('#if FASTECC_SIMD_GN')
+        o.append('        const int VL = VTraits<v_float32>::vlanes();')
+        o.append('        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];')
+        o.append('        for (int k = 0; k < VL; ++k) lane[k] = (float)k;')
+        o.append('        const v_float32 vlane = v_load_aligned(lane), vVL = v_setall_f32((float)VL);')
+        o.append('        const v_float32 vmuI = v_setall_f32(muI), vmuT = v_setall_f32(muT);')
+        o.append('        const v_int32 vzi = v_setzero_s32();')
+        if VCONST[base]:
+            o.append(VCONST[base].rstrip('\n'))
+        if lap:
+            o.append('        const v_float32 vlsc = v_setall_f32(lsc);')
+        o.append('#endif')
         o.append('')
         o.append('        for (int y = y0; y < y1; ++y) {')
         o.append('            const float* pgx = gx.ptr<float>(y - base);')
@@ -214,12 +308,79 @@ for base, K0, L, U0, cols0 in MOTIONS:
             o.append('            const float* pl = lp.ptr<float>(y - base);')
         o.append('            const uchar* pmk = mask.ptr<uchar>(y - base);')
         o.append('            const float fy = (float)y;')
-        if PRE[base]:
-            o.append(PRE[base].rstrip('\n').replace('        ', '            '))
         o.append('            float ' + ', '.join('%s = 0' % a for a in live) + ';')
         o.append('            float ' + ', '.join('%s = 0' % p for p in liveproj) + ';')
+        o.append('            int x = 0;')
+
+        # ---- the vector part of the row
+        o.append('#if FASTECC_SIMD_GN')
+        o.append('            {')
+        if L == 3:
+            o.append('                const v_float32 vfy = v_setall_f32(fy);')
+        if VPRE[base]:
+            o.append(VPRE[base].rstrip('\n'))
+        o.extend(vdecl(live))
+        o.extend(vdecl(liveproj))
+        o.append('                v_float32 vx = vlane;')
+        o.append('                for (; x + VL <= w; x += VL) {')
+        o.append('                    const v_float32 mf = v_reinterpret_as_f32(v_ne(v_reinterpret_as_s32('
+                 'v_load_expand_q(pmk + x)), vzi));')
+        o.append('                    const v_float32 gxv = v_and(v_load(pgx + x), mf), gyv = v_and(v_load(pgy + x), mf);')
+        if lap:
+            o.append('                    const v_float32 lv = v_and(v_load(pl + x), mf);')
+        vbody = VPIX[base] + (VLAPPIX if lap else '')
+        o.append(vbody.replace('                ', '                    ').rstrip('\n'))
+        up = []
+        for idx, (i, j) in enumerate(kp):
+            if idx in uu_used:
+                up.append('uu%d = v_mul(%s, %s)' % (idx, U[i], U[j]))
+        o.append('                    const v_float32 ' + ', '.join(up) + ';')
+        if L == 3:
+            wp = []
+            for idx, (i, j) in enumerate(lp):
+                if idx not in ww_used:
+                    continue
+                wp.append('ww%d = %s' % (idx, ('v_mul(%s, %s)' % (vwn[i], vwn[j])) if vwn[j] != '1.f'
+                                          else vwn[i]))
+            if wp:
+                o.append('                    const v_float32 ' + ', '.join(wp) + ';')
+        for a in range(len(kp)):
+            line = []
+            for b in range(len(lp)):
+                if (a, b) not in live_set:
+                    continue
+                if L == 1 or b == ONE:
+                    line.append('vm%d_%d = v_add(vm%d_%d, uu%d);' % (a, b, a, b, a))
+                else:
+                    line.append('vm%d_%d = v_fma(uu%d, ww%d, vm%d_%d);' % (a, b, a, b, a, b))
+            if line:
+                o.append('                    ' + '  '.join(line))
+        o.append('                    const v_float32 ii = v_sub(v_load(pim + x), vmuI), '
+                 'tt = v_sub(v_load(ptm + x), vmuT);')
+        for s, (k, l) in enumerate(cols):
+            if s in hoistp:
+                continue
+            jexpr = U[k] if L == 1 or vwn[l] == '1.f' else 'v_mul(%s, %s)' % (U[k], vwn[l])
+            o.append('                    const v_float32 j%d = %s;' % (s, jexpr))
+        for pre, src in (('pi', 'ii'), ('pt', 'tt')):
+            terms = ['v%s%d = v_fma(j%d, %s, v%s%d);' % (pre, s, s, src, pre, s) for s in kept]
+            terms += ['v%s%s = v_fma(%s, %s, v%s%s);' % (pre, e, U[int(e[1:])], src, pre, e) for e in extra]
+            o.append('                    ' + '  '.join(terms))
+        terms = ['vpj%d = v_add(vpj%d, j%d);' % (s, s, s) for s in kept]
+        terms += ['vpj%s = v_add(vpj%s, %s);' % (e, e, U[int(e[1:])]) for e in extra]
+        o.append('                    ' + '  '.join(terms))
+        o.append('                    vx = v_add(vx, vVL);')
+        o.append('                }')
+        o.extend(vreduce(live))
+        o.extend(vreduce(liveproj))
+        o.append('            }')
+        o.append('#endif')
+
+        # ---- the scalar loop (the whole row without FASTECC_SIMD_GN, the tail with it)
+        if PRE[base]:
+            o.append(PRE[base].rstrip('\n').replace('        ', '            '))
         o.append('')
-        o.append('            for (int x = 0; x < w; ++x) {')
+        o.append('            for (; x < w; ++x) {')
         o.append('                if (pmk[x] != 0) {')
         body_start = len(o)          # everything from here to the projections is indented once more
         if L == 3:
@@ -262,7 +423,6 @@ for base, K0, L, U0, cols0 in MOTIONS:
                 continue                       # formed at row end from its partner
             jexpr = U[k] if L == 1 or wn[l] == '1.f' else '%s * %s' % (U[k], wn[l])
             o.append('                const float j%d = %s;' % (s, jexpr))
-        kept = [s for s in range(P) if s not in hoistp]
         for pre, src in (('pi', 'ii'), ('pt', 'tt')):
             terms = ['%s%d += j%d * %s;' % (pre, s, s, src) for s in kept]
             terms += ['%s%s += %s * %s;' % (pre, e, U[int(e[1:])], src) for e in extra]
