@@ -9,11 +9,13 @@
 // eccms works in 8-bit internally and takes a CV_64F warp; the conversions sit
 // outside the timed region.
 //
-// Usage: bench [imageSize] [repeats] [threads] [eccmsLevels]
+// Usage: bench [imageSize] [repeats] [threads] [eccmsLevels] [fastLevels]
 //   threads      0 = OpenCV's default (all cores); the number is what
 //                cv::setNumThreads gets, and applies to every implementation
 //   eccmsLevels  nlevels for findTransformECCMultiScale (its default is 4;
-//                1 makes it single-scale, like the other two)
+//                1 makes it single-scale)
+//   fastLevels   nlevels for the second fast-ecc column (default 4); the
+//                first fast-ecc column is always single-scale
 #include "fast_ecc.hpp"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/core.hpp>
@@ -72,6 +74,7 @@ int main(int argc, char** argv) {
     const int repeats = argc > 2 ? std::atoi(argv[2]) : 20;
     const int threads = argc > 3 ? std::atoi(argv[3]) : 0;
     const int eccmsLevels = argc > 4 ? std::atoi(argv[4]) : 4;
+    const int fastLevels = argc > 5 ? std::atoi(argv[5]) : 4;
     if (threads > 0) cv::setNumThreads(threads);
 
     Mat templ = syntheticImage(n);
@@ -101,12 +104,13 @@ int main(int argc, char** argv) {
         return std::sqrt(se / 4.0);
     };
 
-    std::printf("image %dx%d, %d repeats, %d thread(s), eccms nlevels %d%s\n", n, n, repeats,
-                cv::getNumThreads(), eccmsLevels,
+    std::printf("image %dx%d, %d repeats, %d thread(s), eccms nlevels %d, fastN nlevels %d%s\n",
+                n, n, repeats, cv::getNumThreads(), eccmsLevels, fastLevels,
                 BENCH_HAS_ECCMS ? "" : "  (this OpenCV has no findTransformECCMultiScale)");
-    std::printf("%-12s %8s %9s %8s %8s %8s %11s %11s %11s\n",
-                "motion", "cv(ms)", "eccms(ms)", "fast(ms)", "vs cv", "vs eccms",
-                "errCv(px)", "errEccms", "errFast");
+    std::printf("%-12s %8s %9s %8s %9s %8s %8s %8s %9s %9s %9s %9s\n",
+                "motion", "cv(ms)", "eccms(ms)", "fast(ms)", "fastN(ms)",
+                "fast/cv", "fastN/cv", "fastN/ms",
+                "errCv", "errEccms", "errFast", "errFastN");
 
     for (int m = 0; m < 4; ++m) {
         Mat Wgt = groundTruth(motions[m]);
@@ -117,13 +121,14 @@ int main(int argc, char** argv) {
         else
             warpPerspective(templ, input, Wgt, templ.size(), INTER_LINEAR);
 
-        auto timeIt = [&](bool fast, Mat& outW, double& outRho) {
+        auto timeIt = [&](int fastLv, Mat& outW, double& outRho) {   // 0 = cv, >= 1 = fast-ecc with that many levels
             double best = 1e30;
             for (int r = 0; r < repeats; ++r) {
                 Mat W = Mat::eye(motions[m] == MOTION_HOMOGRAPHY ? 3 : 2, 3, CV_32F);
                 auto t0 = clock_type::now();
-                double rho = fast
-                    ? fastecc::findTransformECC(templ, input, W, motions[m], crit)
+                double rho = fastLv > 0
+                    ? fastecc::findTransformECC(templ, input, W, motions[m], crit, noArray(), 5,
+                                                fastecc::FASTECC_DEFAULT_FLAGS, fastLv)
                     : cv::findTransformECC(templ, input, W, motions[m], crit);
                 auto t1 = clock_type::now();
                 double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -132,11 +137,13 @@ int main(int argc, char** argv) {
             return best;
         };
 
-        Mat Wcv, Wfast; double rhoCv = 0, rhoFast = 0;
-        double tcv   = timeIt(false, Wcv,   rhoCv);
-        double tfast = timeIt(true,  Wfast, rhoFast);
-        double errCv   = cornerRMS(Wcv,   Wgt);
-        double errFast = cornerRMS(Wfast, Wgt);
+        Mat Wcv, Wfast, WfastN; double rhoCv = 0, rhoFast = 0, rhoFastN = 0;
+        double tcv    = timeIt(0,          Wcv,    rhoCv);
+        double tfast  = timeIt(1,          Wfast,  rhoFast);
+        double tfastN = timeIt(fastLevels, WfastN, rhoFastN);
+        double errCv    = cornerRMS(Wcv,    Wgt);
+        double errFast  = cornerRMS(Wfast,  Wgt);
+        double errFastN = cornerRMS(WfastN, Wgt);
 
         // eccms: default parameters (nlevels 4, gaussFiltSize 5), the same stop
         double teccms = -1, errEccms = -1;
@@ -171,12 +178,13 @@ int main(int argc, char** argv) {
 #endif
 
         if (teccms > 0)
-            std::printf("%-12s %8.2f %9.2f %8.2f %7.2fx %7.2fx %11.4f %11.4f %11.4f\n",
-                        names[m], tcv, teccms, tfast, tcv / tfast, teccms / tfast,
-                        errCv, errEccms, errFast);
+            std::printf("%-12s %8.2f %9.2f %8.2f %9.2f %7.2fx %7.2fx %7.2fx %9.4f %9.4f %9.4f %9.4f\n",
+                        names[m], tcv, teccms, tfast, tfastN, tcv / tfast, tcv / tfastN, teccms / tfastN,
+                        errCv, errEccms, errFast, errFastN);
         else
-            std::printf("%-12s %8.2f %9s %8.2f %7.2fx %8s %11.4f %11s %11.4f\n",
-                        names[m], tcv, "-", tfast, tcv / tfast, "-", errCv, "-", errFast);
+            std::printf("%-12s %8.2f %9s %8.2f %9.2f %7.2fx %7.2fx %8s %9.4f %9s %9.4f %9.4f\n",
+                        names[m], tcv, "-", tfast, tfastN, tcv / tfast, tcv / tfastN, "-",
+                        errCv, "-", errFast, errFastN);
     }
     return 0;
 }
