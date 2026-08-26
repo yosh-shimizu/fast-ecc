@@ -73,4 +73,12 @@ double findTransformECC(
     int flags = FASTECC_DEFAULT_FLAGS,
     int nlevels = 3);
 
+// The vector path this build takes on this machine: "avx2" (eight lanes with
+// fused multiply-adds -- compiled in with FAST_ECC_AVX2, or picked at run
+// time from the second instance the default build carries), "simd128"
+// (OpenCV's universal intrinsics at 128 bits: SSE2 or NEON) or "scalar"
+// (OpenCV before 4.7, or -DFASTECC_NO_SIMD).  FASTECC_NO_AVX2 in the
+// environment keeps a run on the 128-bit instance, for comparison.
+const char* vectorPath();
+
 } // namespace fastecc

@@ -28,17 +28,28 @@ target_include_directories(fast_ecc PUBLIC ${OpenCV_INCLUDE_DIRS})
 
 # The vector paths are written for OpenCV's universal intrinsics at whatever
 # width the headers expose, which outside OpenCV's own build is 128 bits
-# (SSE2 / NEON).  This option compiles them for AVX2 with FMA instead --
-# eight lanes, fused multiply-adds, gathers -- and makes the library require
-# an AVX2 CPU (2013 on).  See the top of src/fast_ecc.cpp.
-option(FAST_ECC_AVX2 "Compile the vector paths for AVX2 + FMA (needs an AVX2 CPU)" OFF)
+# (SSE2 / NEON).  Compiled with AVX2 + FMA they run at eight lanes with fused
+# multiply-adds and gathers, about 1.5x faster per iteration.  By default, on
+# x86, the library carries both: src/fast_ecc_avx2.cpp is the same source
+# compiled again with the AVX2 flags, and findTransformECC() picks it at run
+# time when the CPU has AVX2 and FMA (FAST_ECC_DISPATCH).  FAST_ECC_AVX2
+# instead compiles the whole library for AVX2 -- one instance, and a binary
+# that needs an AVX2 CPU (2013 on).  See the top of src/fast_ecc.cpp.
+option(FAST_ECC_AVX2 "Compile the whole library for AVX2 + FMA (the binary then needs an AVX2 CPU)" OFF)
+option(FAST_ECC_DISPATCH "Also compile an AVX2 + FMA instance and pick it at run time (x86)" ON)
+if(MSVC)
+  set(FAST_ECC_AVX2_FLAGS /arch:AVX2)
+else()
+  set(FAST_ECC_AVX2_FLAGS -mavx2 -mfma)
+endif()
 if(FAST_ECC_AVX2)
   target_compile_definitions(fast_ecc PRIVATE FASTECC_AVX2=1)
-  if(MSVC)
-    target_compile_options(fast_ecc PRIVATE /arch:AVX2)
-  else()
-    target_compile_options(fast_ecc PRIVATE -mavx2 -mfma)
-  endif()
+  target_compile_options(fast_ecc PRIVATE ${FAST_ECC_AVX2_FLAGS})
+elseif(FAST_ECC_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|i[3-6]86|x86|X86)")
+  target_sources(fast_ecc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/fast_ecc_avx2.cpp)
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/fast_ecc_avx2.cpp
+    PROPERTIES COMPILE_OPTIONS "${FAST_ECC_AVX2_FLAGS}")
+  target_compile_definitions(fast_ecc PRIVATE FASTECC_HAVE_AVX2_TU=1)
 endif()
 
 # --- tools (optional) ------------------------------------------------------

@@ -13,13 +13,14 @@ jobs:
       matrix:
         include:
           # 24.04 ships OpenCV 4.6: the scalar loops.  26.04 ships 4.10: the
-          # universal-intrinsics paths at 128 bits, and with FAST_ECC_AVX2 at
-          # 256 bits with FMA (GitHub's runners have AVX2).  All three must
-          # build and pass.
+          # universal-intrinsics paths -- the default build carries the 128-bit
+          # and the AVX2 instance and picks at run time (GitHub's runners have
+          # AVX2), FAST_ECC_AVX2 builds the AVX2 instance alone.  All three must
+          # build and pass; the default build is tested on both its instances.
           - { image: "ubuntu:24.04", avx2: "OFF" }
           - { image: "ubuntu:26.04", avx2: "OFF" }
           - { image: "ubuntu:26.04", avx2: "ON" }
-    name: build-and-test (${{ matrix.image }}, AVX2 ${{ matrix.avx2 }})
+    name: build-and-test (${{ matrix.image }}, AVX2-only ${{ matrix.avx2 }})
     container: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +41,10 @@ jobs:
 
       - name: Test (equivalence with cv::findTransformECC)
         run: ctest --test-dir build --output-on-failure
+
+      - name: Test again on the 128-bit instance
+        if: matrix.avx2 == 'OFF'
+        run: FASTECC_NO_AVX2=1 ctest --test-dir build --output-on-failure
 
       - name: Benchmark
         run: ./build/bench 512 10
