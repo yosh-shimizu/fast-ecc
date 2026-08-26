@@ -51,7 +51,8 @@ the numbers below are taken against a corrected OpenCV baseline.
 | 5-tap image gradient (3 iterations to the floor instead of 4–5) | landed, on by default |
 | Laplacian column (wider basin, 2.6× lower error on a real image) | landed, on by default |
 | Equivalence test with a margin of real data, run under every flag set | landed |
-| Coarse-to-fine pyramid (`nlevels`), like `findTransformECCMultiScale` | landed, off by default |
+| Coarse-to-fine pyramid (`nlevels`), like `findTransformECCMultiScale` | landed, default 3 levels |
+| One parallel pass per iteration, exact bilinear sampling (no 1/32 px rounding) | landed |
 
 ### What was wrong, and how it is guarded now
 
@@ -82,75 +83,81 @@ trials, started **at** the ground truth so that any movement is bias:
 |---|---:|---:|---:|
 | `cv::findTransformECC` (fixed) | 0.0017 px | 0.0072 px | +5.7e-07 (0.6) |
 | `cv::findTransformECCMultiScale` (fixed, 4 levels) | — | 0.0078 px | — |
-| `fastecc::findTransformECC`, `flags = 0` | 0.0017 px | 0.0072 px | +5.8e-07 (0.6) |
-| `fastecc::findTransformECC` (default flags) | **0.0015 px** | **0.0028 px** | +3.1e-07 (0.3) |
+| `fastecc::findTransformECC`, `flags = FASTECC_LEGACY_PIPELINE` | 0.0017 px | 0.0072 px | +5.8e-07 (0.6) |
+| `fastecc::findTransformECC` (defaults) | **0.0013 px** | **0.0025 px** | +2.2e-07 (0.2) |
 
 (`findTransformECCMultiScale` has no analytic-scene entry: its 4-level pyramid takes a
 200 px window to 25 px, and the band-limited scene has no content left there. It
 carries the same border defect as `findTransformECC` — opencv#29781 — and is measured
 here with that fix applied locally.)
 
-With the plain kernels the two are statistically indistinguishable and neither shows a
-systematic bias: the warp reduction, the fused stage and the folded normalisation are the
-same algebra evaluated in a different order, and convergence counts over 150 trials at
-five deformation steps match `cv` trial for trial. Before the border fix this fork sat at
-0.0287 px with a −1.8e−04 (t = −63.9) scale bias at `gaussFiltSize=9`.
+Through the multi-pass pipeline with the plain kernels the two are statistically
+indistinguishable and neither shows a systematic bias: the warp reduction, the fused stage
+and the folded normalisation are the same algebra evaluated in a different order, and
+convergence counts over 150 trials at five deformation steps match `cv` trial for trial.
+Before the border fix this fork sat at 0.0287 px with a −1.8e−04 (t = −63.9) scale bias at
+`gaussFiltSize=9`.
 
-The defaults add the [laplacian column](#two-optional-flags-the-laplacian-column-and-the-5-tap-gradient),
-which takes the bilinear interpolation error out of the fixed point: on the real image the
-corner error drops 2.6×, and the fraction of trials that converge from the no-motion guess
-goes from 69 / 26 / 4 % to 82 / 33 / 8 % at ×1 / ×2 / ×4 the default deformation.
+The defaults add two things. The [laplacian column](#two-optional-flags-the-laplacian-column-and-the-5-tap-gradient)
+takes the bilinear interpolation error out of the fixed point: on the real image the corner
+error drops 2.9×, and the fraction of trials that converge from the no-motion guess goes
+from 69 / 26 / 4 % to 86 / 31 / 9 % at ×1 / ×2 / ×4 the default deformation (with the
+default 3-level pyramid, 100 / 100 / 99 %). And the [single-pass iteration](#one-parallel-pass-per-iteration)
+samples with exact bilinear weights where OpenCV's warp rounds the coordinate to 1/32 px:
+the translation floor goes from 0.0176 to 0.0116 px, and the centre offset that the
+rounding induced — affine biasX t = −12, euclidean −4.4 — is gone (t = −0.5 and −0.3).
 
 ### Speed
 
 Cost of one iteration, affine, analytic scene, fixed 20 iterations, best of 3 runs,
-default flags, against a border-fixed OpenCV:
+default flags, single scale, against a border-fixed OpenCV:
 
 | window | 4 threads | 1 thread |
 |---:|---:|---:|
-| 256 | **2.61×** | 1.90× |
-| 512 | 2.80× | 2.10× |
-| 768 | **3.53×** | 2.29× |
+| 256 | **4.96×** | 1.94× |
+| 512 | 4.56× | 1.99× |
+| 768 | **4.84×** | 2.40× |
 
-Three changes contribute, and they cover each other. The **warp reduction** takes the
-three bilinear warps per iteration down to one; it pays most at small windows and
-decays at large ones with a thread pool, because OpenCV parallelises the `warpAffine`
-it removes but not the `filter2D` that replaces it. The **fused Gauss–Newton stage**
-does the opposite: it builds the Hessian and both projections in one pass without
-materialising the Jacobian, and the saving grows with the parameter count. The
-**folded normalisation** removes the eleven masked OpenCV calls and the mask warp that
-sat between the two, which were 45–60 % of an iteration once the other two had landed.
+Four changes contribute, and they cover each other. The **warp reduction** takes the
+three bilinear warps per iteration down to one. The **fused Gauss–Newton stage** builds
+the Hessian and both projections in one pass without materialising the Jacobian, and the
+saving grows with the parameter count. The **folded normalisation** removes the eleven
+masked OpenCV calls and the mask warp that sat between the two, which were 45–60 % of an
+iteration once the other two had landed. And the **single-pass iteration** turns what was
+left — a warp, three filters, two reductions, each its own fork/join and each writing a
+plane for the next — into one parallel region per iteration, which is where the
+four-thread column comes from: single-thread cost is unchanged, two threads gain 1.2–1.3×
+and four 1.6–2.1× over the multi-pass layout.
 
 The bundled `./build/bench` (512×512, best of 20 calls, the start 3 px and a few
 percent off) shows the per-motion spread against both OpenCV implementations —
 `findTransformECC` (ecc.cpp) and `findTransformECCMultiScale` (eccms.cpp, OpenCV ≥ 4.12,
 with its default 4-level pyramid and single-scale):
 
-| one thread | cv | eccms, 4 levels | fast, 1 level | fast, 4 levels | fast 4 vs cv | fast 4 vs eccms | fast 1 vs eccms |
+| one thread | cv | eccms, 4 levels | fast, 1 level | fast, 3 levels (default) | fast 3 vs cv | fast 3 vs eccms | fast 1 vs eccms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| TRANSLATION | 44.8 ms | 11.6 ms | 14.3 ms | 13.5 ms | 3.3× | 0.86× | 0.81× |
-| EUCLIDEAN | 64.7 ms | 13.0 ms | 24.3 ms | 15.4 ms | 4.2× | 0.84× | 0.53× |
-| AFFINE | 80.6 ms | 16.6 ms | 33.1 ms | 17.3 ms | 4.7× | 0.96× | 0.50× |
-| HOMOGRAPHY | 220.5 ms | 26.8 ms | 83.5 ms | 27.6 ms | **8.0×** | 0.97× | 0.32× |
+| TRANSLATION | 39.7 ms | 10.4 ms | 13.5 ms | 12.9 ms | 3.1× | 0.81× | 0.77× |
+| EUCLIDEAN | 56.0 ms | 12.3 ms | 24.4 ms | 16.0 ms | 3.5× | 0.77× | 0.50× |
+| AFFINE | 68.0 ms | 15.8 ms | 32.9 ms | 16.7 ms | 4.1× | 0.94× | 0.48× |
+| HOMOGRAPHY | 194.6 ms | 24.9 ms | 86.8 ms | 28.4 ms | **6.9×** | 0.88× | 0.29× |
 
-| two threads | cv | eccms, 4 levels | fast, 1 level | fast, 4 levels | fast 4 vs cv | fast 4 vs eccms | fast 1 vs eccms |
+| two threads | cv | eccms, 4 levels | fast, 1 level | fast, 3 levels (default) | fast 3 vs cv | fast 3 vs eccms | fast 1 vs eccms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| TRANSLATION | 40.7 ms | 10.6 ms | 11.8 ms | 12.3 ms | 3.3× | 0.86× | 0.90× |
-| EUCLIDEAN | 60.8 ms | 10.1 ms | 19.4 ms | 13.5 ms | 4.5× | 0.75× | 0.52× |
-| AFFINE | 72.8 ms | 12.2 ms | 24.6 ms | 14.8 ms | 4.9× | 0.83× | 0.50× |
-| HOMOGRAPHY | 208.6 ms | 18.3 ms | 56.9 ms | 21.8 ms | **9.6×** | 0.84× | 0.32× |
+| TRANSLATION | 35.9 ms | 8.0 ms | 9.9 ms | 10.4 ms | 3.4× | 0.77× | 0.81× |
+| EUCLIDEAN | 50.1 ms | 8.4 ms | 17.0 ms | 12.1 ms | 4.1× | 0.69× | 0.49× |
+| AFFINE | 62.7 ms | 10.0 ms | 21.9 ms | 12.4 ms | 5.1× | 0.80× | 0.46× |
+| HOMOGRAPHY | 172.3 ms | 14.7 ms | 54.1 ms | 18.4 ms | **9.4×** | 0.80× | 0.27× |
 
-| four threads | cv | eccms, 4 levels | fast, 1 level | fast, 4 levels | fast 4 vs cv | fast 4 vs eccms | fast 1 vs eccms |
+| four threads | cv | eccms, 4 levels | fast, 1 level | fast, 3 levels (default) | fast 3 vs cv | fast 3 vs eccms | fast 1 vs eccms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| TRANSLATION | 34.9 ms | 8.1 ms | 9.7 ms | 11.7 ms | 3.0× | 0.69× | 0.83× |
-| EUCLIDEAN | 55.1 ms | 9.0 ms | 14.9 ms | 12.9 ms | 4.3× | 0.69× | 0.60× |
-| AFFINE | 67.2 ms | 10.3 ms | 21.1 ms | 13.3 ms | 5.1× | 0.78× | 0.49× |
-| HOMOGRAPHY | 181.7 ms | 12.9 ms | 42.6 ms | 18.1 ms | **10.1×** | 0.72× | 0.30× |
+| TRANSLATION | 30.2 ms | 6.6 ms | 6.7 ms | 7.9 ms | 3.8× | 0.83× | 0.98× |
+| EUCLIDEAN | 45.6 ms | 6.8 ms | 10.4 ms | 9.7 ms | 4.7× | 0.70× | 0.65× |
+| AFFINE | 60.3 ms | 7.9 ms | 13.8 ms | 8.3 ms | 7.3× | 0.95× | 0.57× |
+| HOMOGRAPHY | 160.2 ms | 10.4 ms | 31.7 ms | 11.2 ms | **14.3×** | 0.92× | 0.33× |
 
 (Each ratio is taken within one run. Run `./build/bench 512 20 <threads> <eccmsLevels>
-<fastLevels>` to reproduce. With eccms itself single-scale, `nlevels = 1`, single-scale
-fast-ecc measured 1.17–1.37× faster than it on one thread and 0.86–1.05× of it on two
-to four, in a separate run.)
+<fastLevels>` to reproduce. Corner errors in this bench: eccms 0.006–0.022 px, fast-ecc
+0.0001–0.005.)
 
 Against `findTransformECC`, homography gains most because the Jacobian path re-reads
 its blocks P² times for the Gram matrix, and P = 8. The bench counts iterations to
@@ -172,14 +179,15 @@ implementation.
 - **The pyramid is what made eccms faster**, by 2–3× against single-scale fast-ecc in
   this bench, whose start is 3 px and a few percent off so that the coarse levels take
   most of the iterations at 1/16 to 1/64 of the pixels. With its own pyramid
-  ([below](#coarse-to-fine-nlevels)) fast-ecc closes most of that: 0.84–0.97× of eccms
-  on one thread, 0.69–0.86× on two to four. What remains is thread scaling — eccms does
-  an iteration in one parallel pass, fast-ecc in a sequence of OpenCV calls and fused
-  passes.
+  ([below](#coarse-to-fine-nlevels)) and the single-pass iteration fast-ecc is at
+  0.77–0.94× of eccms on one thread and 0.70–0.95× on four in this bench. What remains
+  is the sampler: eccms's is SIMD fixed-point, fast-ecc's is a scalar exact one.
 - **On the real image the order reverses.** At window 384 with the start 1–6 px off,
-  3-level fast-ecc is 1.15–1.7× faster than eccms with its four levels on one to four
-  threads, and its basin matches eccms's (99–100 % at ×4 the default deformation).
-- **Accuracy on the real image:** eccms 0.0078 px, ecc.cpp 0.0072 px, fast-ecc 0.0028 px
+  fast-ecc with its default 3 levels takes 9.7 ms on one thread, 7.5 on two and
+  4.9–5.7 on four, against 15.6 / 10.7 / 8.5–9.2 ms for eccms with four levels —
+  1.4–1.8× faster — and its basin matches eccms's (99–100 % at ×4 the default
+  deformation).
+- **Accuracy on the real image:** eccms 0.0078 px, ecc.cpp 0.0072 px, fast-ecc 0.0025 px
   (affine, window 200, started at the truth); the pyramid does not change the floor.
 
 The fused kernels are generated by [`tools/gen_gn_kernels.py`](tools/gen_gn_kernels.py);
@@ -331,34 +339,68 @@ is time-neutral and buys accuracy and basin; with the 5-tap the call is 1.25× f
 it saves (the plain kernel is already at its floor in 3 iterations) while still widening
 the basin from 82 to 98 % at ×1.
 
+A third flag, **`FASTECC_LEGACY_PIPELINE`**, forces the multi-pass iteration described in
+the sections above (OpenCV's warp, full-size gradient planes, separate moment and
+Gauss–Newton passes) instead of the [single pass](#one-parallel-pass-per-iteration). It is
+what a user mask, or a projective warp whose denominator changes sign over the template,
+takes anyway; it is kept for comparison, and it reproduces the previous fixed points.
+
+### One parallel pass per iteration
+
+After the folded normalisation an iteration was still five things in a row — OpenCV's
+warp, two gradient filters and a laplacian, the moment pass, the Gauss–Newton pass — each
+a fork/join, each writing a full-size plane for the next. It is now one parallel region
+over stripes of rows. Each stripe samples its rows of the warped image straight from the
+blurred input (with a halo for the derivative stencils), takes the gradients and the
+laplacian in the stripe, solves for its mask rows, and accumulates the masked moments and
+the Gauss–Newton sums; nothing full-size is written. The planes are centred on the
+previous iteration's means, since the current ones are not known until the pass is over,
+and the projections are corrected exactly afterwards with the column sums of the Jacobian,
+which the generated kernels accumulate for that purpose. Stripes are four per thread: with
+one per thread a worker that wakes late stalls the whole region, and two threads were no
+faster than one.
+
+Per iteration, affine, multi-pass → single-pass, best of 3 interleaved runs:
+
+| window | 1 thread | 2 threads | 4 threads |
+|---:|---:|---:|---:|
+| 200 | 0.693 → 0.684 ms | 0.609 → 0.462 ms (1.32×) | 0.566 → 0.277 ms (**2.05×**) |
+| 512 | 4.608 → 4.704 ms | 3.590 → 3.042 ms (1.18×) | 2.933 → 1.832 ms (**1.60×**) |
+| 512, homography | 9.28 → 8.91 ms | 5.92 → 5.89 ms | 4.31 → 3.45 ms (1.25×) |
+
+The sampler uses exact bilinear weights, where OpenCV's warp rounds the sampling
+coordinate to 1/32 px (see [exact-warp](#not-bit-identical-to-opencv)). That is why the
+translation floor and the centre biases in the accuracy table move: they were the rounding.
+One consequence to know about: an input that was itself produced by OpenCV's rounding warp
+can be matched *exactly* by the rounding warp and not by an exact one, so on such an input
+the multi-pass path sits below the true floor for pure translation (0.0010 px on the
+resampled fruits) and the single pass at it (0.0125, where eccms also sits, 0.0129). On
+the analytic scene, whose ground truth is not resampled, the single pass is the more
+accurate one in every motion type.
+
 ### Coarse to fine: `nlevels`
 
-`findTransformECC` takes a trailing `nlevels` (default 1). Above 1 it runs coarse to fine
-over a `pyrDown` pyramid the way `findTransformECCMultiScale` does: each level runs the
-whole single-scale iteration — pre-filter, border ring, mask, flags, stop criterion — on
-the downsampled images and hands its warp to the next finer level (translation ×2,
-projective row ÷2). The coarsest level keeps at least 16 px on the template's shorter
-side, and a coarse level that gives up (a band-limited scene with nothing left at that
-scale) is skipped rather than fatal. The finest level is the same iteration as before, so
-the floor is unchanged; what the pyramid buys is the start:
+`findTransformECC` takes a trailing `nlevels` (default 3; 1 is single scale). Above 1 it
+runs coarse to fine over a `pyrDown` pyramid the way `findTransformECCMultiScale` does:
+each level runs the whole single-scale iteration — pre-filter, border ring, mask, flags,
+stop criterion — on the downsampled images and hands its warp to the next finer level
+(translation ×2, projective row ÷2). The coarsest level keeps at least 16 px on the
+template's shorter side, and a coarse level that gives up (a band-limited scene with
+nothing left at that scale) is skipped rather than fatal; on the analytic test scene at
+200 px, 3 levels lose no trial and 4 lose 4 %. The finest level is the same iteration as
+before, so the floor is unchanged; what the pyramid buys is the start:
 
 | fruits, affine, window 384, one thread, ms per call (corner error) | start 1 px off | 3 px | 6 px |
 |---|---:|---:|---:|
-| `cv::findTransformECC` | 33.2 (0.0030) | 33.5 | 53.8 |
-| `cv::findTransformECCMultiScale`, 4 levels | 16.4 (0.0032) | 17.6 | 17.8 |
-| `fastecc::findTransformECC`, 1 level | 12.1 (0.0019) | 15.8 | 24.0 |
-| `fastecc::findTransformECC`, 3 levels | **10.4 (0.0019)** | **10.5** | **10.5** |
+| `cv::findTransformECC` | 28.6 (0.0030) | 30.9 | 44.5 |
+| `cv::findTransformECCMultiScale`, 4 levels | 15.6 (0.0032) | 15.4 | 15.6 |
+| `fastecc::findTransformECC`, 1 level | 12.0 (0.0014) | 21.0 | 23.7 |
+| `fastecc::findTransformECC`, 3 levels (default) | **9.8 (0.0014)** | **9.8** | **9.7** |
 
-With the start 3 px off, on two and four threads: eccms 11.8 / 9.2 ms, fast-ecc 1 level
-12.9 / 9.4 ms, fast-ecc 3 levels 9.1 / 8.1 ms. On the real image the fraction of trials
-that converge from the no-motion guess at ×4 the default deformation goes from 85 %
-(1 level) to 99–100 % (3–4 levels), which is where eccms sits; for homography from 62 %
-to 96 %.
-
-`nlevels = 3` is the recommendation whenever the start may be more than a pixel off;
-it is not the default because a band-limited or very small template can have nothing
-left at the coarse levels (on the analytic test scene, 200 px, 4 levels lose 4 % of the
-trials even with the fallback).
+On two and four threads the default takes 7.5 and 4.9–5.7 ms whatever the start, against
+10.7 and 8.5–9.2 for eccms. On the real image the fraction of trials that converge from
+the no-motion guess at ×4 the default deformation goes from 85 % (1 level) to 99–100 %
+(3–4 levels), which is where eccms sits; for homography from 62 % to 96 %.
 
 ### Not bit-identical to OpenCV
 

@@ -186,16 +186,16 @@ sits on the floor, the sweep is flat, the tolerances come down to ~3× of it, an
 sets.</p>
 <p>Against a border-fixed OpenCV (4.15.0-dev with opencv#29775), one thread unless stated:</p>
 <div class="tw"><table>
-<tr><th>affine, ms per iteration (fixed 20 iterations, best of 3)</th><th>window 256</th><th>512</th><th>768</th></tr>
-<tr><td>one thread</td><td>1.90×</td><td>2.10×</td><td>2.29×</td></tr>
-<tr><td>four threads</td><td>2.61×</td><td>2.80×</td><td><b>3.53×</b></td></tr>
+<tr><th>affine, ms per iteration (fixed 20 iterations, best of 3, single scale)</th><th>window 256</th><th>512</th><th>768</th></tr>
+<tr><td>one thread</td><td>1.94×</td><td>1.99×</td><td>2.40×</td></tr>
+<tr><td>four threads</td><td><b>4.96×</b></td><td>4.56×</td><td>4.84×</td></tr>
 </table></div>
 <div class="tw"><table>
-<tr><th><code>./build/bench 512 20 4</code>, four threads, fast vs ecc.cpp</th><th>cv</th><th>fast</th><th></th><th>previous release (default threads)</th></tr>
-<tr><td>TRANSLATION</td><td>27.8 ms</td><td>7.8 ms</td><td>3.6×</td><td>1.71×</td></tr>
-<tr><td>EUCLIDEAN</td><td>40.1 ms</td><td>11.8 ms</td><td>3.4×</td><td>1.93×</td></tr>
-<tr><td>AFFINE</td><td>51.2 ms</td><td>17.3 ms</td><td>3.0×</td><td>2.11×</td></tr>
-<tr><td>HOMOGRAPHY</td><td>139.1 ms</td><td>34.7 ms</td><td><b>4.0×</b></td><td>3.24×</td></tr>
+<tr><th><code>./build/bench 512 20 4</code>, four threads, fast (default: 3 levels) vs ecc.cpp</th><th>cv</th><th>fast</th><th></th><th>previous release (default threads)</th></tr>
+<tr><td>TRANSLATION</td><td>30.2 ms</td><td>7.9 ms</td><td>3.8×</td><td>1.71×</td></tr>
+<tr><td>EUCLIDEAN</td><td>45.6 ms</td><td>9.7 ms</td><td>4.7×</td><td>1.93×</td></tr>
+<tr><td>AFFINE</td><td>60.3 ms</td><td>8.3 ms</td><td>7.3×</td><td>2.11×</td></tr>
+<tr><td>HOMOGRAPHY</td><td>160.2 ms</td><td>11.2 ms</td><td><b>14.3×</b></td><td>3.24×</td></tr>
 </table></div>
 <h3>6.1 Against <code>findTransformECCMultiScale</code></h3>
 <p>OpenCV 4.12 added a second ECC, <code>findTransformECCMultiScale</code> (eccms.cpp): a fresh implementation with a
@@ -266,12 +266,46 @@ thread and 3.0–10.1× on four. <code>nlevels = 3</code> is the recommendation 
 off; it is not the default because a band-limited or very small template can have nothing left at the coarse levels
 (the analytic 200 px scene loses 4 % of trials at 4 levels even with the fallback).</p>
 
-<h3>6.3 As landed, against ecc.cpp</h3>
+<h3>6.3 One parallel pass per iteration</h3>
+<p>After the folded normalisation an iteration was still five things in a row — OpenCV's warp, two gradient filters and
+a laplacian, the moment pass, the Gauss–Newton pass — each a fork/join, each writing a full-size plane for the next. It
+is now one parallel region over stripes of rows: each stripe samples its rows of the warped image straight from the
+blurred input (with a halo for the derivative stencils), takes the gradients and the laplacian in the stripe, solves for
+its mask rows, and accumulates the masked moments and the Gauss–Newton sums. Nothing full-size is written. The planes are
+centred on the previous iteration's means and the projections corrected exactly afterwards with the column sums of the
+Jacobian, <span class="m">Σ j</span>, which the kernels now accumulate: for a column <span class="m">j</span> and the
+true mean <span class="m">m</span>, <span class="m">Σ j (i − m) = Σ j (i − m<sub>prev</sub>) − (m − m<sub>prev</sub>) Σ j</span>.
+Stripes are four per thread — with one per thread a worker that wakes late stalls the region, and two threads were no
+faster than one.</p>
 <div class="tw"><table>
-<tr><th>affine, window 200, 200 trials, started at the ground truth</th><th>cv (fixed)</th><th>fast, flags = 0</th><th>fast (default)</th></tr>
-<tr><td>corner RMS, analytic scene</td><td>0.0017 px</td><td>0.0017 px</td><td><b>0.0015 px</b></td></tr>
-<tr><td>corner RMS, real image (fruits, resampled)</td><td>0.0072 px</td><td>0.0072 px</td><td><b>0.0028 px</b></td></tr>
-<tr><td>converged from the no-motion guess, ×1 / ×2 / ×4</td><td>69 / 26 / 4 %</td><td>69 / 26 / 4 %</td><td><b>82 / 33 / 8 %</b></td></tr>
+<tr><th>ms per iteration, affine, multi-pass → single-pass (best of 3 interleaved runs)</th><th>1 thread</th><th>2 threads</th><th>4 threads</th></tr>
+<tr><td>window 200</td><td>0.693 → 0.684</td><td>0.609 → 0.462 (1.32×)</td><td>0.566 → 0.277 (<b>2.05×</b>)</td></tr>
+<tr><td>window 512</td><td>4.608 → 4.704</td><td>3.590 → 3.042 (1.18×)</td><td>2.933 → 1.832 (<b>1.60×</b>)</td></tr>
+<tr><td>window 512, homography</td><td>9.28 → 8.91</td><td>5.92 → 5.89</td><td>4.31 → 3.45 (1.25×)</td></tr>
+</table></div>
+<p>The first version sampled with double-precision coordinates and a bounds test per pixel and was 0.84–0.89× of the
+multi-pass path on one thread: a scalar sampler against OpenCV's SIMD warp. Solving each row for the interval whose four
+taps are inside the source and running it in single precision brought it level. The sampler is exact where OpenCV's warp
+rounds the coordinate to 1/32 px, and that moves the fixed points: on the analytic scene, started at the truth, the
+translation floor goes from 0.0169 to 0.0116 px and the centre offset the rounding induced disappears (affine biasX
+<span class="m">t</span> = −12 → −0.5, euclidean −4.4 → −0.3); affine 0.0015 → 0.0013, homography 0.0022 → 0.0021, the
+real image 0.0028 → 0.0025, the noise floor and the basin unchanged. One caveat: an input that was itself produced by
+OpenCV's rounding warp can be matched exactly by the rounding warp and not by an exact one, so on such an input the
+multi-pass path sits below the true floor for pure translation (0.0010 px on the resampled fruits) and the single pass at
+it (0.0125, where eccms also sits, 0.0129).</p>
+<p>Against ecc.cpp per iteration (affine, fixed 20 iterations): 1.94 / 1.99 / 2.40× on one thread at windows
+256 / 512 / 768, and <b>4.96 / 4.56 / 4.84×</b> on four. In the bench (512², start 3 px off, 3 levels against eccms's
+four) 0.77–0.94× of eccms on one thread and 0.70–0.95× on four; on the real image (window 384, start 1–6 px off)
+9.7 / 7.5 / 4.9–5.7 ms on one / two / four threads against 15.6 / 10.7 / 8.5–9.2 for eccms, at 0.0014 px against
+0.0032. What remains between the two in the bench is the sampler: eccms's is SIMD fixed-point, fast-ecc's a scalar
+exact one.</p>
+
+<h3>6.4 As landed, against ecc.cpp</h3>
+<div class="tw"><table>
+<tr><th>affine, window 200, 200 trials, started at the ground truth</th><th>cv (fixed)</th><th>fast, legacy pipeline, plain</th><th>fast (default)</th></tr>
+<tr><td>corner RMS, analytic scene</td><td>0.0017 px</td><td>0.0017 px</td><td><b>0.0013 px</b></td></tr>
+<tr><td>corner RMS, real image (fruits, resampled)</td><td>0.0072 px</td><td>0.0072 px</td><td><b>0.0025 px</b></td></tr>
+<tr><td>converged from the no-motion guess, ×1 / ×2 / ×4 (real image)</td><td>100 / 100 / 89 %</td><td>100 / 100 / 89 %</td><td><b>100 / 100 / 99 %</b></td></tr>
 </table></div>
 
 <h2>7. What was tried, and what is left</h2>
@@ -299,11 +333,14 @@ takes the floor from 4–5 iterations to 3; nothing else in the model can be imp
 <li><b>Sigma cannot be estimated, but its column can be kept.</b> As a nuisance direction it absorbs the isotropic second-order
 residual and the interpolation error: half the first step, +10–40 % basin, 2.6× lower error on a real image, for +2–19 % per
 iteration.</li>
-<li><b>Together, against a border-fixed ecc.cpp:</b> 1.9–3.5× per iteration on affine depending on window and threads, 2.9–4.5× per
-call in the bundled bench, and a lower floor rather than an equal one. <b>Against eccms.cpp</b> fast-ecc is the faster
-single-scale implementation on one thread (1.17–1.37×), level with it on two to four, and the more accurate one (0.0028 vs
-0.0078 px on the real image). With its own pyramid it is 1.15–1.7× faster than eccms on the real image whatever the start,
-and within 0.84–0.97× of it on one thread in the bench, where the remaining gap is thread scaling.</li>
+<li><b>One parallel region per iteration, sampling exactly.</b> Single-thread cost is unchanged, four threads gain
+1.6–2.1× over the multi-pass layout, and the 1/32 px rounding of OpenCV's warp — which was the translation floor and a
+systematic centre offset — is gone.</li>
+<li><b>Together, against a border-fixed ecc.cpp:</b> 1.9–2.4× per iteration on one thread and 4.6–5.0× on four (affine,
+windows 256–768), 3.1–6.9× per call on one thread and 3.8–14× on four in the bundled bench, and a lower floor rather than
+an equal one. <b>Against eccms.cpp</b> fast-ecc is 1.4–1.8× faster on the real image whatever the start and 2.3× more
+accurate; in the bench, whose start is far off, it is at 0.77–0.94× of eccms on one thread and 0.70–0.95× on four, the
+remaining gap being a scalar sampler against a SIMD one.</li>
 </ol>
 
 <footer>
