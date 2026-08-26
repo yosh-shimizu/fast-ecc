@@ -57,7 +57,9 @@
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 using namespace cv;
@@ -155,57 +157,189 @@ static void recombination(const Mat& map, int motionType, float r[4])
 // interval, for an affine warp and for a projective one with a positive
 // denominator alike, so it can be solved for instead of resampled: two
 // bounds per constraint, four constraints, per row.  The ring of the
-// template border is applied at the same time.  Returns false when the
-// projective denominator changes sign along some row, in which case the
-// caller falls back to the warp.
-static bool analyticMask(Mat& mask, const Mat& map, int motionType, int wd, int hd, int ring)
+// template border is applied at the same time.
+//
+// rowInterval() solves one row into [x0, x1) and returns false when the
+// projective denominator changes sign along it; analyticMask() fills a whole
+// mask plane with it, and the single-pass iteration below calls it per
+// stripe.
+struct WarpCoef {
+    double a0, a1, a2, a3, a4, a5, a6, a7, a8;
+    bool homo;
+    WarpCoef(const Mat& map, int motionType) {
+        CV_Assert(map.isContinuous() && map.type() == CV_32FC1 && map.cols == 3);
+        const float* m = map.ptr<float>(0);
+        homo = motionType == MOTION_HOMOGRAPHY;
+        a0 = m[0]; a1 = m[1]; a2 = m[2];
+        a3 = m[3]; a4 = m[4]; a5 = m[5];
+        a6 = homo ? m[6] : 0.0;
+        a7 = homo ? m[7] : 0.0;
+        a8 = homo ? m[8] : 1.0;
+    }
+    // the projective denominator is affine in (x, y): positive at the four
+    // corners means positive on the whole template
+    bool denominatorPositive(int ws, int hs) const {
+        if (!homo) return true;
+        const double c[4] = { a8, a6 * (ws - 1) + a8, a7 * (hs - 1) + a8, a6 * (ws - 1) + a7 * (hs - 1) + a8 };
+        return c[0] > 0 && c[1] > 0 && c[2] > 0 && c[3] > 0;
+    }
+};
+
+static bool rowInterval(const WarpCoef& c, int y, int ws, int wd, int hd, int ring, int& x0, int& x1)
 {
-    CV_Assert(mask.type() == CV_8UC1 && map.isContinuous());
-    const int hs = mask.rows, ws = mask.cols;
-    const bool homography = motionType == MOTION_HOMOGRAPHY;
-    const float* m = map.ptr<float>(0);
-    const double a0 = m[0], a1 = m[1], a2 = m[2];
-    const double a3 = m[3], a4 = m[4], a5 = m[5];
-    const double a6 = homography ? m[6] : 0.0;
-    const double a7 = homography ? m[7] : 0.0;
-    const double a8 = homography ? m[8] : 1.0;
     // round(x') in [2, wd-3]  <=>  1.5 <= x' < wd-2.5, and the same for y'
     const double xlo = 1.5, xhi = wd - 2.5, ylo = 1.5, yhi = hd - 2.5;
     const double eps = 1e-12;
+    const double bx = c.a1 * y + c.a2, by = c.a4 * y + c.a5, dy = c.a7 * y + c.a8;
+    // each constraint is  p*x + q >= 0  (or > 0); keep [lo, hi)
+    double lo = ring, hi = ws - ring;
+    bool empty = false;
+    const double P[5] = { c.a0 - xlo * c.a6, -(c.a0 - xhi * c.a6), c.a3 - ylo * c.a6, -(c.a3 - yhi * c.a6), c.a6 };
+    const double Q[5] = { bx - xlo * dy, -(bx - xhi * dy), by - ylo * dy, -(by - yhi * dy), dy };
+    if (c.homo) {
+        // the denominator must stay positive across the row we keep
+        const double d0 = c.a6 * lo + dy, d1 = c.a6 * (hi - 1) + dy;
+        if (d0 <= 0.0 || d1 <= 0.0) {
+            if (d0 <= 0.0 && d1 <= 0.0) { x0 = x1 = ws; return true; }
+            return false;
+        }
+    }
+    for (int k = 0; k < (c.homo ? 5 : 4); ++k) {
+        const double pk = P[k], qk = Q[k];
+        if (pk > eps)       lo = std::max(lo, -qk / pk);
+        else if (pk < -eps) hi = std::min(hi, -qk / pk);
+        else if (qk < 0.0)  { empty = true; break; }
+    }
+    x0 = empty ? ws : (int)std::ceil(lo - 1e-9);
+    x1 = empty ? ws : (int)std::ceil(hi - 1e-9);
+    x0 = std::max(ring, std::min(ws - ring, x0));
+    x1 = std::max(x0, std::min(ws - ring, x1));
+    return true;
+}
 
+static bool analyticMask(Mat& mask, const Mat& map, int motionType, int wd, int hd, int ring)
+{
+    CV_Assert(mask.type() == CV_8UC1);
+    const int hs = mask.rows, ws = mask.cols;
+    const WarpCoef c(map, motionType);
     for (int y = 0; y < hs; ++y) {
         uchar* row = mask.ptr<uchar>(y);
         if (y < ring || y >= hs - ring) { std::memset(row, 0, ws); continue; }
-        const double bx = a1 * y + a2, by = a4 * y + a5, dy = a7 * y + a8;
-        // each constraint is  p*x + q >= 0  (or > 0); keep [lo, hi)
-        double lo = ring, hi = ws - ring;
-        bool empty = false;
-        const double P[5] = { a0 - xlo * a6, -(a0 - xhi * a6), a3 - ylo * a6, -(a3 - yhi * a6), a6 };
-        const double Q[5] = { bx - xlo * dy, -(bx - xhi * dy), by - ylo * dy, -(by - yhi * dy), dy };
-        if (homography) {
-            // the denominator must stay positive across the row we keep
-            const double d0 = a6 * lo + dy, d1 = a6 * (hi - 1) + dy;
-            if (d0 <= 0.0 || d1 <= 0.0) {
-                if (d0 <= 0.0 && d1 <= 0.0) { std::memset(row, 0, ws); continue; }
-                return false;
-            }
-        }
-        for (int k = 0; k < (homography ? 5 : 4); ++k) {
-            const double pk = P[k], qk = Q[k];
-            if (pk > eps)       lo = std::max(lo, -qk / pk);
-            else if (pk < -eps) hi = std::min(hi, -qk / pk);
-            else if (qk < 0.0)  { empty = true; break; }
-        }
-        int x0 = empty ? ws : (int)std::ceil(lo - 1e-9);
-        int x1 = empty ? ws : (int)std::ceil(hi - 1e-9);
-        x0 = std::max(ring, std::min(ws - ring, x0));
-        x1 = std::max(x0, std::min(ws - ring, x1));
+        int x0, x1;
+        if (!rowInterval(c, y, ws, wd, hd, ring, x0, x1)) return false;
         std::memset(row, 0, x0);
         std::memset(row + x0, 1, x1 - x0);
         std::memset(row + x1, 0, ws - x1);
     }
     return true;
 }
+
+// One row of the warped image, sampled straight from the blurred input with
+// exact bilinear weights (OpenCV's warp rounds the coordinate to 1/32 px).
+// Zero where any of the four taps is outside the source, like
+// BORDER_CONSTANT.  Rows outside the template (the derivative halo at the
+// top and bottom) are zero: everything they would feed is masked out.
+static void sampleRow(const Mat& src, const WarpCoef& c, int y, int hs, float* out, int ws)
+{
+    if (y < 0 || y >= hs) { std::memset(out, 0, ws * sizeof(float)); return; }
+    const int SW = src.cols, SH = src.rows;
+    const float* SRC = src.ptr<float>(0);
+    const size_t STEP = src.step / sizeof(float);
+    const double fy = (double)y;
+    const double bx = c.a1 * fy + c.a2, by = c.a4 * fy + c.a5, bd = c.a7 * fy + c.a8;
+    if (!c.homo) {
+        // sx = a0*x + bx and sy = a3*x + by are linear in x, so the x whose
+        // four taps are inside the source form an interval: solve for it once
+        // and run the interior without a test per pixel.
+        double lo = 0.0, hi = (double)ws;
+        const double eps = 1e-12;
+        if (c.a0 > eps)       { lo = std::max(lo, (0.0 - bx) / c.a0);        hi = std::min(hi, ((SW - 1) - bx) / c.a0); }
+        else if (c.a0 < -eps) { lo = std::max(lo, ((SW - 1) - bx) / c.a0);   hi = std::min(hi, (0.0 - bx) / c.a0); }
+        else if (bx < 0.0 || bx >= SW - 1) { lo = 1.0; hi = 0.0; }
+        if (c.a3 > eps)       { lo = std::max(lo, (0.0 - by) / c.a3);        hi = std::min(hi, ((SH - 1) - by) / c.a3); }
+        else if (c.a3 < -eps) { lo = std::max(lo, ((SH - 1) - by) / c.a3);   hi = std::min(hi, (0.0 - by) / c.a3); }
+        else if (by < 0.0 || by >= SH - 1) { lo = 1.0; hi = 0.0; }
+        int xlo = std::min(ws, std::max(0, (int)std::ceil(lo)));
+        int xhi = std::max(xlo, std::min(ws, (int)std::floor(hi) + 1));
+        // one pixel of slack: a coordinate that lands exactly on the last
+        // valid tap must not read past it
+        while (xhi > xlo && (c.a0 * (xhi - 1) + bx >= SW - 1 || c.a3 * (xhi - 1) + by >= SH - 1)) --xhi;
+        while (xhi > xlo && (c.a0 * xlo + bx < 0.0 || c.a3 * xlo + by < 0.0)) ++xlo;
+        for (int x = 0; x < xlo; ++x) out[x] = 0.f;
+        for (int x = xhi; x < ws; ++x) out[x] = 0.f;
+        const float a0f = (float)c.a0, a3f = (float)c.a3;
+        const float bxf = (float)(bx + c.a0 * xlo), byf = (float)(by + c.a3 * xlo);
+        for (int x = xlo; x < xhi; ++x) {
+            // the coordinate is formed from the row start in float: 24 bits
+            // over a few hundred pixels is 1e-5 px, below anything measured
+            const float sx = a0f * (float)(x - xlo) + bxf, sy = a3f * (float)(x - xlo) + byf;
+            const int x0 = (int)sx, y0 = (int)sy;          // both >= 0 here
+            const float u = sx - (float)x0, v = sy - (float)y0;
+            const float* r0 = SRC + (size_t)y0 * STEP + x0;
+            const float* r1 = r0 + STEP;
+            const float top = r0[0] + u * (r0[1] - r0[0]);
+            const float bot = r1[0] + u * (r1[1] - r1[0]);
+            out[x] = top + v * (bot - top);
+        }
+    } else {
+        for (int x = 0; x < ws; ++x) {
+            const double d = c.a6 * x + bd;
+            if (d == 0.0) { out[x] = 0.f; continue; }
+            const double inv = 1.0 / d;
+            const double sx = (c.a0 * x + bx) * inv, sy = (c.a3 * x + by) * inv;
+            const int x0 = (int)std::floor(sx), y0 = (int)std::floor(sy);
+            if (x0 < 0 || y0 < 0 || x0 + 1 >= SW || y0 + 1 >= SH) { out[x] = 0.f; continue; }
+            const float u = (float)(sx - x0), v = (float)(sy - y0);
+            const float* r0 = SRC + (size_t)y0 * STEP + x0;
+            const float* r1 = r0 + STEP;
+            const float top = r0[0] + u * (r0[1] - r0[0]);
+            const float bot = r1[0] + u * (r1[1] - r1[0]);
+            out[x] = top + v * (bot - top);
+        }
+    }
+}
+
+// Per-stripe scratch for the single-pass iteration: the sampled rows with a
+// derivative halo of R rows above and below, the derivative planes and the
+// mask rows.  One set per stripe, reused across iterations and levels of the
+// same size.
+struct StripeBuffers { Mat im, gx, gy, lp, mk; };
+struct StripePool {
+    int nstripes = 0, rowsPer = 0, R = 0, ws = 0;
+    bool lap = false;
+    std::vector<StripeBuffers> buf;
+    int prepare(int hs, int ws_, int R_, bool lap_) {
+        const int T = std::max(1, getNumThreads());
+        // stripes per thread: more than one lets the pool balance a worker
+        // that wakes late (FASTECC_STRIPES overrides, for measurement)
+        static int perThread = -1;
+        if (perThread < 0) {
+            const char* e = std::getenv("FASTECC_STRIPES");
+            perThread = e ? std::max(1, std::atoi(e)) : 4;
+        }
+        int n = std::max(1, std::min(T == 1 ? 1 : T * perThread, hs / 16));
+        const int rows = (hs + n - 1) / n;
+        n = (hs + rows - 1) / rows;
+        if (n != nstripes || rows != rowsPer || R_ != R || lap_ != lap || ws_ != ws) {
+            nstripes = n; rowsPer = rows; R = R_; lap = lap_; ws = ws_;
+            buf.assign(n, StripeBuffers());
+            for (size_t i = 0; i < buf.size(); ++i) {
+                buf[i].im.create(rows + 2 * R, ws, CV_32F);
+                buf[i].gx.create(rows, ws, CV_32F);
+                buf[i].gy.create(rows, ws, CV_32F);
+                if (lap) buf[i].lp.create(rows, ws, CV_32F);
+                buf[i].mk.create(rows, ws, CV_8U);
+            }
+        }
+        return nstripes;
+    }
+};
+
+// Masked moments of one stripe, centred on the previous iteration's means.
+struct StripeStats {
+    double n = 0, sd = 0, sdd = 0, se = 0, see = 0, sde = 0;
+    void add(const StripeStats& o) { n += o.n; sd += o.sd; sdd += o.sdd; se += o.se; see += o.see; sde += o.sde; }
+};
 
 #include "gn_fused.inc"
 
@@ -374,21 +508,26 @@ double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
     const int imageFlags = INTER_LINEAR  + WARP_INVERSE_MAP;
     const int maskFlags  = INTER_NEAREST + WARP_INVERSE_MAP;
 
+    // The single-pass iteration: per stripe of rows, sample the warped image
+    // straight from the blurred input (with a derivative halo), take the
+    // gradients and the laplacian in the stripe, solve for the mask rows, and
+    // accumulate the masked moments and the Gauss-Newton sums -- nothing
+    // full-size is written and the whole iteration is one parallel region.
+    // The planes are centred on the previous iteration's means (the current
+    // ones are not known until the pass is over) and the projections are
+    // corrected exactly afterwards with the column sums VJ.  A user mask, or
+    // a projective denominator that changes sign over the template, takes
+    // the multi-pass path below instead; FASTECC_LEGACY_PIPELINE forces it.
+    const bool canFuse = (flags & FASTECC_LEGACY_PIPELINE) == 0 && inputMaskMat.empty();
+    double muPrevI = 0, muPrevT = 0;
+    if (canFuse) { const Scalar m0 = mean(templateFloat); muPrevI = muPrevT = m0[0]; }
+    StripePool pool;
+
     // iteratively update map_matrix
     double rho      = -1;
     double last_rho = - termination_eps;
     for (int i = 1; (i <= numberOfIterations) && (fabs(rho-last_rho)>= termination_eps); i++)
     {
-        // Warp-back ONLY the image.  The gradient images are NOT warped: we
-        // take gradients of the warped image and recombine them with the
-        // warp's linear part inside the fused pass.  This removes two warps
-        // per iteration; the mask below removes a third when it can be solved
-        // for instead.
-        if (motionType != MOTION_HOMOGRAPHY)
-            warpAffine(imageFloat, imageWarped, map, imageWarped.size(), imageFlags);
-        else
-            warpPerspective(imageFloat, imageWarped, map, imageWarped.size(), imageFlags);
-
         // The Gaussian pre-filter above extrapolated the template border
         // (BORDER_REFLECT_101), so a ring of gaussFiltSize/2 px of
         // templateFloat is fabricated rather than measured.  Used at full
@@ -400,48 +539,67 @@ double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
         // the 5-tap stencil must not be formed from reflected samples either
         if (useGrad5 && imageMask.rows > 4 && imageMask.cols > 4) ring = std::max(ring, 2);
 
-        // The mask: solved for when there is no user mask (see analyticMask),
-        // warped like the image otherwise.
-        if (!(inputMaskMat.empty() && analyticMask(imageMask, map, motionType, wd, hd, ring)))
-        {
-            ensurePreMask();
-            if (motionType != MOTION_HOMOGRAPHY)
-                warpAffine(preMask, imageMask, map, imageMask.size(), maskFlags);
-            else
-                warpPerspective(preMask, imageMask, map, imageMask.size(), maskFlags);
-            imageMask.rowRange(0, ring).setTo(0);
-            imageMask.rowRange(imageMask.rows - ring, imageMask.rows).setTo(0);
-            imageMask.colRange(0, ring).setTo(0);
-            imageMask.colRange(imageMask.cols - ring, imageMask.cols).setTo(0);
-        }
-
-        // gradients of the WARPED image (chain rule: d/dx[I(W(x))] = J_W^T grad(I)).
-        // Left as they are: the fused pass masks them per pixel.
-        if (useGrad5) {
-            filter2D(imageWarped, imageWarpedGradientX, -1, dx5);
-            filter2D(imageWarped, imageWarpedGradientY, -1, dx5.t());
+        double imgMean = 0, tmpMean = 0, imgNorm = 0, tmpNorm = 0, correlation = 0;
+        const bool fused = canFuse && WarpCoef(map, motionType).denominatorPositive(ws, hs);
+        if (fused) {
+            // the kernel centres on the previous means; the pass fixes the rest
+            imgMean = muPrevI; tmpMean = muPrevT;
         } else {
-            filter2D(imageWarped, imageWarpedGradientX, -1, dx3);
-            filter2D(imageWarped, imageWarpedGradientY, -1, dx3.t());
-        }
-        if (useLap)
-            Laplacian(imageWarped, imageWarpedLaplacian, CV_32F, 1);
+            // Warp-back ONLY the image.  The gradient images are NOT warped: we
+            // take gradients of the warped image and recombine them with the
+            // warp's linear part inside the fused pass.  This removes two warps
+            // per iteration; the mask below removes a third when it can be solved
+            // for instead.
+            if (motionType != MOTION_HOMOGRAPHY)
+                warpAffine(imageFloat, imageWarped, map, imageWarped.size(), imageFlags);
+            else
+                warpPerspective(imageFloat, imageWarped, map, imageWarped.size(), imageFlags);
 
-        // The normalisation from one pass of masked moments.  With N pixels in
-        // the mask and S1, S2 the masked sums of a plane and its square, the
-        // sum of squares about the mean is S2 - S1^2/N, and the correlation of
-        // the two centred planes is sum(I T) - S_I S_T / N.  These are the
-        // quantities OpenCV forms with meanStdDev, countNonZero and a dot
-        // product on explicitly centred, explicitly masked copies.
-        const MaskedStats st = maskedStats(imageWarped, templateFloat, imageMask);
-        if (st.n == 0) {
-          CV_Error(Error::StsNoConv, "NaN encountered.");
+
+            // The mask: solved for when there is no user mask (see analyticMask),
+            // warped like the image otherwise.
+            if (!(inputMaskMat.empty() && analyticMask(imageMask, map, motionType, wd, hd, ring)))
+            {
+                ensurePreMask();
+                if (motionType != MOTION_HOMOGRAPHY)
+                    warpAffine(preMask, imageMask, map, imageMask.size(), maskFlags);
+                else
+                    warpPerspective(preMask, imageMask, map, imageMask.size(), maskFlags);
+                imageMask.rowRange(0, ring).setTo(0);
+                imageMask.rowRange(imageMask.rows - ring, imageMask.rows).setTo(0);
+                imageMask.colRange(0, ring).setTo(0);
+                imageMask.colRange(imageMask.cols - ring, imageMask.cols).setTo(0);
+            }
+
+            // gradients of the WARPED image (chain rule: d/dx[I(W(x))] = J_W^T grad(I)).
+            // Left as they are: the fused pass masks them per pixel.
+            if (useGrad5) {
+                filter2D(imageWarped, imageWarpedGradientX, -1, dx5);
+                filter2D(imageWarped, imageWarpedGradientY, -1, dx5.t());
+            } else {
+                filter2D(imageWarped, imageWarpedGradientX, -1, dx3);
+                filter2D(imageWarped, imageWarpedGradientY, -1, dx3.t());
+            }
+            if (useLap)
+                Laplacian(imageWarped, imageWarpedLaplacian, CV_32F, 1);
+
+            // The normalisation from one pass of masked moments.  With N pixels in
+            // the mask and S1, S2 the masked sums of a plane and its square, the
+            // sum of squares about the mean is S2 - S1^2/N, and the correlation of
+            // the two centred planes is sum(I T) - S_I S_T / N.  These are the
+            // quantities OpenCV forms with meanStdDev, countNonZero and a dot
+            // product on explicitly centred, explicitly masked copies.
+            const MaskedStats st = maskedStats(imageWarped, templateFloat, imageMask);
+            if (st.n == 0) {
+              CV_Error(Error::StsNoConv, "NaN encountered.");
+            }
+            imgMean = st.si / st.n;
+            tmpMean = st.st / st.n;
+            imgNorm = std::sqrt(std::max(st.sii - st.si * st.si / st.n, 0.0));
+            tmpNorm = std::sqrt(std::max(st.stt - st.st * st.st / st.n, 0.0));
+            correlation = st.sit - st.si * st.st / st.n;
+
         }
-        const double imgMean = st.si / st.n;
-        const double tmpMean = st.st / st.n;
-        const double imgNorm = std::sqrt(std::max(st.sii - st.si * st.si / st.n, 0.0));
-        const double tmpNorm = std::sqrt(std::max(st.stt - st.st * st.st / st.n, 0.0));
-        const double correlation = st.sit - st.si * st.st / st.n;
 
         // The Gram matrix and both projections come out of a single pass over
         // the raw planes, with no jacobian materialised and nothing centred,
@@ -451,10 +609,106 @@ double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
         const float* h = map.ptr<float>(0);
         // each motion type has a kernel with and without the laplacian column;
         // the coefficients are the same, so one generic lambda fills either
+        // Single pass: stripes of sampled rows, derivatives in the stripe,
+        // mask rows solved, moments and Gauss-Newton sums accumulated, then
+        // the exact correction of the projections to the true means.
+        auto fusedIteration = [&](auto& proto) {
+            using Acc = typename std::decay<decltype(proto)>::type;
+            const int R = useGrad5 ? 2 : 1;
+            const int nstripes = pool.prepare(hs, ws, R, useLap);
+            std::vector<Acc> parts(nstripes, proto);
+            std::vector<StripeStats> stats(nstripes);
+            const WarpCoef coef(map, motionType);
+            const float mI = (float)muPrevI, mT = (float)muPrevT;
+            parallel_for_(Range(0, nstripes), [&](const Range& rg) {
+                for (int si = rg.start; si < rg.end; ++si) {
+                    StripeBuffers& B = pool.buf[si];
+                    const int y0 = si * pool.rowsPer, y1 = std::min(hs, y0 + pool.rowsPer);
+                    if (y0 >= y1) continue;
+                    const int hsub = y1 - y0;
+                    // 1. the warped rows, halo included (buffer row k = image row y0 - R + k)
+                    for (int y = y0 - R; y < y1 + R; ++y)
+                        sampleRow(imageFloat, coef, y, hs, B.im.ptr<float>(y - (y0 - R)), ws);
+                    // 2. mask rows, 3. derivatives, 4. moments
+                    StripeStats& st = stats[si];
+                    for (int y = y0; y < y1; ++y) {
+                        const int k = y - y0;
+                        uchar* mk = B.mk.ptr<uchar>(k);
+                        int x0 = ws, x1 = ws;
+                        if (y >= ring && y < hs - ring) {
+                            if (!rowInterval(coef, y, ws, wd, hd, ring, x0, x1)) { x0 = x1 = ws; }
+                        }
+                        std::memset(mk, 0, ws);
+                        if (x1 > x0) std::memset(mk + x0, 1, x1 - x0);
+
+                        const float* r0 = B.im.ptr<float>(k + R);
+                        const float* rm1 = r0 - B.im.step1();
+                        const float* rp1 = r0 + B.im.step1();
+                        float* gx = B.gx.ptr<float>(k);
+                        float* gy = B.gy.ptr<float>(k);
+                        float* lp = useLap ? B.lp.ptr<float>(k) : nullptr;
+                        if (x1 <= x0) continue;
+                        if (useGrad5) {
+                            const float* rm2 = rm1 - B.im.step1();
+                            const float* rp2 = rp1 + B.im.step1();
+                            for (int x = x0; x < x1; ++x) {
+                                gx[x] = (r0[x - 2] - 8.f * r0[x - 1] + 8.f * r0[x + 1] - r0[x + 2]) * (1.f / 12);
+                                gy[x] = (rm2[x] - 8.f * rm1[x] + 8.f * rp1[x] - rp2[x]) * (1.f / 12);
+                            }
+                        } else {
+                            for (int x = x0; x < x1; ++x) {
+                                gx[x] = 0.5f * (r0[x + 1] - r0[x - 1]);
+                                gy[x] = 0.5f * (rp1[x] - rm1[x]);
+                            }
+                        }
+                        if (useLap)
+                            for (int x = x0; x < x1; ++x)
+                                lp[x] = r0[x - 1] + r0[x + 1] + rm1[x] + rp1[x] - 4.f * r0[x];
+                        const float* tm = templateFloat.ptr<float>(y);
+                        double n = 0, sd = 0, sdd = 0, se = 0, see = 0, sde = 0;
+                        for (int x = x0; x < x1; ++x) {
+                            const double d = r0[x] - mI, e = tm[x] - mT;
+                            n += 1; sd += d; sdd += d * d; se += e; see += e * e; sde += d * e;
+                        }
+                        st.n += n; st.sd += sd; st.sdd += sdd; st.se += se; st.see += see; st.sde += sde;
+                    }
+                    // 5. the Gauss-Newton sums of this stripe
+                    Mat imView(hsub, ws, CV_32F, B.im.ptr<float>(R), B.im.step);
+                    Mat gxView = B.gx.rowRange(0, hsub), gyView = B.gy.rowRange(0, hsub);
+                    Mat lpView = useLap ? B.lp.rowRange(0, hsub) : Mat();
+                    Mat mkView = B.mk.rowRange(0, hsub);
+                    parts[si].rows(gxView, gyView, imView, templateFloat, lpView, mkView, y0, y1, y0);
+                }
+            }, (double)nstripes);
+            Acc total = proto;
+            std::fill(total.H, total.H + Acc::P * (Acc::P + 1) / 2, 0.0);
+            std::fill(total.VI, total.VI + Acc::P, 0.0);
+            std::fill(total.VT, total.VT + Acc::P, 0.0);
+            std::fill(total.VJ, total.VJ + Acc::P, 0.0);
+            StripeStats st;
+            for (int si = 0; si < nstripes; ++si) { total.add(parts[si]); st.add(stats[si]); }
+            if (st.n == 0) {
+              CV_Error(Error::StsNoConv, "NaN encountered.");
+            }
+            const double meanI = muPrevI + st.sd / st.n;
+            const double meanT = muPrevT + st.se / st.n;
+            imgNorm = std::sqrt(std::max(st.sdd - st.sd * st.sd / st.n, 0.0));
+            tmpNorm = std::sqrt(std::max(st.see - st.se * st.se / st.n, 0.0));
+            correlation = st.sde - st.sd * st.se / st.n;
+            for (int q = 0; q < Acc::P; ++q) {
+                total.VI[q] -= (meanI - muPrevI) * total.VJ[q];
+                total.VT[q] -= (meanT - muPrevT) * total.VJ[q];
+            }
+            storeSystem(total, hessian, imageProjection, templateProjection);
+            muPrevI = meanI; muPrevT = meanT;
+        };
         auto run = [&](auto& acc) {
-            runFusedGN(acc, imageWarpedGradientX, imageWarpedGradientY, imageWarped,
-                       templateFloat, imageWarpedLaplacian, imageMask,
-                       hessian, imageProjection, templateProjection);
+            if (fused)
+                fusedIteration(acc);
+            else
+                runFusedGN(acc, imageWarpedGradientX, imageWarpedGradientY, imageWarped,
+                           templateFloat, imageWarpedLaplacian, imageMask,
+                           hessian, imageProjection, templateProjection);
         };
         if (motionType == MOTION_AFFINE)
         {

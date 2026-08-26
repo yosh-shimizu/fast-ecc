@@ -66,9 +66,9 @@
   5-tap reaches the floor in 3 iterations instead of 4–5; and an experiment on estimating
   sigma, which cannot work, leaves behind a laplacian column that halves the first step,
   widens the basin and lowers the real-image error 2.6×. Together, 2.9–4.5× against a
-  border-fixed ecc.cpp in the bundled bench; against eccms.cpp the faster single-scale
-  implementation, and with its own pyramid 1.15–1.7× faster on the real image whatever
-  the start.</p>
+  border-fixed ecc.cpp per call in the bundled bench, 4.6–5× per iteration on four threads
+  once the iteration is one parallel pass; against eccms.cpp 1.4–1.8× faster on the real
+  image whatever the start, at 2.3× the accuracy.</p>
 </a>
 
 <p class="note">
