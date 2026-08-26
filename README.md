@@ -53,6 +53,7 @@ the numbers below are taken against a corrected OpenCV baseline.
 | Equivalence test with a margin of real data, run under every flag set | landed |
 | Coarse-to-fine pyramid (`nlevels`), like `findTransformECCMultiScale` | landed, default 3 levels |
 | One parallel pass per iteration, exact bilinear sampling (no 1/32 px rounding) | landed |
+| Sampler vectorised (OpenCV universal intrinsics; scalar loops below OpenCV 4.7) | landed |
 
 ### What was wrong, and how it is guarded now
 
@@ -114,11 +115,11 @@ default flags, single scale, against a border-fixed OpenCV:
 
 | window | 4 threads | 1 thread |
 |---:|---:|---:|
-| 256 | **4.96×** | 1.94× |
-| 512 | 4.56× | 1.99× |
-| 768 | **4.84×** | 2.40× |
+| 256 | 5.13× | 2.27× |
+| 512 | 5.27× | 2.48× |
+| 768 | **5.56×** | **2.74×** |
 
-Four changes contribute, and they cover each other. The **warp reduction** takes the
+Five changes contribute, and they cover each other. The **warp reduction** takes the
 three bilinear warps per iteration down to one. The **fused Gauss–Newton stage** builds
 the Hessian and both projections in one pass without materialising the Jacobian, and the
 saving grows with the parameter count. The **folded normalisation** removes the eleven
@@ -127,7 +128,10 @@ iteration once the other two had landed. And the **single-pass iteration** turns
 left — a warp, three filters, two reductions, each its own fork/join and each writing a
 plane for the next — into one parallel region per iteration, which is where the
 four-thread column comes from: single-thread cost is unchanged, two threads gain 1.2–1.3×
-and four 1.6–2.1× over the multi-pass layout.
+and four 1.6–2.1× over the multi-pass layout. The **vectorised sampler** takes the last
+big scalar loop, the bilinear gather of the warped rows (25–35 % of a single-thread
+iteration), down by 1.9–2.4×: 1.17–1.31× on the iteration at one thread and 1.0–1.08× at four
+(the four-thread profile has not been taken; the single-thread one is below).
 
 The bundled `./build/bench` (512×512, best of 20 calls, the start 3 px and a few
 percent off) shows the per-motion spread against both OpenCV implementations —
@@ -136,24 +140,24 @@ with its default 4-level pyramid and single-scale):
 
 | one thread | cv | eccms, 4 levels | fast, 1 level | fast, 3 levels (default) | fast 3 vs cv | fast 3 vs eccms | fast 1 vs eccms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| TRANSLATION | 39.7 ms | 10.4 ms | 13.5 ms | 12.9 ms | 3.1× | 0.81× | 0.77× |
-| EUCLIDEAN | 56.0 ms | 12.3 ms | 24.4 ms | 16.0 ms | 3.5× | 0.77× | 0.50× |
-| AFFINE | 68.0 ms | 15.8 ms | 32.9 ms | 16.7 ms | 4.1× | 0.94× | 0.48× |
-| HOMOGRAPHY | 194.6 ms | 24.9 ms | 86.8 ms | 28.4 ms | **6.9×** | 0.88× | 0.29× |
+| TRANSLATION | 39.4 ms | 10.5 ms | 11.3 ms | 10.7 ms | 3.7× | 0.98× | 0.93× |
+| EUCLIDEAN | 55.2 ms | 12.2 ms | 21.0 ms | 13.3 ms | 4.2× | 0.92× | 0.58× |
+| AFFINE | 71.8 ms | 15.8 ms | 28.3 ms | 15.0 ms | 4.8× | **1.06×** | 0.56× |
+| HOMOGRAPHY | 194.6 ms | 24.8 ms | 69.7 ms | 23.1 ms | **8.4×** | **1.07×** | 0.36× |
 
 | two threads | cv | eccms, 4 levels | fast, 1 level | fast, 3 levels (default) | fast 3 vs cv | fast 3 vs eccms | fast 1 vs eccms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| TRANSLATION | 35.9 ms | 8.0 ms | 9.9 ms | 10.4 ms | 3.4× | 0.77× | 0.81× |
-| EUCLIDEAN | 50.1 ms | 8.4 ms | 17.0 ms | 12.1 ms | 4.1× | 0.69× | 0.49× |
-| AFFINE | 62.7 ms | 10.0 ms | 21.9 ms | 12.4 ms | 5.1× | 0.80× | 0.46× |
-| HOMOGRAPHY | 172.3 ms | 14.7 ms | 54.1 ms | 18.4 ms | **9.4×** | 0.80× | 0.27× |
+| TRANSLATION | 35.2 ms | 8.2 ms | 8.2 ms | 9.5 ms | 3.7× | 0.86× | 0.99× |
+| EUCLIDEAN | 50.9 ms | 8.3 ms | 14.7 ms | 10.5 ms | 4.9× | 0.80× | 0.57× |
+| AFFINE | 65.5 ms | 9.5 ms | 19.0 ms | 11.2 ms | 5.9× | 0.85× | 0.50× |
+| HOMOGRAPHY | 175.7 ms | 15.3 ms | 44.9 ms | 16.5 ms | **10.7×** | 0.93× | 0.34× |
 
 | four threads | cv | eccms, 4 levels | fast, 1 level | fast, 3 levels (default) | fast 3 vs cv | fast 3 vs eccms | fast 1 vs eccms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| TRANSLATION | 30.2 ms | 6.6 ms | 6.7 ms | 7.9 ms | 3.8× | 0.83× | 0.98× |
-| EUCLIDEAN | 45.6 ms | 6.8 ms | 10.4 ms | 9.7 ms | 4.7× | 0.70× | 0.65× |
-| AFFINE | 60.3 ms | 7.9 ms | 13.8 ms | 8.3 ms | 7.3× | 0.95× | 0.57× |
-| HOMOGRAPHY | 160.2 ms | 10.4 ms | 31.7 ms | 11.2 ms | **14.3×** | 0.92× | 0.33× |
+| TRANSLATION | 30.4 ms | 6.0 ms | 5.7 ms | 7.0 ms | 4.3× | 0.85× | 1.05× |
+| EUCLIDEAN | 45.2 ms | 6.2 ms | 8.4 ms | 7.6 ms | 6.0× | 0.82× | 0.74× |
+| AFFINE | 62.4 ms | 7.3 ms | 11.3 ms | 6.9 ms | 9.0× | **1.06×** | 0.65× |
+| HOMOGRAPHY | 165.9 ms | 11.3 ms | 25.5 ms | 9.6 ms | **17.3×** | **1.18×** | 0.44× |
 
 (Each ratio is taken within one run. Run `./build/bench 512 20 <threads> <eccmsLevels>
 <fastLevels>` to reproduce. Corner errors in this bench: eccms 0.006–0.022 px, fast-ecc
@@ -171,17 +175,16 @@ OpenCV 4.12 added `cv::findTransformECCMultiScale`: a fresh implementation with 
 Two things separate it from `findTransformECC`, and only one of them is the speed of the
 implementation.
 
-- **Single-scale, the two implementations are close.** With `nlevels = 1` eccms is
-  1.6–2.7× faster than ecc.cpp on one thread, and fast-ecc is a further 1.17–1.37×
-  faster than that. With two or four threads eccms's stripes scale better than
-  fast-ecc's mix of OpenCV calls and fused passes, and the two are level to slightly
-  in eccms's favour (fast-ecc at 0.86–1.05× of it).
+- **Single-scale, fast-ecc is ahead.** With `nlevels = 1` on both, fast-ecc is
+  1.33–1.58× faster than eccms on one thread, 1.05–1.26× on two and 1.31–1.52× on four
+  (bench, 512²; eccms itself is 1.7–2.7× faster than ecc.cpp single-scale on one thread).
 - **The pyramid is what made eccms faster**, by 2–3× against single-scale fast-ecc in
   this bench, whose start is 3 px and a few percent off so that the coarse levels take
   most of the iterations at 1/16 to 1/64 of the pixels. With its own pyramid
-  ([below](#coarse-to-fine-nlevels)) and the single-pass iteration fast-ecc is at
-  0.77–0.94× of eccms on one thread and 0.70–0.95× on four in this bench. What remains
-  is the sampler: eccms's is SIMD fixed-point, fast-ecc's is a scalar exact one.
+  ([below](#coarse-to-fine-nlevels)), the single-pass iteration and the vectorised
+  sampler fast-ecc is level with eccms in this bench — 0.92–1.07× of it on one thread,
+  0.80–0.93× on two, 0.82–1.18× on four — ahead on affine and homography, behind on
+  translation and euclidean, with an exact sampler where eccms's is fixed-point.
 - **On the real image the order reverses.** At window 384 with the start 1–6 px off,
   fast-ecc with its default 3 levels takes 9.7 ms on one thread, 7.5 on two and
   4.9–5.7 on four, against 15.6 / 10.7 / 8.5–9.2 ms for eccms with four levels —
@@ -367,6 +370,31 @@ Per iteration, affine, multi-pass → single-pass, best of 3 interleaved runs:
 | 200 | 0.693 → 0.684 ms | 0.609 → 0.462 ms (1.32×) | 0.566 → 0.277 ms (**2.05×**) |
 | 512 | 4.608 → 4.704 ms | 3.590 → 3.042 ms (1.18×) | 2.933 → 1.832 ms (**1.60×**) |
 | 512, homography | 9.28 → 8.91 ms | 5.92 → 5.89 ms | 4.31 → 3.45 ms (1.25×) |
+
+The sampler is vectorised with OpenCV's universal intrinsics in their function form,
+which needs OpenCV ≥ 4.7; an older OpenCV, or `-DFASTECC_NO_SIMD`, gets the scalar loops,
+and CI runs the equivalence test on both. Per row it makes two passes over chunks of 64
+pixels: the coordinates, truncated and split into tap index and fractions, are streamed
+into small buffers first, then gathered and combined as a weighted sum of the four taps,
+so that nothing but the gathers and the weighting is on the second pass's dependency
+chain. The affine span and the projective row (now in single precision like the affine
+one) share their arithmetic with the scalar tails, so the lanes and the tail agree bit
+for bit and a row does not depend on where the vector part ends. The single-pass stage
+profile (`eval/spbench.cpp`, one thread, window 512, ms per iteration):
+
+| motion | sampler, scalar → SIMD | iteration |
+|---|---:|---:|
+| translation | 1.03 → 0.43 (2.4×) | 2.94 → 2.25 (1.31×) |
+| euclidean | 1.29 → 0.68 (1.9×) | 3.95 → 3.32 (1.19×) |
+| affine | 1.23 → 0.64 (1.9×) | 4.72 → 4.04 (1.17×) |
+| homography | 2.60 → 1.10 (2.4×) | 8.60 → 7.08 (1.21×) |
+
+An external build sees only SSE2 (or NEON) through OpenCV's headers — the AVX2 gathers
+need OpenCV's in-tree dispatch — so a tap vector is four scalar loads and three shuffles,
+and the pass is bound by the load ports at about 4 cycles per pixel where the taps stay
+in L1; a rotation spreads them over rows and costs another 50 %. The fixed points are
+unchanged to four digits. What is left of the single-thread iteration is the
+Gauss–Newton pass, 60–70 % of it.
 
 The sampler uses exact bilinear weights, where OpenCV's warp rounds the sampling
 coordinate to 1/32 px (see [exact-warp](#not-bit-identical-to-opencv)). That is why the
