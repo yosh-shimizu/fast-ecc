@@ -236,9 +236,37 @@ pay: on the real image at window 384, fast-ecc is level with eccms with its four
 <li><b>Accuracy on the real image</b> (affine, window 200, started at the truth): eccms 0.0078 px with four levels, 0.0076
 with one; ecc.cpp 0.0072; fast-ecc 0.0028.</li>
 </ul>
-<p>A pyramid on top of fast-ecc's single-scale iteration is the obvious next step, orthogonal to everything above.</p>
+<h3>6.2 A pyramid for fast-ecc</h3>
+<p><code>findTransformECC</code> now takes a trailing <code>nlevels</code> (default 1). Above 1 it runs coarse to fine over a
+<code>pyrDown</code> pyramid the way eccms does: each level runs the whole single-scale iteration on the downsampled images
+and hands its warp to the next finer level scaled by <span class="m">S</span><sup>−1</sup><span class="m">W S</span>. A coarse
+level that gives up is skipped rather than fatal, and the finest level is the same iteration as before, so the floor is
+unchanged (analytic 0.0015 px, real image 0.0028 px, at 1, 2, 3 and 4 levels). What the pyramid buys is the start:</p>
+<div class="tw"><table>
+<tr><th>fruits, affine, window 384, one thread, ms per call (corner error)</th><th>start 1 px off</th><th>3 px</th><th>6 px</th></tr>
+<tr><td>cv (ecc.cpp)</td><td>33.2 (0.0030)</td><td>33.5</td><td>53.8</td></tr>
+<tr><td>eccms, 4 levels</td><td>16.4 (0.0032)</td><td>17.6</td><td>17.8</td></tr>
+<tr><td>fast-ecc, 1 level</td><td>12.1 (0.0019)</td><td>15.8</td><td>24.0</td></tr>
+<tr><td>fast-ecc, 3 levels</td><td><b>10.4 (0.0019)</b></td><td><b>10.5</b></td><td><b>10.5</b></td></tr>
+</table></div>
+<p>With the start 3 px off, on two and four threads: eccms 11.8 / 9.2 ms, fast-ecc 1 level 12.9 / 9.4 ms, 3 levels
+9.1 / 8.1 ms. The basin on the real image goes from 85 % (1 level) to 99–100 % (3–4 levels) at ×4 the default deformation,
+where eccms sits; for homography from 62 % to 96 %.</p>
+<div class="tw"><table>
+<tr><th>bench 512², start 3 px and a few percent off; fast-ecc 4 levels against eccms 4 levels</th><th>one thread</th><th>two</th><th>four</th></tr>
+<tr><td>TRANSLATION</td><td>0.86×</td><td>0.86×</td><td>0.69×</td></tr>
+<tr><td>EUCLIDEAN</td><td>0.84×</td><td>0.75×</td><td>0.69×</td></tr>
+<tr><td>AFFINE</td><td>0.96×</td><td>0.83×</td><td>0.78×</td></tr>
+<tr><td>HOMOGRAPHY</td><td>0.97×</td><td>0.84×</td><td>0.72×</td></tr>
+</table></div>
+<p>In the bench the pyramid closes most of the gap to eccms on one thread and less of it with threads: eccms does an
+iteration in one parallel pass, fast-ecc in a sequence of OpenCV calls and fused passes, each a fork/join, and the
+coarse levels are small enough for that to show. Against ecc.cpp the four-level fast-ecc is 3.3–8.0× faster on one
+thread and 3.0–10.1× on four. <code>nlevels = 3</code> is the recommendation whenever the start may be more than a pixel
+off; it is not the default because a band-limited or very small template can have nothing left at the coarse levels
+(the analytic 200 px scene loses 4 % of trials at 4 levels even with the fallback).</p>
 
-<h3>6.2 As landed, against ecc.cpp</h3>
+<h3>6.3 As landed, against ecc.cpp</h3>
 <div class="tw"><table>
 <tr><th>affine, window 200, 200 trials, started at the ground truth</th><th>cv (fixed)</th><th>fast, flags = 0</th><th>fast (default)</th></tr>
 <tr><td>corner RMS, analytic scene</td><td>0.0017 px</td><td>0.0017 px</td><td><b>0.0015 px</b></td></tr>
@@ -274,8 +302,8 @@ iteration.</li>
 <li><b>Together, against a border-fixed ecc.cpp:</b> 1.9–3.5× per iteration on affine depending on window and threads, 2.9–4.5× per
 call in the bundled bench, and a lower floor rather than an equal one. <b>Against eccms.cpp</b> fast-ecc is the faster
 single-scale implementation on one thread (1.17–1.37×), level with it on two to four, and the more accurate one (0.0028 vs
-0.0078 px on the real image); eccms's default pyramid wins by 1.3–3.5× whenever the start is far enough off for the coarse
-levels to pay. The pyramid is what fast-ecc lacks.</li>
+0.0078 px on the real image). With its own pyramid it is 1.15–1.7× faster than eccms on the real image whatever the start,
+and within 0.84–0.97× of it on one thread in the bench, where the remaining gap is thread scaling.</li>
 </ol>
 
 <footer>
