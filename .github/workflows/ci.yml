@@ -11,9 +11,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 24.04 ships OpenCV 4.6 (the sampler's scalar loops), 26.04 ships 4.10
-        # (its universal-intrinsics path); both must build and pass
-        image: [ "ubuntu:24.04", "ubuntu:26.04" ]
+        include:
+          # 24.04 ships OpenCV 4.6: the scalar loops.  26.04 ships 4.10: the
+          # universal-intrinsics paths at 128 bits, and with FAST_ECC_AVX2 at
+          # 256 bits with FMA (GitHub's runners have AVX2).  All three must
+          # build and pass.
+          - { image: "ubuntu:24.04", avx2: "OFF" }
+          - { image: "ubuntu:26.04", avx2: "OFF" }
+          - { image: "ubuntu:26.04", avx2: "ON" }
+    name: build-and-test (${{ matrix.image }}, AVX2 ${{ matrix.avx2 }})
     container: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +33,7 @@ jobs:
         run: python3 tools/gen_gn_kernels.py --check
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFAST_ECC_AVX2=${{ matrix.avx2 }}
 
       - name: Build
         run: cmake --build build --config Release -j

@@ -357,6 +357,40 @@ thread and 2.0–3.0× on four. On the real image (window 384, start 1–6 px of
 two / four threads against 16.9–18.2 / 11.6–12.9 / 9.4–9.8 for eccms, 2.0–2.6×, at 0.0014 px against 0.0032. The fixed
 points are unchanged to four digits, floors and biases alike.</p>
 
+<h3>6.6 Eight lanes, on request</h3>
+<p>What stops the 128-bit kernel is not the algebra. The vector loop of the affine kernel with the laplacian column
+compiles (MSVC, SSE2) to 181 instructions per four pixels: 76 floating-point operations, 88 register moves — 56 of
+them spills and reloads of the 32 lane accumulators over 16 registers, the rest the copies that two-operand SSE
+encoding needs — and a handful of loads. That is issue-bound at about 45 cycles per four pixels, with the two
+floating-point ports (38 cycles) close behind; the measured 12 cycles per pixel is that. Splitting the loop into a
+Gram sweep and a projection sweep would recompute the gradients and change nothing else. Hoisting the
+<span class="m">x·y</span> Gram column to the row end (it is <span class="m">y</span> times the
+<span class="m">x</span> column, exactly) took three accumulators and six operations off; what is left needs wider
+lanes and fused multiply-adds.</p>
+<p>An external build does not get them from OpenCV: its headers enable SSE2 alone outside its own build, whatever
+the compiler was given, because the feature macros come from a generated file the dispatch machinery owns. The
+macros can be set by hand. <code>-DFAST_ECC_AVX2=ON</code> compiles with <code>/arch:AVX2</code> (or
+<code>-mavx2 -mfma</code>) and defines <code>CV_AVX2</code>, <code>CV_FMA3</code> and the SSE3–4.2 macros ahead
+of the headers, which then bring in the 256-bit universal intrinsics; the vector code, written width-agnostically
+(<code>vx_load</code>, <code>vlanes()</code>), needs no other change and runs at eight lanes with fused
+multiply-adds and hardware gathers. It is off by default because the binary then requires an AVX2 CPU. OpenCV
+4.10's wrapper layer and 4.15's native functions both compile it; the equivalence test passes under it and the
+fixed points are unchanged to four digits.</p>
+<div class="tw"><table>
+<tr><th>ms per iteration, window 512, one thread, same run: scalar → default (SSE2, 4 lanes) → AVX2 (8 lanes + FMA)</th><th>sampler</th><th>derivatives + moments</th><th>Gauss–Newton</th><th>iteration</th></tr>
+<tr><td>translation</td><td>1.25 → 0.53 → 0.36</td><td>0.96 → 0.47 → 0.36</td><td>1.02 → 0.38 → 0.21</td><td>3.15 → 1.38 → <b>0.86</b></td></tr>
+<tr><td>euclidean</td><td>1.60 → 0.67 → 0.70</td><td>1.00 → 0.42 → 0.44</td><td>1.95 → 0.63 → 0.37</td><td>4.39 → 1.81 → <b>1.27</b></td></tr>
+<tr><td>affine</td><td>1.44 → 0.70 → 0.55</td><td>0.95 → 0.46 → 0.38</td><td>2.37 → 0.79 → 0.38</td><td>5.12 → 1.93 → <b>1.36</b></td></tr>
+<tr><td>homography</td><td>3.18 → 1.24 → 0.83</td><td>1.00 → 0.47 → 0.41</td><td>5.06 → 1.49 → 0.77</td><td>8.92 → 3.14 → <b>2.06</b></td></tr>
+</table></div>
+<p>The kernels gain 1.7–2.1× over the 128-bit build, the sampler 1.0–1.5× (its gathers are now one instruction,
+but a gather is a slow one), the derivative loop 1.0–1.3×; the iteration 1.4–1.6× on one thread. End to end,
+against ecc.cpp per iteration (affine): <b>8.0 / 8.2 / 8.2×</b> on one thread at windows 256 / 512 / 768,
+11.7 / 10.4 / 10.0× on two and <b>17.3 / 14.0 / 11.6×</b> on four; homography at 512, 11.9× and 24.9×. In the
+bench (512², 3 levels against eccms's 4): 1.33–2.65× of eccms on one thread, 1.21–2.21× on two, 1.06–1.90× on
+four, and 5.5–24.7× / 5.1–29.2× of ecc.cpp; single-scale against single-scale 2.3–5.9× on one thread. The real
+image (window 384): 6.1–6.6 / 5.2–5.6 / 4.5–4.9 ms against 17.6–18.9 / 12.2–13.7 / 10.3–11.2 for eccms.</p>
+
 <h2>7. What was tried, and what is left</h2>
 <ul>
 <li><b>A second-order model in the parameters</b> (the image Hessian, inner iterations without a re-warp) was derived and not
@@ -389,6 +423,10 @@ systematic centre offset — is gone.</li>
 and moment loops (2.3×) and the eight Gauss–Newton kernels, whose vector path the generator now emits (2.5–3.3×), all
 with SSE2 alone: 2.4–2.8× on the single-thread iteration, and — the whole stripe rather than one stage competing with
 the thread pool — 1.9× on four threads too.</li>
+<li><b>Eight lanes, on request.</b> The 128-bit kernel is issue-bound (181 instructions per four pixels, a third
+of them spills); <code>-DFAST_ECC_AVX2=ON</code> sets the feature macros OpenCV's headers would not, and the same
+source runs at eight lanes with FMA: 8.0–8.2× per iteration against ecc.cpp on one thread and 11.6–17.3× on four,
+1.06–2.65× of eccms in the bench.</li>
 <li><b>Together, against a border-fixed ecc.cpp:</b> 4.9–5.8× per iteration on one thread and 9.3–10.3× on four (affine,
 windows 256–768), 4.8–16× per call on one thread and 4.9–24× on four in the bundled bench, and a lower floor rather than
 an equal one. <b>Against eccms.cpp</b> fast-ecc is 2.0–2.6× faster on the real image whatever the start and 2.3× more

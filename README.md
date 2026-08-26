@@ -54,6 +54,7 @@ the numbers below are taken against a corrected OpenCV baseline.
 | Coarse-to-fine pyramid (`nlevels`), like `findTransformECCMultiScale` | landed, default 3 levels |
 | One parallel pass per iteration, exact bilinear sampling (no 1/32 px rounding) | landed |
 | The whole stripe vectorised — sampler, derivatives, moments, Gauss–Newton kernels (OpenCV universal intrinsics; scalar loops below OpenCV 4.7) | landed |
+| AVX2 + FMA build (`-DFAST_ECC_AVX2=ON`): eight lanes, gathers, fused multiply-adds | landed, off by default |
 
 ### What was wrong, and how it is guarded now
 
@@ -115,11 +116,22 @@ default flags, single scale, against a border-fixed OpenCV:
 
 | window | 4 threads | 2 threads | 1 thread |
 |---:|---:|---:|---:|
-| 256 | 9.25× | 6.22× | 4.86× |
-| 512 | **10.26×** | 6.94× | 5.16× |
-| 768 | 9.29× | 7.19× | **5.80×** |
+| 256 | 8.9× | 6.6× | 5.2× |
+| 512 | **11.3×** | 6.9× | 5.2× |
+| 768 | 9.7× | 7.6× | **5.6×** |
 
-(Homography at 512: 6.85× on one thread, 14.6× on four.)
+(Homography at 512: 7.2× on one thread, 14.1× on four.)
+
+With the AVX2 build (`-DFAST_ECC_AVX2=ON`: eight lanes and fused multiply-adds; the
+binary then needs an AVX2 CPU):
+
+| window | 4 threads | 2 threads | 1 thread |
+|---:|---:|---:|---:|
+| 256 | **17.3×** | 11.7× | 8.0× |
+| 512 | 14.0× | 10.4× | 8.2× |
+| 768 | 11.6× | 10.0× | 8.2× |
+
+(Homography at 512: 11.9× on one thread, 24.9× on four.)
 
 Five changes contribute, and they cover each other. The **warp reduction** takes the
 three bilinear warps per iteration down to one. The **fused Gauss–Newton stage** builds
@@ -133,7 +145,9 @@ four-thread column comes from: single-thread cost is unchanged, two threads gain
 and four 1.6–2.1× over the multi-pass layout. And the **vectorised stripe** — the sampler,
 the derivative and moment loops and the Gauss–Newton kernels, all in OpenCV's universal
 intrinsics — takes 2.4–2.8× off the single-thread iteration and, being the whole stripe
-rather than one stage competing with the thread pool, 1.9× off the four-thread one.
+rather than one stage competing with the thread pool, 1.9× off the four-thread one. The
+AVX2 build (below) takes another 1.3–1.6× off the single-thread iteration and 1.1–1.9×
+off the four-thread one.
 
 The bundled `./build/bench` (512×512, best of 20 calls, the start 3 px and a few
 percent off) shows the per-motion spread against both OpenCV implementations —
@@ -142,28 +156,38 @@ with its default 4-level pyramid and single-scale):
 
 | one thread | cv | eccms, 4 levels | fast, 1 level | fast, 3 levels (default) | fast 3 vs cv | fast 3 vs eccms | fast 1 vs eccms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| TRANSLATION | 43.2 ms | 11.5 ms | 7.4 ms | 8.9 ms | 4.8× | 1.29× | 1.55× |
-| EUCLIDEAN | 61.4 ms | 13.3 ms | 12.5 ms | 10.6 ms | 5.8× | 1.26× | 1.06× |
-| AFFINE | 73.5 ms | 17.1 ms | 15.5 ms | 10.7 ms | 6.9× | 1.61× | 1.11× |
-| HOMOGRAPHY | 224.8 ms | 25.9 ms | 32.1 ms | 13.9 ms | **16.2×** | **1.87×** | 0.81× |
+| TRANSLATION | 42.2 ms | 10.4 ms | 7.3 ms | 9.1 ms | 4.7× | 1.14× | 1.41× |
+| EUCLIDEAN | 66.1 ms | 12.4 ms | 12.2 ms | 10.8 ms | 6.1× | 1.14× | 1.01× |
+| AFFINE | 82.6 ms | 15.9 ms | 16.7 ms | 10.6 ms | 7.8× | 1.50× | 0.95× |
+| HOMOGRAPHY | 219.2 ms | 25.5 ms | 30.8 ms | 13.6 ms | **16.1×** | **1.87×** | 0.83× |
 
 | two threads | cv | eccms, 4 levels | fast, 1 level | fast, 3 levels (default) | fast 3 vs cv | fast 3 vs eccms | fast 1 vs eccms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| TRANSLATION | 38.0 ms | 9.3 ms | 6.1 ms | 8.2 ms | 4.7× | 1.14× | 1.53× |
-| EUCLIDEAN | 57.4 ms | 10.4 ms | 9.2 ms | 8.8 ms | 6.5× | 1.19× | 1.14× |
-| AFFINE | 67.7 ms | 10.7 ms | 10.8 ms | 8.6 ms | 7.8× | 1.24× | 1.00× |
-| HOMOGRAPHY | 200.8 ms | 15.2 ms | 20.3 ms | 9.1 ms | **22.0×** | **1.66×** | 0.75× |
+| TRANSLATION | 37.4 ms | 8.5 ms | 5.8 ms | 8.1 ms | 4.6× | 1.04× | 1.46× |
+| EUCLIDEAN | 54.1 ms | 9.1 ms | 9.9 ms | 9.5 ms | 5.7× | 0.96× | 0.92× |
+| AFFINE | 72.3 ms | 10.6 ms | 10.2 ms | 8.0 ms | 9.0× | 1.33× | 1.05× |
+| HOMOGRAPHY | 186.0 ms | 15.5 ms | 18.8 ms | 8.9 ms | **21.0×** | **1.76×** | 0.82× |
 
 | four threads | cv | eccms, 4 levels | fast, 1 level | fast, 3 levels (default) | fast 3 vs cv | fast 3 vs eccms | fast 1 vs eccms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| TRANSLATION | 33.1 ms | 7.6 ms | 4.9 ms | 6.7 ms | 4.9× | 1.13× | 1.56× |
-| EUCLIDEAN | 50.4 ms | 7.6 ms | 6.1 ms | 6.9 ms | 7.3× | 1.10× | 1.24× |
-| AFFINE | 62.9 ms | 8.9 ms | 6.0 ms | 6.5 ms | 9.7× | 1.36× | 1.48× |
-| HOMOGRAPHY | 163.6 ms | 11.5 ms | 12.8 ms | 6.8 ms | **24.1×** | **1.69×** | 0.90× |
+| TRANSLATION | 32.5 ms | 7.5 ms | 4.8 ms | 8.2 ms | 4.0× | 0.92× | 1.57× |
+| EUCLIDEAN | 50.5 ms | 7.5 ms | 7.2 ms | 7.9 ms | 6.4× | 0.95× | 1.05× |
+| AFFINE | 64.7 ms | 9.7 ms | 6.7 ms | 6.8 ms | 9.5× | 1.41× | 1.44× |
+| HOMOGRAPHY | 153.2 ms | 11.7 ms | 12.5 ms | 7.5 ms | **20.5×** | **1.56×** | 0.93× |
 
 (Each ratio is taken within one run. Run `./build/bench 512 20 <threads> <eccmsLevels>
 <fastLevels>` to reproduce. Corner errors in this bench: eccms 0.006–0.022 px, fast-ecc
 0.0002–0.005.)
+
+With `-DFAST_ECC_AVX2=ON`, fast-ecc's 3 levels against the same two (ms per call, then the
+ratio to `findTransformECC` and to eccms with its 4 levels):
+
+| AVX2 build | one thread | two threads | four threads |
+|---|---:|---:|---:|
+| TRANSLATION | 8.2 ms — 5.5×, 1.33× | 8.0 ms — 5.0×, 1.26× | 7.0 ms — 5.1×, 1.15× |
+| EUCLIDEAN | 10.0 ms — 6.5×, 1.33× | 8.7 ms — 6.7×, 1.21× | 7.4 ms — 7.7×, 1.06× |
+| AFFINE | 9.1 ms — 9.1×, 1.87× | 8.0 ms — 9.0×, 1.48× | 5.8 ms — 11.0×, 1.51× |
+| HOMOGRAPHY | 10.1 ms — **24.7×**, **2.65×** | 7.4 ms — 27.2×, 2.21× | 6.6 ms — **29.2×**, 1.90× |
 
 Against `findTransformECC`, homography gains most because the Jacobian path re-reads
 its blocks P² times for the Gram matrix, and P = 8. The bench counts iterations to
@@ -178,20 +202,23 @@ Two things separate it from `findTransformECC`, and only one of them is the spee
 implementation.
 
 - **Single-scale, fast-ecc is well ahead.** With `nlevels = 1` on both, fast-ecc is
-  2.0–3.3× faster than eccms on one thread, 1.6–2.8× on two and 2.0–3.0× on four
-  (bench, 512²; eccms itself is 1.8–2.6× faster than ecc.cpp single-scale on one thread).
+  2.1–3.5× faster than eccms on one thread, 1.7–2.7× on two and 1.6–2.9× on four
+  (bench, 512²; eccms itself is 1.9–2.9× faster than ecc.cpp single-scale on one thread);
+  with the AVX2 build 2.3–5.9× on one thread and 2.4–5.0× on four.
 - **The pyramid is what made eccms faster** in this bench, whose start is 3 px and a few
   percent off so that the coarse levels take most of the iterations at 1/16 to 1/64 of
   the pixels: 2–3× against the scalar single-scale fast-ecc, and still 0.8–1.1× against
   the vectorised one. With its own pyramid ([below](#coarse-to-fine-nlevels)) and the
-  vectorised stripe fast-ecc is ahead of eccms in every row of the bench — 1.26–1.87× on
-  one thread, 1.14–1.66× on two, 1.10–1.69× on four — with an exact sampler where
-  eccms's is fixed-point.
+  vectorised stripe fast-ecc is ahead of eccms on affine and homography — 1.50× and
+  1.87× on one thread, 1.41× and 1.56× on four — and level on translation and euclidean
+  (0.92–1.14×; these 6–9 ms calls of three levels vary by ±15 % between runs on four
+  threads), with an exact sampler where eccms's is fixed-point. The AVX2 build is ahead
+  in every row: 1.33–2.65× on one thread, 1.21–2.21× on two, 1.06–1.90× on four.
 - **On the real image the gap is wider.** At window 384 with the start 1–6 px off,
-  fast-ecc with its default 3 levels takes 6.4–7.6 ms on one thread, 5.1–6.0 on two and
-  4.4–4.6 on four, against 16.9–18.2 / 11.6–12.9 / 9.4–9.8 ms for eccms with four levels —
-  2.0–2.6× faster — and its basin matches eccms's (99–100 % at ×4 the default
-  deformation).
+  fast-ecc with its default 3 levels takes 6.3–7.1 ms on one thread, 5.3–5.7 on two and
+  4.3–4.6 on four, against 16.5–17.2 / 11.5–12.5 / 9.3–9.8 ms for eccms with four levels —
+  2.0–2.7× faster (the AVX2 build 6.1–6.6 / 5.2–5.6 / 4.5–4.9 ms, 2.1–2.9×) — and its basin
+  matches eccms's (99–100 % at ×4 the default deformation).
 - **Accuracy on the real image:** eccms 0.0078 px, ecc.cpp 0.0072 px, fast-ecc 0.0025 px
   (affine, window 200, started at the truth); the pyramid does not change the floor.
 
@@ -410,18 +437,27 @@ the scalar loops, and CI runs the equivalence test on both.
 - **Four stripes per thread, on one thread too**: a stripe's planes then stay in L2
   between the sampler, the derivative loop and the kernel, and the kernel pass shrinks
   by up to a third.
+- **Eight lanes, on request.** Outside OpenCV's own build its headers enable SSE2 alone,
+  whatever the compiler was given, so the default build's vectors are four floats wide
+  with separate multiplies and adds — and the kernel's inner loop is then issue-bound:
+  181 instructions per four pixels, 76 of them floating-point, 56 of them spills of the
+  lane accumulators over 16 registers. `-DFAST_ECC_AVX2=ON` compiles with `/arch:AVX2`
+  (or `-mavx2 -mfma`) and defines the feature macros OpenCV's own dispatch would
+  (`CV_AVX2`, `CV_FMA3`, …) ahead of its headers, so the same source — written
+  width-agnostically, `vx_load` and `vlanes()` — runs at eight lanes with fused
+  multiply-adds and hardware gathers. The binary then needs an AVX2 CPU (2013 on).
 
 The vector lanes and the scalar tails share their arithmetic, so a row does not depend
 on where the vector part ends, and the fixed points are unchanged to four digits. The
 single-pass stage profile (`eval/spbench.cpp`, one thread, window 512, ms per iteration,
-scalar → vectorised, same run):
+scalar → default build → AVX2 build, same run):
 
 | motion | sampler | derivatives + moments | Gauss–Newton | iteration |
 |---|---:|---:|---:|---:|
-| translation | 1.27 → 0.46 | 1.13 → 0.49 | 1.15 → 0.44 | 3.48 → 1.44 (**2.4×**) |
-| euclidean | 1.52 → 0.63 | 1.09 → 0.48 | 2.00 → 0.65 | 4.51 → 1.83 (**2.5×**) |
-| affine | 1.52 → 0.65 | 1.10 → 0.47 | 2.74 → 0.87 | 5.28 → 2.02 (**2.6×**) |
-| homography | 2.81 → 1.19 | 1.08 → 0.55 | 5.40 → 1.65 | 9.45 → 3.41 (**2.8×**) |
+| translation | 1.25 → 0.53 → 0.36 | 0.96 → 0.47 → 0.36 | 1.02 → 0.38 → 0.21 | 3.15 → 1.38 → 0.86 (**2.3× → 3.7×**) |
+| euclidean | 1.60 → 0.67 → 0.70 | 1.00 → 0.42 → 0.44 | 1.95 → 0.63 → 0.37 | 4.39 → 1.81 → 1.27 (**2.4× → 3.5×**) |
+| affine | 1.44 → 0.70 → 0.55 | 0.95 → 0.46 → 0.38 | 2.37 → 0.79 → 0.38 | 5.12 → 1.93 → 1.36 (**2.7× → 3.8×**) |
+| homography | 3.18 → 1.24 → 0.83 | 1.00 → 0.47 → 0.41 | 5.06 → 1.49 → 0.77 | 8.92 → 3.14 → 2.06 (**2.8× → 4.3×**) |
 
 Unlike a vectorised kernel on its own, which competed with the thread pool for the
 same headroom (1.04–1.14× at four threads in an earlier experiment), the whole stripe
@@ -442,13 +478,13 @@ before, so the floor is unchanged; what the pyramid buys is the start:
 
 | fruits, affine, window 384, one thread, ms per call (corner error) | start 1 px off | 3 px | 6 px |
 |---|---:|---:|---:|
-| `cv::findTransformECC` | 31.7 (0.0030) | 34.5 | 49.2 |
-| `cv::findTransformECCMultiScale`, 4 levels | 16.9 (0.0032) | 17.5 | 18.2 |
-| `fastecc::findTransformECC`, 1 level | **5.6 (0.0014)** | 7.4 | 11.4 |
-| `fastecc::findTransformECC`, 3 levels (default) | 6.4 (0.0014) | **6.6** | **7.6** |
+| `cv::findTransformECC` | 33.5 (0.0030) | 34.9 | 50.9 |
+| `cv::findTransformECCMultiScale`, 4 levels | 16.9 (0.0032) | 17.2 | 16.5 |
+| `fastecc::findTransformECC`, 1 level | **6.3 (0.0014)** | 7.6 | 10.5 |
+| `fastecc::findTransformECC`, 3 levels (default) | 7.0 (0.0014) | **6.3** | **7.1** |
 
-On two and four threads the default takes 5.1–6.0 and 4.4–4.6 ms whatever the start,
-against 11.6–12.9 and 9.4–9.8 for eccms. On the real image the fraction of trials that converge from
+On two and four threads the default takes 5.3–5.7 and 4.3–4.6 ms whatever the start,
+against 11.5–12.5 and 9.3–9.8 for eccms. On the real image the fraction of trials that converge from
 the no-motion guess at ×4 the default deformation goes from 85 % (1 level) to 99–100 %
 (3–4 levels), which is where eccms sits; for homography from 62 % to 96 %.
 
@@ -479,6 +515,11 @@ ctest --test-dir build --output-on-failure   # accuracy vs ground truth
 
 Requires OpenCV `core`, `imgproc` and `video` (plus `imgcodecs` for the example) — any
 4.x.  On Debian/Ubuntu: `sudo apt-get install libopencv-dev`.
+
+Add `-DFAST_ECC_AVX2=ON` to the configure line for the AVX2 + FMA build: eight-lane
+vectors, about 1.5× faster per iteration, and the binary then needs an AVX2 CPU. If you
+compile `src/fast_ecc.cpp` yourself, that is `-DFASTECC_AVX2=1` together with `/arch:AVX2`
+or `-mavx2 -mfma`. Below OpenCV 4.7 the vector paths fall back to scalar loops either way.
 
 ### Use it in your project
 
