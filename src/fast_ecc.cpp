@@ -58,6 +58,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 using namespace cv;
 
@@ -270,58 +271,19 @@ static void update_warping_matrix_ECC(Mat& map_matrix, const Mat& update, const 
 
 namespace fastecc {
 
-double findTransformECC(InputArray templateImage,
-                        InputArray inputImage,
-                        InputOutputArray warpMatrix,
-                        int motionType,
-                        TermCriteria criteria,
-                        InputArray inputMask,
-                        int gaussFiltSize,
-                        int flags)
+namespace {
+
+// One scale of the iteration.  `src` and `dst` are single-channel CV_8U or
+// CV_32F images, `inputMaskMat` an optional CV_8U mask on `dst` (empty for
+// none), `map` the warp in the coordinates of these images.  Everything
+// findTransformECC used to do after validating its arguments lives here; the
+// pyramid wrapper below calls it once per level, coarsest first.
+double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
+                      int numberOfIterations, double termination_eps,
+                      const Mat& inputMaskMat, int gaussFiltSize, int flags)
 {
     const bool useLap   = (flags & FASTECC_LAPLACIAN_COLUMN) != 0;
     const bool useGrad5 = (flags & FASTECC_GRAD5) != 0;
-    Mat src = templateImage.getMat();//template image
-    Mat dst = inputImage.getMat();  //input image (to be warped)
-    Mat map = warpMatrix.getMat();  //warp (transformation)
-
-    CV_Assert(!src.empty());
-    CV_Assert(!dst.empty());
-
-    // If the user passed an un-initialized warpMatrix, initialize to identity
-    if(map.empty()) {
-        int rowCount = 2;
-        if(motionType == MOTION_HOMOGRAPHY)
-            rowCount = 3;
-
-        warpMatrix.create(rowCount, 3, CV_32FC1);
-        map = warpMatrix.getMat();
-        map = Mat::eye(rowCount, 3, CV_32F);
-    }
-
-    if( ! (src.type()==dst.type()))
-        CV_Error( Error::StsUnmatchedFormats, "Both input images must have the same data type" );
-
-    //accept only 1-channel images
-    if( src.type() != CV_8UC1 && src.type()!= CV_32FC1)
-        CV_Error( Error::StsUnsupportedFormat, "Images must have 8uC1 or 32fC1 type");
-
-    if( map.type() != CV_32FC1)
-        CV_Error( Error::StsUnsupportedFormat, "warpMatrix must be single-channel floating-point matrix");
-
-    CV_Assert (map.cols == 3);
-    CV_Assert (map.rows == 2 || map.rows ==3);
-
-    CV_Assert (motionType == MOTION_AFFINE || motionType == MOTION_HOMOGRAPHY ||
-        motionType == MOTION_EUCLIDEAN || motionType == MOTION_TRANSLATION);
-
-    if (motionType == MOTION_HOMOGRAPHY){
-        CV_Assert (map.rows ==3);
-    }
-
-    CV_Assert (criteria.type & TermCriteria::COUNT || criteria.type & TermCriteria::EPS);
-    const int    numberOfIterations = (criteria.type & TermCriteria::COUNT) ? criteria.maxCount : 200;
-    const double termination_eps    = (criteria.type & TermCriteria::EPS)   ? criteria.epsilon  :  -1;
 
     int paramTemp = 6;//default: affine
     switch (motionType){
@@ -349,29 +311,34 @@ double findTransformECC(InputArray templateImage,
     Mat imageWarped   = Mat(hs, ws, CV_32F);// to store the warped input image
     Mat imageMask     = Mat(hs, ws, CV_8U); // to store the final mask
 
-    Mat inputMaskMat = inputMask.getMat();
-    //to use it for mask warping
-    Mat preMask;
-    if(inputMask.empty())
-        preMask = Mat::ones(hd, wd, CV_8U);
-    else
-        threshold(inputMask, preMask, 0, 1, THRESH_BINARY);
-
     //gaussian filtering is optional (sigma=0 -> derived from gaussFiltSize, matching cv::findTransformECC)
     src.convertTo(templateFloat, templateFloat.type());
     GaussianBlur(templateFloat, templateFloat, Size(gaussFiltSize, gaussFiltSize), 0, 0);
 
-    Mat preMaskFloat;
-    preMask.convertTo(preMaskFloat, CV_32F);
-    GaussianBlur(preMaskFloat, preMaskFloat, Size(gaussFiltSize, gaussFiltSize), 0, 0);
-    // Change threshold.
-    preMaskFloat *= (0.5/0.95);
-    // Rounding conversion.
-    preMaskFloat.convertTo(preMask, preMask.type());
-    preMask.row(0).setTo(0); preMask.row(preMask.rows - 1).setTo(0);
-    preMask.col(0).setTo(0); preMask.col(preMask.cols - 1).setTo(0);
-    preMask.row(1).setTo(0); preMask.row(preMask.rows - 2).setTo(0);
-    preMask.col(1).setTo(0); preMask.col(preMask.cols - 2).setTo(0);
+    // The mask to warp, as upstream builds it: the user mask (or all ones)
+    // blurred like the images and thresholded, with a two-pixel border.
+    // Only the warp path needs it -- a user mask, or a row on which the
+    // analytic mask gives up -- so it is built on first use rather than
+    // costing a full-size blur on every call.
+    Mat preMask;
+    auto ensurePreMask = [&]() {
+        if (!preMask.empty()) return;
+        if(inputMaskMat.empty())
+            preMask = Mat::ones(hd, wd, CV_8U);
+        else
+            threshold(inputMaskMat, preMask, 0, 1, THRESH_BINARY);
+        Mat preMaskFloat;
+        preMask.convertTo(preMaskFloat, CV_32F);
+        GaussianBlur(preMaskFloat, preMaskFloat, Size(gaussFiltSize, gaussFiltSize), 0, 0);
+        // Change threshold.
+        preMaskFloat *= (0.5/0.95);
+        // Rounding conversion.
+        preMaskFloat.convertTo(preMask, preMask.type());
+        preMask.row(0).setTo(0); preMask.row(preMask.rows - 1).setTo(0);
+        preMask.col(0).setTo(0); preMask.col(preMask.cols - 1).setTo(0);
+        preMask.row(1).setTo(0); preMask.row(preMask.rows - 2).setTo(0);
+        preMask.col(1).setTo(0); preMask.col(preMask.cols - 2).setTo(0);
+    };
 
     dst.convertTo(imageFloat, imageFloat.type());
     GaussianBlur(imageFloat, imageFloat, Size(gaussFiltSize, gaussFiltSize), 0, 0);
@@ -435,8 +402,9 @@ double findTransformECC(InputArray templateImage,
 
         // The mask: solved for when there is no user mask (see analyticMask),
         // warped like the image otherwise.
-        if (!(inputMask.empty() && analyticMask(imageMask, map, motionType, wd, hd, ring)))
+        if (!(inputMaskMat.empty() && analyticMask(imageMask, map, motionType, wd, hd, ring)))
         {
+            ensurePreMask();
             if (motionType != MOTION_HOMOGRAPHY)
                 warpAffine(preMask, imageMask, map, imageMask.size(), maskFlags);
             else
@@ -561,6 +529,131 @@ double findTransformECC(InputArray templateImage,
     }
 
     // return final correlation coefficient
+    return rho;
+}
+
+// Re-express a warp x' = W x in coordinates scaled by s (s = 2 going one
+// pyramid level finer, 1/2^L going straight to level L): S^-1 W S with
+// S = diag(s, s, 1).  The linear part is unchanged, the translation scales
+// with s, the projective row against it.
+void scaleWarp(Mat& map, double s)
+{
+    float* m = map.ptr<float>(0);
+    m[2] = (float)(m[2] * s);
+    m[5] = (float)(m[5] * s);
+    if (map.rows == 3) {
+        m[6] = (float)(m[6] / s);
+        m[7] = (float)(m[7] / s);
+    }
+}
+
+}  // namespace
+
+double findTransformECC(InputArray templateImage,
+                        InputArray inputImage,
+                        InputOutputArray warpMatrix,
+                        int motionType,
+                        TermCriteria criteria,
+                        InputArray inputMask,
+                        int gaussFiltSize,
+                        int flags,
+                        int nlevels)
+{
+    Mat src = templateImage.getMat();//template image
+    Mat dst = inputImage.getMat();  //input image (to be warped)
+    Mat map = warpMatrix.getMat();  //warp (transformation)
+
+    CV_Assert(!src.empty());
+    CV_Assert(!dst.empty());
+
+    // If the user passed an un-initialized warpMatrix, initialize to identity
+    if(map.empty()) {
+        int rowCount = 2;
+        if(motionType == MOTION_HOMOGRAPHY)
+            rowCount = 3;
+
+        warpMatrix.create(rowCount, 3, CV_32FC1);
+        map = warpMatrix.getMat();
+        map = Mat::eye(rowCount, 3, CV_32F);
+    }
+
+    if( ! (src.type()==dst.type()))
+        CV_Error( Error::StsUnmatchedFormats, "Both input images must have the same data type" );
+
+    //accept only 1-channel images
+    if( src.type() != CV_8UC1 && src.type()!= CV_32FC1)
+        CV_Error( Error::StsUnsupportedFormat, "Images must have 8uC1 or 32fC1 type");
+
+    if( map.type() != CV_32FC1)
+        CV_Error( Error::StsUnsupportedFormat, "warpMatrix must be single-channel floating-point matrix");
+
+    CV_Assert (map.cols == 3);
+    CV_Assert (map.rows == 2 || map.rows ==3);
+
+    CV_Assert (motionType == MOTION_AFFINE || motionType == MOTION_HOMOGRAPHY ||
+        motionType == MOTION_EUCLIDEAN || motionType == MOTION_TRANSLATION);
+
+    if (motionType == MOTION_HOMOGRAPHY){
+        CV_Assert (map.rows ==3);
+    }
+
+    CV_Assert (criteria.type & TermCriteria::COUNT || criteria.type & TermCriteria::EPS);
+    const int    numberOfIterations = (criteria.type & TermCriteria::COUNT) ? criteria.maxCount : 200;
+    const double termination_eps    = (criteria.type & TermCriteria::EPS)   ? criteria.epsilon  :  -1;
+    CV_Assert (nlevels >= 1);
+
+    Mat inputMaskMat = inputMask.getMat();
+    if (nlevels == 1)
+        return runSingleScale(src, dst, map, motionType, numberOfIterations, termination_eps,
+                              inputMaskMat, gaussFiltSize, flags);
+
+    // Coarse to fine.  The levels are pyrDown of the images (a 5-tap Gaussian
+    // centred on the even pixels, so level-L coordinates are exactly the
+    // full-resolution ones over 2^L); the pre-filter, the border ring, the
+    // mask and the flags are all applied per level by runSingleScale, and the
+    // stop criterion holds per level.  The coarsest level keeps at least 16 px
+    // on the template's shorter side.
+    int levels = nlevels;
+    while (levels > 1 && (std::min(src.rows, src.cols) >> (levels - 1)) < 16) --levels;
+
+    std::vector<Mat> srcPyr(levels), dstPyr(levels), maskPyr(levels);
+    src.convertTo(srcPyr[0], CV_32F);
+    dst.convertTo(dstPyr[0], CV_32F);
+    if (!inputMaskMat.empty())
+        threshold(inputMaskMat, maskPyr[0], 0, 255, THRESH_BINARY);
+    for (int l = 1; l < levels; ++l) {
+        pyrDown(srcPyr[l - 1], srcPyr[l]);
+        pyrDown(dstPyr[l - 1], dstPyr[l]);
+        if (!maskPyr[l - 1].empty()) {
+            // a coarse pixel is valid only if everything under it was
+            pyrDown(maskPyr[l - 1], maskPyr[l]);
+            threshold(maskPyr[l], maskPyr[l], 254, 255, THRESH_BINARY);
+        }
+    }
+
+    Mat mapL = map.clone();
+    scaleWarp(mapL, 1.0 / (double)(1 << (levels - 1)));
+    double rho = -1;
+    for (int l = levels - 1; l >= 0; --l) {
+        if (l < levels - 1) scaleWarp(mapL, 2.0);
+        if (l > 0) {
+            // A coarse level can have nothing left to align (a band-limited
+            // scene, a small template): if it gives up, keep the warp it
+            // started from and let the next finer level try.  Only the
+            // finest level's failure is the call's failure.
+            Mat before = mapL.clone();
+            try {
+                rho = runSingleScale(srcPyr[l], dstPyr[l], mapL, motionType, numberOfIterations,
+                                     termination_eps, maskPyr[l], gaussFiltSize, flags);
+            } catch (const cv::Exception&) {
+                before.copyTo(mapL);
+            }
+        } else {
+            rho = runSingleScale(srcPyr[l], dstPyr[l], mapL, motionType, numberOfIterations,
+                                 termination_eps, maskPyr[l], gaussFiltSize, flags);
+        }
+    }
+    mapL.copyTo(map);
     return rho;
 }
 

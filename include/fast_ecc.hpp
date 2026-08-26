@@ -35,6 +35,7 @@ enum {
     FASTECC_DEFAULT_FLAGS = FASTECC_LAPLACIAN_COLUMN | FASTECC_GRAD5
 };
 #define FASTECC_HAS_FLAGS 1
+#define FASTECC_HAS_PYRAMID 1
 
 // Estimates the geometric transform `warpMatrix` (CV_32FC1, 2x3 or 3x3 for
 // homography) that aligns `templateImage` to `inputImage`.  `motionType` is one
@@ -45,6 +46,14 @@ enum {
 // image, and resampling does not commute with differentiation), but recovers
 // the transform with the same accuracy against ground truth — see README.md
 // and the bundled equivalence test.
+//
+// `nlevels` > 1 runs coarse to fine over a pyrDown pyramid, like
+// cv::findTransformECCMultiScale: each level runs the full single-scale
+// iteration (pre-filter, border ring, flags, stop criterion) on the
+// downsampled images and hands its warp to the next finer level.  The
+// coarsest level keeps at least 16 px on the template's shorter side, so
+// `nlevels` is reduced for small templates.  1 (the default) is the
+// single-scale iteration exactly as before.
 double findTransformECC(
     cv::InputArray templateImage,
     cv::InputArray inputImage,
@@ -54,6 +63,7 @@ double findTransformECC(
         cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 50, 0.001),
     cv::InputArray inputMask = cv::noArray(),
     int gaussFiltSize = 5,
-    int flags = FASTECC_DEFAULT_FLAGS);
+    int flags = FASTECC_DEFAULT_FLAGS,
+    int nlevels = 1);
 
 } // namespace fastecc
