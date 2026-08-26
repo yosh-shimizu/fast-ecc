@@ -62,19 +62,28 @@
 #include <type_traits>
 #include <vector>
 
-// The sampler's vector path is written with OpenCV's universal intrinsics in
-// their function form (v_add, v_lut, ...), which exist from OpenCV 4.7 --
-// as wrappers over the operators until 4.10, native from 4.11, where the
-// operators went away.  An older OpenCV, or -DFASTECC_NO_SIMD, gets the
-// scalar loops; the two agree bit for bit on the affine path.
+// The vector paths -- the sampler, the derivative and moment loops of the
+// stripe, and the Gauss-Newton kernels -- are written with OpenCV's
+// universal intrinsics in their function form (v_add, v_lut, ...), which
+// exist from OpenCV 4.7: as wrappers over the operators until 4.10, native
+// from 4.11, where the operators went away.  An older OpenCV, or
+// -DFASTECC_NO_SIMD, gets the scalar loops.
 #if !defined(FASTECC_NO_SIMD) && (CV_VERSION_MAJOR > 4 || (CV_VERSION_MAJOR == 4 && CV_VERSION_MINOR >= 7))
 #  include <opencv2/core/hal/intrin.hpp>
 #  if CV_SIMD
-#    define FASTECC_SIMD_SAMPLER 1
+#    define FASTECC_SIMD 1
 #  endif
 #endif
-#ifndef FASTECC_SIMD_SAMPLER
-#  define FASTECC_SIMD_SAMPLER 0
+#ifndef FASTECC_SIMD
+#  define FASTECC_SIMD 0
+#endif
+// The Gauss-Newton kernels have a vector path on the same footing
+// (gn_fused.inc); -DFASTECC_NO_SIMD_GN keeps their scalar loops alone,
+// which is how the two are compared.
+#if FASTECC_SIMD && !defined(FASTECC_NO_SIMD_GN)
+#  define FASTECC_SIMD_GN 1
+#else
+#  define FASTECC_SIMD_GN 0
 #endif
 
 using namespace cv;
@@ -270,7 +279,7 @@ static inline void bilinearSpan(const float* SRC, size_t STEP,
                                 float a0, float a3, float bx, float by, float* out, int n)
 {
     int i = 0;
-#if FASTECC_SIMD_SAMPLER
+#if FASTECC_SIMD
     {
         enum { CH = 64 };
         const int L = VTraits<v_float32>::vlanes();
@@ -329,7 +338,7 @@ static inline void projectiveRow(const float* SRC, size_t STEP, int SW, int SH,
                                  float* out, int ws)
 {
     int x = 0;
-#if FASTECC_SIMD_SAMPLER
+#if FASTECC_SIMD
     {
         enum { CH = 64 };
         const int L = VTraits<v_float32>::vlanes();
@@ -446,13 +455,15 @@ struct StripePool {
     int prepare(int hs, int ws_, int R_, bool lap_) {
         const int T = std::max(1, getNumThreads());
         // stripes per thread: more than one lets the pool balance a worker
-        // that wakes late (FASTECC_STRIPES overrides, for measurement)
+        // that wakes late, and keeps a stripe's planes in L2 between the
+        // sampler, the derivative loop and the kernel, which is why one
+        // thread gets them too (FASTECC_STRIPES overrides, for measurement)
         static int perThread = -1;
         if (perThread < 0) {
             const char* e = std::getenv("FASTECC_STRIPES");
             perThread = e ? std::max(1, std::atoi(e)) : 4;
         }
-        int n = std::max(1, std::min(T == 1 ? 1 : T * perThread, hs / 16));
+        int n = std::max(1, std::min(T * perThread, hs / 16));
         const int rows = (hs + n - 1) / n;
         n = (hs + rows - 1) / rows;
         if (n != nstripes || rows != rowsPer || R_ != R || lap_ != lap || ws_ != ws) {
@@ -779,33 +790,67 @@ double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
                         const float* r0 = B.im.ptr<float>(k + R);
                         const float* rm1 = r0 - B.im.step1();
                         const float* rp1 = r0 + B.im.step1();
+                        const float* rm2 = rm1 - B.im.step1();   // read only under useGrad5
+                        const float* rp2 = rp1 + B.im.step1();
                         float* gx = B.gx.ptr<float>(k);
                         float* gy = B.gy.ptr<float>(k);
                         float* lp = useLap ? B.lp.ptr<float>(k) : nullptr;
+                        const float* tm = templateFloat.ptr<float>(y);
                         if (x1 <= x0) continue;
+                        // the derivatives, the laplacian and the moments about the
+                        // previous means, over the mask interval; the moments are
+                        // float within the row, like the kernels, and double after
+                        double sd = 0, sdd = 0, se = 0, see = 0, sde = 0;
+                        int x = x0;
+#if FASTECC_SIMD
+                        {
+                            const int VL = VTraits<v_float32>::vlanes();
+                            const v_float32 vmI = v_setall_f32(mI), vmT = v_setall_f32(mT);
+                            const v_float32 c8 = v_setall_f32(8.f), c12 = v_setall_f32(1.f / 12);
+                            const v_float32 c4 = v_setall_f32(4.f), ch = v_setall_f32(0.5f);
+                            v_float32 vsd = v_setzero_f32(), vsdd = v_setzero_f32(), vse = v_setzero_f32();
+                            v_float32 vsee = v_setzero_f32(), vsde = v_setzero_f32();
+                            for (; x + VL <= x1; x += VL) {
+                                const v_float32 c = v_load(r0 + x), l1 = v_load(r0 + x - 1), r1 = v_load(r0 + x + 1);
+                                const v_float32 u1 = v_load(rm1 + x), d1 = v_load(rp1 + x);
+                                if (useGrad5) {
+                                    v_store(gx + x, v_mul(v_sub(v_add(v_sub(v_load(r0 + x - 2), v_mul(c8, l1)),
+                                                                      v_mul(c8, r1)), v_load(r0 + x + 2)), c12));
+                                    v_store(gy + x, v_mul(v_sub(v_add(v_sub(v_load(rm2 + x), v_mul(c8, u1)),
+                                                                      v_mul(c8, d1)), v_load(rp2 + x)), c12));
+                                } else {
+                                    v_store(gx + x, v_mul(ch, v_sub(r1, l1)));
+                                    v_store(gy + x, v_mul(ch, v_sub(d1, u1)));
+                                }
+                                if (useLap)
+                                    v_store(lp + x, v_sub(v_add(v_add(v_add(l1, r1), u1), d1), v_mul(c4, c)));
+                                const v_float32 d = v_sub(c, vmI), e = v_sub(v_load(tm + x), vmT);
+                                vsd = v_add(vsd, d);  vsdd = v_fma(d, d, vsdd);
+                                vse = v_add(vse, e);  vsee = v_fma(e, e, vsee);  vsde = v_fma(d, e, vsde);
+                            }
+                            sd = v_reduce_sum(vsd); sdd = v_reduce_sum(vsdd);
+                            se = v_reduce_sum(vse); see = v_reduce_sum(vsee); sde = v_reduce_sum(vsde);
+                        }
+#endif
                         if (useGrad5) {
-                            const float* rm2 = rm1 - B.im.step1();
-                            const float* rp2 = rp1 + B.im.step1();
-                            for (int x = x0; x < x1; ++x) {
-                                gx[x] = (r0[x - 2] - 8.f * r0[x - 1] + 8.f * r0[x + 1] - r0[x + 2]) * (1.f / 12);
-                                gy[x] = (rm2[x] - 8.f * rm1[x] + 8.f * rp1[x] - rp2[x]) * (1.f / 12);
+                            for (int xt = x; xt < x1; ++xt) {
+                                gx[xt] = (r0[xt - 2] - 8.f * r0[xt - 1] + 8.f * r0[xt + 1] - r0[xt + 2]) * (1.f / 12);
+                                gy[xt] = (rm2[xt] - 8.f * rm1[xt] + 8.f * rp1[xt] - rp2[xt]) * (1.f / 12);
                             }
                         } else {
-                            for (int x = x0; x < x1; ++x) {
-                                gx[x] = 0.5f * (r0[x + 1] - r0[x - 1]);
-                                gy[x] = 0.5f * (rp1[x] - rm1[x]);
+                            for (int xt = x; xt < x1; ++xt) {
+                                gx[xt] = 0.5f * (r0[xt + 1] - r0[xt - 1]);
+                                gy[xt] = 0.5f * (rp1[xt] - rm1[xt]);
                             }
                         }
                         if (useLap)
-                            for (int x = x0; x < x1; ++x)
-                                lp[x] = r0[x - 1] + r0[x + 1] + rm1[x] + rp1[x] - 4.f * r0[x];
-                        const float* tm = templateFloat.ptr<float>(y);
-                        double n = 0, sd = 0, sdd = 0, se = 0, see = 0, sde = 0;
-                        for (int x = x0; x < x1; ++x) {
-                            const double d = r0[x] - mI, e = tm[x] - mT;
-                            n += 1; sd += d; sdd += d * d; se += e; see += e * e; sde += d * e;
+                            for (int xt = x; xt < x1; ++xt)
+                                lp[xt] = r0[xt - 1] + r0[xt + 1] + rm1[xt] + rp1[xt] - 4.f * r0[xt];
+                        for (int xt = x; xt < x1; ++xt) {
+                            const float d = r0[xt] - mI, e = tm[xt] - mT;
+                            sd += d; sdd += d * d; se += e; see += e * e; sde += d * e;
                         }
-                        st.n += n; st.sd += sd; st.sdd += sdd; st.se += se; st.see += see; st.sde += sde;
+                        st.n += x1 - x0; st.sd += sd; st.sdd += sdd; st.se += se; st.see += see; st.sde += sde;
                     }
                     // 5. the Gauss-Newton sums of this stripe
                     Mat imView(hsub, ws, CV_32F, B.im.ptr<float>(R), B.im.step);
