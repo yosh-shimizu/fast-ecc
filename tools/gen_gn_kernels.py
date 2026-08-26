@@ -15,8 +15,9 @@
 # The w = y^2 and w = y columns are constant along a row, so they are not
 # accumulated per pixel: within one row, sum_x u*fy^2 == fy^2 * sum_x u.  Only
 # the w = 1 column is summed in the loop and the other two are formed from it at
-# row end.  That is exact, and it removes both arithmetic and live accumulators
-# (affine 30 -> 20, homography 52 -> 36).
+# row end; likewise sum_x u*x*y == fy * sum_x u*x, so the (x, y) pair is the
+# (x, 1) pair scaled.  That is exact, and it removes both arithmetic and live
+# accumulators (affine 30 -> 17, homography 52 -> 30).
 #
 # Only the (u-pair, w-pair) sums that some entry of the Gram matrix actually
 # needs are accumulated.  For the plain kernels that is the full table minus
@@ -143,23 +144,23 @@ VLAPPIX = '                const v_float32 l = v_mul(vlsc, lv);\n'
 
 # broadcast once per rows() call (the warp coefficients) and once per row
 # (what depends on fy)
-VRECOMB = ('        const v_float32 vr00 = v_setall_f32(r00), vr01 = v_setall_f32(r01), '
-           'vr10 = v_setall_f32(r10), vr11 = v_setall_f32(r11);\n')
+VRECOMB = ('        const v_float32 vr00 = vx_setall_f32(r00), vr01 = vx_setall_f32(r01), '
+           'vr10 = vx_setall_f32(r10), vr11 = vx_setall_f32(r11);\n')
 VCONST = {
     'Translation': '',
-    'Euclidean':   VRECOMB + '        const v_float32 vh0 = v_setall_f32(h0), vh1 = v_setall_f32(h1);\n',
+    'Euclidean':   VRECOMB + '        const v_float32 vh0 = vx_setall_f32(h0), vh1 = vx_setall_f32(h1);\n',
     'Affine':      VRECOMB,
     'Homography':  VRECOMB +
-        '        const v_float32 vh2 = v_setall_f32(h2), vh6 = v_setall_f32(h6), vh7 = v_setall_f32(h7);\n'
-        '        const v_float32 vnh0 = v_setall_f32(-h0), vnh1 = v_setall_f32(-h1);\n'
-        '        const v_float32 vone = v_setall_f32(1.f), vzf = v_setzero_f32();\n',
+        '        const v_float32 vh2 = vx_setall_f32(h2), vh6 = vx_setall_f32(h6), vh7 = vx_setall_f32(h7);\n'
+        '        const v_float32 vnh0 = vx_setall_f32(-h0), vnh1 = vx_setall_f32(-h1);\n'
+        '        const v_float32 vone = vx_setall_f32(1.f), vzf = vx_setzero_f32();\n',
 }
 VPRE = {
     'Translation': '',
-    'Euclidean':   '                const v_float32 vnfyh0 = v_setall_f32(-(fy * h0)), vfyh1 = v_setall_f32(fy * h1);\n',
+    'Euclidean':   '                const v_float32 vnfyh0 = vx_setall_f32(-(fy * h0)), vfyh1 = vx_setall_f32(fy * h1);\n',
     'Affine':      '',
-    'Homography':  '                const v_float32 vfyh3 = v_setall_f32(fy * h3), vfyh4 = v_setall_f32(fy * h4), '
-                   'vfyh5 = v_setall_f32(fy * h5);\n',
+    'Homography':  '                const v_float32 vfyh3 = vx_setall_f32(fy * h3), vfyh4 = vx_setall_f32(fy * h4), '
+                   'vfyh5 = vx_setall_f32(fy * h5);\n',
 }
 
 RECOMB = '    float r00, r01, r10, r11;   // A^-T of the current warp\n'
@@ -182,7 +183,7 @@ def vdecl(names, per_line=6):
     lines = []
     for i in range(0, len(names), per_line):
         chunk = names[i:i + per_line]
-        lines.append('                v_float32 ' + ', '.join('v%s = v_setzero_f32()' % n for n in chunk) + ';')
+        lines.append('                v_float32 ' + ', '.join('v%s = vx_setzero_f32()' % n for n in chunk) + ';')
     return lines
 
 
@@ -207,11 +208,16 @@ for base, K0, L, U0, cols0 in MOTIONS:
         wn = ['fx', 'fy', '1.f'] if L == 3 else ['1.f']
         vwn = ['vx', 'vfy', '1.f'] if L == 3 else ['1.f']
 
-        # lp indices whose w-pair does not involve fx are constant along a row.
-        # For L == 3 those are (fy,fy), (fy,1) and (1,1); the last is the one
-        # that gets accumulated, the first two are it scaled by fy^2 and fy.
+        # w-pairs that carry a factor of fy are that factor times a pair without
+        # it, and fy is constant along a row: (fy,fy) and (fy,1) are (1,1) scaled
+        # by fy^2 and fy, (fx,fy) is (fx,1) scaled by fy.  Only the pair without
+        # the factor is accumulated; the others are formed at row end.
         ONE = lp.index((L - 1, L - 1))                 # the w = 1 column
-        rowconst = [b for b, (i, j) in enumerate(lp) if i != 0 and b != ONE] if L == 3 else []
+        hoisted = {}                                   # lp index -> (source lp index, scale)
+        if L == 3:
+            XC = lp.index((0, 2))
+            hoisted = {lp.index((1, 1)): (ONE, 'dyy'), lp.index((1, 2)): (ONE, 'dy'), lp.index((0, 1)): (XC, 'dy')}
+        rowconst = sorted(hoisted)
 
         # which (u-pair, w-pair) sums the Gram matrix needs, and which of those
         # are summed per pixel (a row-constant w-pair is formed from ONE)
@@ -222,7 +228,7 @@ for base, K0, L, U0, cols0 in MOTIONS:
                 lpi = lp.index((min(cols[p][1], cols[q][1]), max(cols[p][1], cols[q][1])))
                 if (kpi, lpi) not in needed:
                     needed.append((kpi, lpi))
-                lv = (kpi, ONE) if lpi in rowconst else (kpi, lpi)
+                lv = (kpi, hoisted[lpi][0]) if lpi in hoisted else (kpi, lpi)
                 if lv not in live_set:
                     live_set.append(lv)
         needed.sort()
@@ -290,13 +296,13 @@ for base, K0, L, U0, cols0 in MOTIONS:
         o.append('        const int VL = VTraits<v_float32>::vlanes();')
         o.append('        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];')
         o.append('        for (int k = 0; k < VL; ++k) lane[k] = (float)k;')
-        o.append('        const v_float32 vlane = v_load_aligned(lane), vVL = v_setall_f32((float)VL);')
-        o.append('        const v_float32 vmuI = v_setall_f32(muI), vmuT = v_setall_f32(muT);')
-        o.append('        const v_int32 vzi = v_setzero_s32();')
+        o.append('        const v_float32 vlane = vx_load_aligned(lane), vVL = vx_setall_f32((float)VL);')
+        o.append('        const v_float32 vmuI = vx_setall_f32(muI), vmuT = vx_setall_f32(muT);')
+        o.append('        const v_int32 vzi = vx_setzero_s32();')
         if VCONST[base]:
             o.append(VCONST[base].rstrip('\n'))
         if lap:
-            o.append('        const v_float32 vlsc = v_setall_f32(lsc);')
+            o.append('        const v_float32 vlsc = vx_setall_f32(lsc);')
         o.append('#endif')
         o.append('')
         o.append('        for (int y = y0; y < y1; ++y) {')
@@ -316,7 +322,7 @@ for base, K0, L, U0, cols0 in MOTIONS:
         o.append('#if FASTECC_SIMD_GN')
         o.append('            {')
         if L == 3:
-            o.append('                const v_float32 vfy = v_setall_f32(fy);')
+            o.append('                const v_float32 vfy = vx_setall_f32(fy);')
         if VPRE[base]:
             o.append(VPRE[base].rstrip('\n'))
         o.extend(vdecl(live))
@@ -324,10 +330,10 @@ for base, K0, L, U0, cols0 in MOTIONS:
         o.append('                v_float32 vx = vlane;')
         o.append('                for (; x + VL <= w; x += VL) {')
         o.append('                    const v_float32 mf = v_reinterpret_as_f32(v_ne(v_reinterpret_as_s32('
-                 'v_load_expand_q(pmk + x)), vzi));')
-        o.append('                    const v_float32 gxv = v_and(v_load(pgx + x), mf), gyv = v_and(v_load(pgy + x), mf);')
+                 'vx_load_expand_q(pmk + x)), vzi));')
+        o.append('                    const v_float32 gxv = v_and(vx_load(pgx + x), mf), gyv = v_and(vx_load(pgy + x), mf);')
         if lap:
-            o.append('                    const v_float32 lv = v_and(v_load(pl + x), mf);')
+            o.append('                    const v_float32 lv = v_and(vx_load(pl + x), mf);')
         vbody = VPIX[base] + (VLAPPIX if lap else '')
         o.append(vbody.replace('                ', '                    ').rstrip('\n'))
         up = []
@@ -355,8 +361,8 @@ for base, K0, L, U0, cols0 in MOTIONS:
                     line.append('vm%d_%d = v_fma(uu%d, ww%d, vm%d_%d);' % (a, b, a, b, a, b))
             if line:
                 o.append('                    ' + '  '.join(line))
-        o.append('                    const v_float32 ii = v_sub(v_load(pim + x), vmuI), '
-                 'tt = v_sub(v_load(ptm + x), vmuT);')
+        o.append('                    const v_float32 ii = v_sub(vx_load(pim + x), vmuI), '
+                 'tt = v_sub(vx_load(ptm + x), vmuT);')
         for s, (k, l) in enumerate(cols):
             if s in hoistp:
                 continue
@@ -444,9 +450,9 @@ for base, K0, L, U0, cols0 in MOTIONS:
                 for b in range(len(lp)):
                     if (a, b) not in needed:
                         continue
-                    if b in rowconst:
-                        scale = 'dyy' if lp[b][1] == 1 else 'dy'   # (fy,fy) or (fy,1)
-                        line.append('t_m%d_%d += m%d_%d * %s;' % (a, b, a, ONE, scale))
+                    if b in hoisted:
+                        src, scale = hoisted[b]
+                        line.append('t_m%d_%d += m%d_%d * %s;' % (a, b, a, src, scale))
                     else:
                         line.append('t_m%d_%d += m%d_%d;' % (a, b, a, b))
                 if line:
