@@ -308,42 +308,54 @@ scalar exact one (§6.5).</p>
 <tr><td>converged from the no-motion guess, ×1 / ×2 / ×4 (real image)</td><td>100 / 100 / 89 %</td><td>100 / 100 / 89 %</td><td><b>100 / 100 / 99 %</b></td></tr>
 </table></div>
 
-<h3>6.5 The sampler, vectorised</h3>
+<h3>6.5 The stripe, vectorised</h3>
 <p>The single-pass stage profile (<code>eval/spbench.cpp</code>: the library source included, the stripe body repeated
-with a timer between its stages) put the sampler at 25–35 % of a single-thread iteration and the Gauss–Newton pass at
-45–60 %; at 4.7 ns per pixel for affine — some 17 cycles — the scalar gather was well short of what the machine can do.
-It is now written with OpenCV's universal intrinsics in their function form (OpenCV ≥ 4.7; older, or
-<code>-DFASTECC_NO_SIMD</code>, keeps the scalar loops, and CI runs the equivalence test on both). Two things mattered.
-First, the shape of the loop: one pass per row that converts, indexes, gathers and combines each vector of pixels puts the
-conversion, the integer multiply and a store-to-load forward on the same dependency chain as the gathers, and the
-out-of-order window fills with that chain; two passes over chunks of 64 pixels — coordinates truncated and split into
-tap index and fractions into small buffers, then gathered and combined — leave nothing but the gathers and the weighting
-on the second pass's chain, and the bilinear combination as a weighted sum of the four taps (the weights depend only
-on the fractions and are ready before the taps arrive) shortens that chain from three dependent lerp steps to a
-multiply and two adds. Second, what an external build can reach: OpenCV's headers enable only SSE2 (or NEON) outside
-the library's own build, so there are no gather instructions — a tap vector is four scalar loads and three shuffles,
-about 5.5 loads per pixel in all, and the pass is bound by the two load ports at about 4 cycles per pixel where the
-taps stay in L1. A rotation spreads the taps of one row over some twenty source rows at 512 px and costs another
-50 %; that is the difference between translation and affine below. The projective row went from double to single
-precision like the affine one, and the lanes and the scalar tails share their arithmetic, so a row does not depend on
-where the vector part ends.</p>
+with a timer between its stages) put the sampler at 25–35 % of a single-thread iteration, the derivative and moment loops
+at 20 % and the Gauss–Newton kernels at 45–60 %, all scalar. The three are now vectorised with OpenCV's universal
+intrinsics in their function form (OpenCV ≥ 4.7; older, or <code>-DFASTECC_NO_SIMD</code>, keeps the scalar loops, and CI
+runs the equivalence test on both).</p>
+<p><b>The sampler.</b> At 4.7 ns per pixel for affine — some 17 cycles — the scalar gather was well short of what the
+machine can do. Two things mattered. First, the shape of the loop: one pass per row that converts, indexes, gathers and
+combines each vector of pixels puts the conversion, the integer multiply and a store-to-load forward on the same
+dependency chain as the gathers, and the out-of-order window fills with that chain; two passes over chunks of 64 pixels
+— coordinates truncated and split into tap index and fractions into small buffers, then gathered and combined — leave
+nothing but the gathers and the weighting on the second pass's chain, and the bilinear combination as a weighted sum of
+the four taps (the weights depend only on the fractions and are ready before the taps arrive) shortens that chain from
+three dependent lerp steps to a multiply and two adds. Second, what an external build can reach: OpenCV's headers
+enable only SSE2 (or NEON) outside the library's own build, so there are no gather instructions — a tap vector is four
+scalar loads and three shuffles, about 5.5 loads per pixel in all, and the pass is bound by the two load ports at about
+4 cycles per pixel where the taps stay in L1. A rotation spreads the taps of one row over some twenty source rows at
+512 px and costs another 50 %. The projective row went from double to single precision like the affine one.</p>
+<p><b>The kernels.</b> Their inner loops are floating-point reductions, and under <code>/fp:precise</code> MSVC will not
+reassociate a sum, so it does not vectorise them (every one reports C5002; <code>ivdep</code> and <code>__restrict</code>
+change nothing, and spelling out four scalar partial sums is 1.6× slower because the arrays go to memory). The
+generator now emits, for each of the eight kernels, a vector path ahead of the scalar loop: one partial sum per lane for
+every live accumulator, the mask applied as a bitwise AND on the gradient inputs — every <span class="m">u</span>,
+<span class="m">j</span> and product downstream of a zeroed gradient is zero, so a masked lane contributes nothing, and
+the AND is safe on whatever the gradient planes hold outside the mask — and the lanes reduced into the scalar row
+accumulators before the tail. The reassociation is the one the kernels already made, float within a row and double at
+row end, one level down; four shorter chains lose less than one long one. The derivative, laplacian and moment loops
+of the stripe became one vector loop over the mask interval. And with the whole stripe in vectors the cache shows:
+four stripes per thread on one thread too, so that a stripe's planes stay in L2 between the sampler, the derivative
+loop and the kernel, takes the kernel pass of translation from 0.53 to 0.35 ms at 512.</p>
 <div class="tw"><table>
-<tr><th>ms per iteration, window 512, one thread</th><th>sampler, scalar → SIMD</th><th>iteration</th></tr>
-<tr><td>translation</td><td>1.03 → 0.43 (2.4×)</td><td>2.94 → 2.25 (1.31×)</td></tr>
-<tr><td>euclidean</td><td>1.29 → 0.68 (1.9×)</td><td>3.95 → 3.32 (1.19×)</td></tr>
-<tr><td>affine</td><td>1.23 → 0.64 (1.9×)</td><td>4.72 → 4.04 (1.17×)</td></tr>
-<tr><td>homography</td><td>2.60 → 1.10 (2.4×)</td><td>8.60 → 7.08 (1.21×)</td></tr>
+<tr><th>ms per iteration, window 512, one thread, scalar → vectorised (same run)</th><th>sampler</th><th>derivatives + moments</th><th>Gauss–Newton</th><th>iteration</th></tr>
+<tr><td>translation</td><td>1.27 → 0.46</td><td>1.13 → 0.49</td><td>1.15 → 0.44</td><td>3.48 → 1.44 (<b>2.4×</b>)</td></tr>
+<tr><td>euclidean</td><td>1.52 → 0.63</td><td>1.09 → 0.48</td><td>2.00 → 0.65</td><td>4.51 → 1.83 (<b>2.5×</b>)</td></tr>
+<tr><td>affine</td><td>1.52 → 0.65</td><td>1.10 → 0.47</td><td>2.74 → 0.87</td><td>5.28 → 2.02 (<b>2.6×</b>)</td></tr>
+<tr><td>homography</td><td>2.81 → 1.19</td><td>1.08 → 0.55</td><td>5.40 → 1.65</td><td>9.45 → 3.41 (<b>2.8×</b>)</td></tr>
 </table></div>
-<p>End to end: per iteration against ecc.cpp (affine, fixed 20 iterations) <b>2.27 / 2.48 / 2.74×</b> on one thread at
-windows 256 / 512 / 768 and <b>5.13 / 5.27 / 5.56×</b> on four (from 1.94 / 1.99 / 2.40 and 4.96 / 4.56 / 4.84); on
-four threads the iteration itself gains only 1.0–1.08× (why is not measured: the stage profile is single-thread).
-In the bench (512², start
-3 px off, 3 levels against eccms's four) fast-ecc is level with eccms: 0.92–1.07× of it on one thread, 0.80–0.93× on
-two and 0.82–1.18× on four, ahead on affine and homography and behind on translation and euclidean; single-scale
-against single-scale it is 1.33–1.58× faster on one thread and 1.31–1.52× on four. The real-image call is unchanged
-within noise — it is the pyramid's few iterations and the setup — and the fixed points are unchanged to four digits.
-What is left of the single-thread iteration is the Gauss–Newton pass, 60–70 % of it; the hand-written SIMD of the
-earlier kernels (§7) would apply to it again, and would again buy more on one thread than on four.</p>
+<p>End to end: per iteration against ecc.cpp (affine, fixed 20 iterations) <b>4.86 / 5.16 / 5.80×</b> on one thread at
+windows 256 / 512 / 768, 6.22 / 6.94 / 7.19× on two and <b>9.25 / 10.26 / 9.29×</b> on four (from 1.94 / 1.99 / 2.40
+and 4.96 / 4.56 / 4.84 before the stripe was vectorised); homography at 512, 6.85× and 14.6×. An earlier experiment
+had vectorised the kernels alone and found the stage 3.4–3.8× faster but the iteration only 1.04–1.14× at four threads,
+the stage being parallelised over stripes already and SIMD and threads substitutes for the same headroom (§7); with the
+whole stripe in vectors the gain holds with threads — the iteration at 512 is 2.06× faster on one thread and 1.92× on
+four. In the bench (512², start 3 px off, 3 levels against eccms's four) fast-ecc is now ahead in every row:
+1.26–1.87× on one thread, 1.14–1.66× on two and 1.10–1.69× on four; single-scale against single-scale 2.0–3.3× on one
+thread and 2.0–3.0× on four. On the real image (window 384, start 1–6 px off) 6.4–7.6 / 5.1–6.0 / 4.4–4.6 ms on one /
+two / four threads against 16.9–18.2 / 11.6–12.9 / 9.4–9.8 for eccms, 2.0–2.6×, at 0.0014 px against 0.0032. The fixed
+points are unchanged to four digits, floors and biases alike.</p>
 
 <h2>7. What was tried, and what is left</h2>
 <ul>
@@ -373,13 +385,15 @@ iteration.</li>
 <li><b>One parallel region per iteration, sampling exactly.</b> Single-thread cost is unchanged, four threads gain
 1.6–2.1× over the multi-pass layout, and the 1/32 px rounding of OpenCV's warp — which was the translation floor and a
 systematic centre offset — is gone.</li>
-<li><b>The sampler, vectorised.</b> Two passes per row and a weighted-sum bilinear take the gather from 4.7 to 2.5 ns per
-pixel with SSE2 alone (no gathers reach an external build); 1.17–1.31× on the single-thread iteration.</li>
-<li><b>Together, against a border-fixed ecc.cpp:</b> 2.3–2.7× per iteration on one thread and 5.1–5.6× on four (affine,
-windows 256–768), 3.7–8.4× per call on one thread and 4.3–17× on four in the bundled bench, and a lower floor rather than
-an equal one. <b>Against eccms.cpp</b> fast-ecc is 1.4–1.8× faster on the real image whatever the start and 2.3× more
-accurate; in the bench, whose start is far off, it is level — 0.92–1.07× of eccms on one thread and 0.82–1.18× on four,
-ahead on affine and homography.</li>
+<li><b>The stripe, vectorised.</b> The sampler (two passes per row, a weighted-sum bilinear: 1.9–2.4×), the derivative
+and moment loops (2.3×) and the eight Gauss–Newton kernels, whose vector path the generator now emits (2.5–3.3×), all
+with SSE2 alone: 2.4–2.8× on the single-thread iteration, and — the whole stripe rather than one stage competing with
+the thread pool — 1.9× on four threads too.</li>
+<li><b>Together, against a border-fixed ecc.cpp:</b> 4.9–5.8× per iteration on one thread and 9.3–10.3× on four (affine,
+windows 256–768), 4.8–16× per call on one thread and 4.9–24× on four in the bundled bench, and a lower floor rather than
+an equal one. <b>Against eccms.cpp</b> fast-ecc is 2.0–2.6× faster on the real image whatever the start and 2.3× more
+accurate; in the bench, whose start is far off, 1.26–1.87× on one thread and 1.10–1.69× on four, single-scale against
+single-scale 2.0–3.3×.</li>
 </ol>
 
 <footer>
