@@ -36,6 +36,17 @@
 # misalignment residual and the bilinear interpolation error.  Its w is 1, so
 # it adds one u entry and the Gram entries that pair it with the (., x) and
 # (., 1) columns; the (., y) pairs are hoisted like everything else.
+#
+# Besides the Gram matrix and the two projections, every kernel also sums the
+# jacobian columns themselves (VJ).  The single-pass iteration centres the
+# planes on the previous iteration's means, since the current ones are not
+# known until the pass is over, and corrects afterwards: for a column j and
+# the true mean m, sum j (i - m) = sum j (i - m_prev) - (m - m_prev) sum j.
+#
+# rows() takes a `base`: the row index of the first row of the gx, gy, im, lp
+# and mask planes.  The full-plane driver passes 0; the single-pass driver
+# hands it stripe buffers whose row 0 is image row y0.  The template plane is
+# always full-size and is indexed by the image row.
 import io
 import sys
 
@@ -159,30 +170,34 @@ for base, K0, L, U0, cols0 in MOTIONS:
                     hoistp[s] = nm
                 else:
                     hoistp[s] = '%d' % partner
-        proj = ['pi%d' % s for s in range(P)] + ['pt%d' % s for s in range(P)]
+        proj = (['pi%d' % s for s in range(P)] + ['pt%d' % s for s in range(P)] +
+                ['pj%d' % s for s in range(P)])
         liveproj = (['pi%d' % s for s in range(P) if s not in hoistp] +
                     ['pi' + e for e in extra] +
                     ['pt%d' % s for s in range(P) if s not in hoistp] +
-                    ['pt' + e for e in extra])
+                    ['pt' + e for e in extra] +
+                    ['pj%d' % s for s in range(P) if s not in hoistp] +
+                    ['pj' + e for e in extra])
 
         o = []
         o.append('// ---- %s: K=%d L=%d P=%d, %d Gram sums (%d live) + %d projection sums ----'
-                 % (name.lower(), K, L, P, len(acc), len(live), 2 * P))
+                 % (name.lower(), K, L, P, len(acc), len(live), 3 * P))
         o.append('struct GN%s {' % name)
         o.append('    enum { P = %d };' % P)
         members = MEMBERS[base] + (LAPSC if lap else '')
         o.append(members.rstrip('\n') if members else '')
-        o.append('    double H[%d], VI[%d], VT[%d];' % (P * (P + 1) // 2, P, P))
+        o.append('    double H[%d], VI[%d], VT[%d], VJ[%d];' % (P * (P + 1) // 2, P, P, P))
         o.append('    GN%s() { std::fill(H, H + %d, 0.0); std::fill(VI, VI + %d, 0.0);'
-                 ' std::fill(VT, VT + %d, 0.0); }' % (name, P * (P + 1) // 2, P, P))
+                 ' std::fill(VT, VT + %d, 0.0); std::fill(VJ, VJ + %d, 0.0); }'
+                 % (name, P * (P + 1) // 2, P, P, P))
         o.append('    void add(const GN%s& o) {' % name)
         o.append('        for (int i = 0; i < %d; ++i) H[i] += o.H[i];' % (P * (P + 1) // 2))
-        o.append('        for (int i = 0; i < %d; ++i) { VI[i] += o.VI[i]; VT[i] += o.VT[i]; }'
+        o.append('        for (int i = 0; i < %d; ++i) { VI[i] += o.VI[i]; VT[i] += o.VT[i]; VJ[i] += o.VJ[i]; }'
                  % P)
         o.append('    }')
         o.append('')
         o.append('    void rows(const Mat& gx, const Mat& gy, const Mat& im, const Mat& tm,')
-        o.append('              const Mat& lp, const Mat& mask, int y0, int y1) {')
+        o.append('              const Mat& lp, const Mat& mask, int y0, int y1, int base) {')
         o.append('        const int w = gx.cols;')
         if not lap:
             o.append('        (void)lp;')
@@ -191,13 +206,13 @@ for base, K0, L, U0, cols0 in MOTIONS:
         o.append('        double ' + ', '.join('t_%s = 0' % p for p in proj) + ';')
         o.append('')
         o.append('        for (int y = y0; y < y1; ++y) {')
-        o.append('            const float* pgx = gx.ptr<float>(y);')
-        o.append('            const float* pgy = gy.ptr<float>(y);')
-        o.append('            const float* pim = im.ptr<float>(y);')
+        o.append('            const float* pgx = gx.ptr<float>(y - base);')
+        o.append('            const float* pgy = gy.ptr<float>(y - base);')
+        o.append('            const float* pim = im.ptr<float>(y - base);')
         o.append('            const float* ptm = tm.ptr<float>(y);')
         if lap:
-            o.append('            const float* pl = lp.ptr<float>(y);')
-        o.append('            const uchar* pmk = mask.ptr<uchar>(y);')
+            o.append('            const float* pl = lp.ptr<float>(y - base);')
+        o.append('            const uchar* pmk = mask.ptr<uchar>(y - base);')
         o.append('            const float fy = (float)y;')
         if PRE[base]:
             o.append(PRE[base].rstrip('\n').replace('        ', '            '))
@@ -252,6 +267,9 @@ for base, K0, L, U0, cols0 in MOTIONS:
             terms = ['%s%d += j%d * %s;' % (pre, s, s, src) for s in kept]
             terms += ['%s%s += %s * %s;' % (pre, e, U[int(e[1:])], src) for e in extra]
             o.append('                ' + '  '.join(terms))
+        terms = ['pj%d += j%d;' % (s, s) for s in kept]
+        terms += ['pj%s += %s;' % (e, U[int(e[1:])]) for e in extra]
+        o.append('                ' + '  '.join(terms))
         for i in range(body_start, len(o)):
             o[i] = '\n'.join('    ' + ln for ln in o[i].split('\n'))
         o.append('                }')
@@ -277,7 +295,7 @@ for base, K0, L, U0, cols0 in MOTIONS:
             o.append('            ' + '  '.join('t_%s += %s;' % (a, a) for a in acc))
 
         if hoistp:
-            for pre in ('pi', 'pt'):
+            for pre in ('pi', 'pt', 'pj'):
                 line = []
                 for s in range(P):
                     if s in hoistp:
@@ -300,6 +318,7 @@ for base, K0, L, U0, cols0 in MOTIONS:
             o.append('        ' + '  '.join(terms))
         o.append('        ' + '  '.join('VI[%d] += t_pi%d;' % (s, s) for s in range(P)))
         o.append('        ' + '  '.join('VT[%d] += t_pt%d;' % (s, s) for s in range(P)))
+        o.append('        ' + '  '.join('VJ[%d] += t_pj%d;' % (s, s) for s in range(P)))
         o.append('    }')
         o.append('};')
         o.append('')
