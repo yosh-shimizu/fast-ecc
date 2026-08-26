@@ -130,7 +130,7 @@ Mat groundTruth(int motion, double shiftX, double shiftY) {
 
 }  // namespace
 
-struct FlagSet { int flags; const char* name; };
+struct FlagSet { int flags; int levels; const char* name; };
 
 int main() {
     const Mat source = syntheticImage(kSize + 2 * kMargin);
@@ -138,10 +138,11 @@ int main() {
     const TermCriteria crit(TermCriteria::COUNT + TermCriteria::EPS, 100, 1e-6);
 
     const FlagSet flagSets[] = {
-        {fastecc::FASTECC_DEFAULT_FLAGS,                          "default (laplacian column + 5-tap)"},
-        {0,                                                       "plain"},
-        {fastecc::FASTECC_LAPLACIAN_COLUMN,                       "laplacian column"},
-        {fastecc::FASTECC_GRAD5,                                  "5-tap"},
+        {fastecc::FASTECC_DEFAULT_FLAGS, 1, "default (laplacian column + 5-tap)"},
+        {0,                              1, "plain"},
+        {fastecc::FASTECC_LAPLACIAN_COLUMN, 1, "laplacian column"},
+        {fastecc::FASTECC_GRAD5,         1, "5-tap"},
+        {fastecc::FASTECC_DEFAULT_FLAGS, 3, "default, 3-level pyramid"},
     };
 
     const MotionCase cases[] = {
@@ -157,9 +158,10 @@ int main() {
     const int kNGauss = 3;
 
     int failures = 0;
-    for (int fi = 0; fi < 4; ++fi) {
+    for (int fi = 0; fi < 5; ++fi) {
     const int flags = flagSets[fi].flags;
-    std::printf("\n== flags = %d: %s ==\n", flags, flagSets[fi].name);
+    const int levels = flagSets[fi].levels;
+    std::printf("\n== flags = %d, nlevels = %d: %s ==\n", flags, levels, flagSets[fi].name);
     std::printf("%-12s %6s %11s %11s %9s %8s   %s\n",
                 "motion", "gauss", "errCv px", "errFast px", "rho", "tol px", "verdict");
 
@@ -204,7 +206,7 @@ int main() {
                 try {
                     cv::findTransformECC(templ, input, Wcv, c.motion, crit, noArray(), gauss);
                     rho = fastecc::findTransformECC(templ, input, Wfast, c.motion, crit,
-                                                    noArray(), gauss, flags);
+                                                    noArray(), gauss, flags, levels);
                 } catch (const cv::Exception& e) {
                     std::printf("%-12s %6d   EXCEPTION: %s\n", c.name, gauss, e.what());
                     ++failures;
