@@ -357,7 +357,7 @@ thread and 2.0–3.0× on four. On the real image (window 384, start 1–6 px of
 two / four threads against 16.9–18.2 / 11.6–12.9 / 9.4–9.8 for eccms, 2.0–2.6×, at 0.0014 px against 0.0032. The fixed
 points are unchanged to four digits, floors and biases alike.</p>
 
-<h3>6.6 Eight lanes, on request</h3>
+<h3>6.6 Eight lanes, at run time</h3>
 <p>What stops the 128-bit kernel is not the algebra. The vector loop of the affine kernel with the laplacian column
 compiles (MSVC, SSE2) to 181 instructions per four pixels: 76 floating-point operations, 88 register moves — 56 of
 them spills and reloads of the 32 lane accumulators over 16 registers, the rest the copies that two-operand SSE
@@ -373,9 +373,15 @@ macros can be set by hand. <code>-DFAST_ECC_AVX2=ON</code> compiles with <code>/
 <code>-mavx2 -mfma</code>) and defines <code>CV_AVX2</code>, <code>CV_FMA3</code> and the SSE3–4.2 macros ahead
 of the headers, which then bring in the 256-bit universal intrinsics; the vector code, written width-agnostically
 (<code>vx_load</code>, <code>vlanes()</code>), needs no other change and runs at eight lanes with fused
-multiply-adds and hardware gathers. It is off by default because the binary then requires an AVX2 CPU. OpenCV
-4.10's wrapper layer and 4.15's native functions both compile it; the equivalence test passes under it and the
-fixed points are unchanged to four digits.</p>
+multiply-adds and hardware gathers. OpenCV 4.10's wrapper layer and 4.15's native functions both compile it; the
+equivalence test passes under it and the fixed points are unchanged to four digits. A binary built that way needs
+an AVX2 CPU, so the default build does what OpenCV's own dispatch does: it compiles the file twice —
+<code>src/fast_ecc_avx2.cpp</code> is the same source with the AVX2 flags — and <code>findTransformECC</code>
+picks the eight-lane instance once per process when <code>cv::checkHardwareSupport</code> reports AVX2 and FMA3.
+The 128-bit instance stays the fallback for older CPUs, <code>FASTECC_NO_AVX2</code> in the environment forces it
+(which is how the two are compared in one binary), and <code>vectorPath()</code> reports which one runs. The
+dispatched instance is as fast as the whole library compiled for AVX2 (1.26 against 1.23 ms per iteration at
+512, one thread).</p>
 <div class="tw"><table>
 <tr><th>ms per iteration, window 512, one thread, same run: scalar → default (SSE2, 4 lanes) → AVX2 (8 lanes + FMA)</th><th>sampler</th><th>derivatives + moments</th><th>Gauss–Newton</th><th>iteration</th></tr>
 <tr><td>translation</td><td>1.25 → 0.53 → 0.36</td><td>0.96 → 0.47 → 0.36</td><td>1.02 → 0.38 → 0.21</td><td>3.15 → 1.38 → <b>0.86</b></td></tr>
@@ -423,10 +429,10 @@ systematic centre offset — is gone.</li>
 and moment loops (2.3×) and the eight Gauss–Newton kernels, whose vector path the generator now emits (2.5–3.3×), all
 with SSE2 alone: 2.4–2.8× on the single-thread iteration, and — the whole stripe rather than one stage competing with
 the thread pool — 1.9× on four threads too.</li>
-<li><b>Eight lanes, on request.</b> The 128-bit kernel is issue-bound (181 instructions per four pixels, a third
-of them spills); <code>-DFAST_ECC_AVX2=ON</code> sets the feature macros OpenCV's headers would not, and the same
-source runs at eight lanes with FMA: 8.0–8.2× per iteration against ecc.cpp on one thread and 11.6–17.3× on four,
-1.06–2.65× of eccms in the bench.</li>
+<li><b>Eight lanes, at run time.</b> The 128-bit kernel is issue-bound (181 instructions per four pixels, a third
+of them spills); a second instance compiled with the AVX2 flags sets the feature macros OpenCV's headers would
+not, the same source runs at eight lanes with FMA, and the default build picks it at run time: 8.0–8.2× per
+iteration against ecc.cpp on one thread and 11.6–17.3× on four, 1.06–2.65× of eccms in the bench.</li>
 <li><b>Together, against a border-fixed ecc.cpp:</b> 4.9–5.8× per iteration on one thread and 9.3–10.3× on four (affine,
 windows 256–768), 4.8–16× per call on one thread and 4.9–24× on four in the bundled bench, and a lower floor rather than
 an equal one. <b>Against eccms.cpp</b> fast-ecc is 2.0–2.6× faster on the real image whatever the start and 2.3× more

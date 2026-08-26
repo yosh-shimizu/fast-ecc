@@ -260,6 +260,6 @@ int main() {
     }
     }
 
-    std::printf("\n%s\n", failures == 0 ? "ALL PASS" : "FAILURES PRESENT");
+    std::printf("\n%s  (fast-ecc on %s)\n", failures == 0 ? "ALL PASS" : "FAILURES PRESENT", fastecc::vectorPath());
     return failures == 0 ? 0 : 1;
 }
