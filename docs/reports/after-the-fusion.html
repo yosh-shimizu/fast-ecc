@@ -297,8 +297,8 @@ it (0.0125, where eccms also sits, 0.0129).</p>
 256 / 512 / 768, and <b>4.96 / 4.56 / 4.84×</b> on four. In the bench (512², start 3 px off, 3 levels against eccms's
 four) 0.77–0.94× of eccms on one thread and 0.70–0.95× on four; on the real image (window 384, start 1–6 px off)
 9.7 / 7.5 / 4.9–5.7 ms on one / two / four threads against 15.6 / 10.7 / 8.5–9.2 for eccms, at 0.0014 px against
-0.0032. What remains between the two in the bench is the sampler: eccms's is SIMD fixed-point, fast-ecc's a scalar
-exact one.</p>
+0.0032. What remained between the two in the bench was the sampler: eccms's is SIMD fixed-point, fast-ecc's was a
+scalar exact one (§6.5).</p>
 
 <h3>6.4 As landed, against ecc.cpp</h3>
 <div class="tw"><table>
@@ -307,6 +307,43 @@ exact one.</p>
 <tr><td>corner RMS, real image (fruits, resampled)</td><td>0.0072 px</td><td>0.0072 px</td><td><b>0.0025 px</b></td></tr>
 <tr><td>converged from the no-motion guess, ×1 / ×2 / ×4 (real image)</td><td>100 / 100 / 89 %</td><td>100 / 100 / 89 %</td><td><b>100 / 100 / 99 %</b></td></tr>
 </table></div>
+
+<h3>6.5 The sampler, vectorised</h3>
+<p>The single-pass stage profile (<code>eval/spbench.cpp</code>: the library source included, the stripe body repeated
+with a timer between its stages) put the sampler at 25–35 % of a single-thread iteration and the Gauss–Newton pass at
+45–60 %; at 4.7 ns per pixel for affine — some 17 cycles — the scalar gather was well short of what the machine can do.
+It is now written with OpenCV's universal intrinsics in their function form (OpenCV ≥ 4.7; older, or
+<code>-DFASTECC_NO_SIMD</code>, keeps the scalar loops, and CI runs the equivalence test on both). Two things mattered.
+First, the shape of the loop: one pass per row that converts, indexes, gathers and combines each vector of pixels puts the
+conversion, the integer multiply and a store-to-load forward on the same dependency chain as the gathers, and the
+out-of-order window fills with that chain; two passes over chunks of 64 pixels — coordinates truncated and split into
+tap index and fractions into small buffers, then gathered and combined — leave nothing but the gathers and the weighting
+on the second pass's chain, and the bilinear combination as a weighted sum of the four taps (the weights depend only
+on the fractions and are ready before the taps arrive) shortens that chain from three dependent lerp steps to a
+multiply and two adds. Second, what an external build can reach: OpenCV's headers enable only SSE2 (or NEON) outside
+the library's own build, so there are no gather instructions — a tap vector is four scalar loads and three shuffles,
+about 5.5 loads per pixel in all, and the pass is bound by the two load ports at about 4 cycles per pixel where the
+taps stay in L1. A rotation spreads the taps of one row over some twenty source rows at 512 px and costs another
+50 %; that is the difference between translation and affine below. The projective row went from double to single
+precision like the affine one, and the lanes and the scalar tails share their arithmetic, so a row does not depend on
+where the vector part ends.</p>
+<div class="tw"><table>
+<tr><th>ms per iteration, window 512, one thread</th><th>sampler, scalar → SIMD</th><th>iteration</th></tr>
+<tr><td>translation</td><td>1.03 → 0.43 (2.4×)</td><td>2.94 → 2.25 (1.31×)</td></tr>
+<tr><td>euclidean</td><td>1.29 → 0.68 (1.9×)</td><td>3.95 → 3.32 (1.19×)</td></tr>
+<tr><td>affine</td><td>1.23 → 0.64 (1.9×)</td><td>4.72 → 4.04 (1.17×)</td></tr>
+<tr><td>homography</td><td>2.60 → 1.10 (2.4×)</td><td>8.60 → 7.08 (1.21×)</td></tr>
+</table></div>
+<p>End to end: per iteration against ecc.cpp (affine, fixed 20 iterations) <b>2.27 / 2.48 / 2.74×</b> on one thread at
+windows 256 / 512 / 768 and <b>5.13 / 5.27 / 5.56×</b> on four (from 1.94 / 1.99 / 2.40 and 4.96 / 4.56 / 4.84); on
+four threads the iteration itself gains only 1.0–1.08× (why is not measured: the stage profile is single-thread).
+In the bench (512², start
+3 px off, 3 levels against eccms's four) fast-ecc is level with eccms: 0.92–1.07× of it on one thread, 0.80–0.93× on
+two and 0.82–1.18× on four, ahead on affine and homography and behind on translation and euclidean; single-scale
+against single-scale it is 1.33–1.58× faster on one thread and 1.31–1.52× on four. The real-image call is unchanged
+within noise — it is the pyramid's few iterations and the setup — and the fixed points are unchanged to four digits.
+What is left of the single-thread iteration is the Gauss–Newton pass, 60–70 % of it; the hand-written SIMD of the
+earlier kernels (§7) would apply to it again, and would again buy more on one thread than on four.</p>
 
 <h2>7. What was tried, and what is left</h2>
 <ul>
@@ -336,11 +373,13 @@ iteration.</li>
 <li><b>One parallel region per iteration, sampling exactly.</b> Single-thread cost is unchanged, four threads gain
 1.6–2.1× over the multi-pass layout, and the 1/32 px rounding of OpenCV's warp — which was the translation floor and a
 systematic centre offset — is gone.</li>
-<li><b>Together, against a border-fixed ecc.cpp:</b> 1.9–2.4× per iteration on one thread and 4.6–5.0× on four (affine,
-windows 256–768), 3.1–6.9× per call on one thread and 3.8–14× on four in the bundled bench, and a lower floor rather than
+<li><b>The sampler, vectorised.</b> Two passes per row and a weighted-sum bilinear take the gather from 4.7 to 2.5 ns per
+pixel with SSE2 alone (no gathers reach an external build); 1.17–1.31× on the single-thread iteration.</li>
+<li><b>Together, against a border-fixed ecc.cpp:</b> 2.3–2.7× per iteration on one thread and 5.1–5.6× on four (affine,
+windows 256–768), 3.7–8.4× per call on one thread and 4.3–17× on four in the bundled bench, and a lower floor rather than
 an equal one. <b>Against eccms.cpp</b> fast-ecc is 1.4–1.8× faster on the real image whatever the start and 2.3× more
-accurate; in the bench, whose start is far off, it is at 0.77–0.94× of eccms on one thread and 0.70–0.95× on four, the
-remaining gap being a scalar sampler against a SIMD one.</li>
+accurate; in the bench, whose start is far off, it is level — 0.92–1.07× of eccms on one thread and 0.82–1.18× on four,
+ahead on affine and homography.</li>
 </ol>
 
 <footer>
@@ -348,7 +387,7 @@ Measured on an Intel Core i7-8700K (6C/12T), Windows 11, MSVC, Release, against 
 applied. Single-thread timings on this machine vary by ±10–30 % between runs; every ratio is taken within one run, and
 per-iteration costs are the best of three interleaved runs.<br>
 Implementation: <code>src/fast_ecc.cpp</code>, <code>src/gn_fused.inc</code> (generated by <code>tools/gen_gn_kernels.py</code>),
-the <code>sigma-param</code> branch for the sigma experiment. Instruments: <code>eval/profbench.cpp</code>,
+the <code>sigma-param</code> branch for the sigma experiment. Instruments: <code>eval/profbench.cpp</code>, <code>eval/spbench.cpp</code>,
 <code>eval/xgrad_ecc.cpp</code>, <code>eval/perspbench.cpp</code>, <code>eval/maskcheck.cpp</code>; raw data under
 <code>eval/results/</code> (U1–U4, V1–V3, W1–W4, X1).<br>
 Related: <a href="gauss-newton-fusion.html">Fusing the Gauss–Newton stage</a>,
