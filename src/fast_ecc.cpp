@@ -52,6 +52,28 @@
 // Not bit-identical to cv::findTransformECC (resampling and differentiation do
 // not commute), but equally accurate against ground truth — see README.md.
 
+// Opt-in AVX2.  FASTECC_AVX2 (set by the FAST_ECC_AVX2 CMake option, which
+// also passes /arch:AVX2 or -mavx2 -mfma) tells OpenCV's headers that the
+// 256-bit universal intrinsics may be used in this translation unit.  Outside
+// OpenCV's own build the headers enable SSE2 alone, whatever the compiler was
+// given; these are the feature macros its own dispatch would set.  The vector
+// code below is written width-agnostically (vx_load, vlanes()), so nothing
+// else changes: eight lanes and fused multiply-adds instead of four lanes and
+// separate ones.  The library then needs an AVX2 CPU (2013 on).
+#if defined(FASTECC_AVX2) && FASTECC_AVX2
+#  if !defined(__AVX2__)
+#    error "FASTECC_AVX2 needs AVX2 code generation: /arch:AVX2 (MSVC) or -mavx2 -mfma"
+#  endif
+#  include <immintrin.h>
+#  define CV_SSE3 1
+#  define CV_SSSE3 1
+#  define CV_SSE4_1 1
+#  define CV_SSE4_2 1
+#  define CV_AVX 1
+#  define CV_AVX2 1
+#  define CV_FMA3 1
+#endif
+
 #include "fast_ecc.hpp"
 
 #include <opencv2/imgproc.hpp>
@@ -287,14 +309,14 @@ static inline void bilinearSpan(const float* SRC, size_t STEP,
         int   CV_DECL_ALIGNED(64) idx[CH];
         float CV_DECL_ALIGNED(64) fu[CH], fv[CH];
         for (int k = 0; k < L; ++k) lane[k] = (float)k;
-        const v_float32 vL = v_setall_f32((float)L), vone = v_setall_f32(1.f);
-        const v_float32 va0 = v_setall_f32(a0), va3 = v_setall_f32(a3);
-        const v_float32 vbx = v_setall_f32(bx), vby = v_setall_f32(by);
-        const v_int32 vstep = v_setall_s32((int)STEP);
+        const v_float32 vL = vx_setall_f32((float)L), vone = vx_setall_f32(1.f);
+        const v_float32 va0 = vx_setall_f32(a0), va3 = vx_setall_f32(a3);
+        const v_float32 vbx = vx_setall_f32(bx), vby = vx_setall_f32(by);
+        const v_int32 vstep = vx_setall_s32((int)STEP);
         const int nv = n - n % L;
         while (i < nv) {
             const int m = std::min((int)CH, nv - i);
-            v_float32 vi = v_add(v_load_aligned(lane), v_setall_f32((float)i));
+            v_float32 vi = v_add(vx_load_aligned(lane), vx_setall_f32((float)i));
             for (int k = 0; k < m; k += L) {
                 const v_float32 sx = v_add(v_mul(va0, vi), vbx), sy = v_add(v_mul(va3, vi), vby);
                 const v_int32 ix = v_trunc(sx), iy = v_trunc(sy);    // both >= 0 here
@@ -304,12 +326,12 @@ static inline void bilinearSpan(const float* SRC, size_t STEP,
                 vi = v_add(vi, vL);
             }
             for (int k = 0; k < m; k += L) {
-                const v_float32 u = v_load_aligned(fu + k), v = v_load_aligned(fv + k);
+                const v_float32 u = vx_load_aligned(fu + k), v = vx_load_aligned(fv + k);
                 const v_float32 omu = v_sub(vone, u), omv = v_sub(vone, v);
                 const v_float32 w00 = v_mul(omu, omv), w01 = v_mul(u, omv);
                 const v_float32 w10 = v_mul(omu, v),   w11 = v_mul(u, v);
-                const v_float32 t00 = v_lut(SRC, idx + k),        t01 = v_lut(SRC + 1, idx + k);
-                const v_float32 t10 = v_lut(SRC + STEP, idx + k), t11 = v_lut(SRC + STEP + 1, idx + k);
+                const v_float32 t00 = vx_lut(SRC, idx + k),        t01 = vx_lut(SRC + 1, idx + k);
+                const v_float32 t10 = vx_lut(SRC + STEP, idx + k), t11 = vx_lut(SRC + STEP + 1, idx + k);
                 v_store(out + i + k, v_add(v_add(v_mul(t00, w00), v_mul(t01, w01)),
                                            v_add(v_mul(t10, w10), v_mul(t11, w11))));
             }
@@ -346,15 +368,15 @@ static inline void projectiveRow(const float* SRC, size_t STEP, int SW, int SH,
         int   CV_DECL_ALIGNED(64) idx[CH], ok[CH];
         float CV_DECL_ALIGNED(64) fu[CH], fv[CH];
         for (int k = 0; k < L; ++k) lane[k] = (float)k;
-        const v_float32 vL = v_setall_f32((float)L), vone = v_setall_f32(1.f), vzf = v_setzero_f32();
-        const v_float32 va0 = v_setall_f32(a0), va3 = v_setall_f32(a3), va6 = v_setall_f32(a6);
-        const v_float32 vbx = v_setall_f32(bx), vby = v_setall_f32(by), vbd = v_setall_f32(bd);
-        const v_int32 vstep = v_setall_s32((int)STEP), vzi = v_setzero_s32();
-        const v_int32 vxmax = v_setall_s32(SW - 2), vymax = v_setall_s32(SH - 2);
+        const v_float32 vL = vx_setall_f32((float)L), vone = vx_setall_f32(1.f), vzf = vx_setzero_f32();
+        const v_float32 va0 = vx_setall_f32(a0), va3 = vx_setall_f32(a3), va6 = vx_setall_f32(a6);
+        const v_float32 vbx = vx_setall_f32(bx), vby = vx_setall_f32(by), vbd = vx_setall_f32(bd);
+        const v_int32 vstep = vx_setall_s32((int)STEP), vzi = vx_setzero_s32();
+        const v_int32 vxmax = vx_setall_s32(SW - 2), vymax = vx_setall_s32(SH - 2);
         const int nv = ws - ws % L;
         while (x < nv) {
             const int m = std::min((int)CH, nv - x);
-            v_float32 vx = v_add(v_load_aligned(lane), v_setall_f32((float)x));
+            v_float32 vx = v_add(vx_load_aligned(lane), vx_setall_f32((float)x));
             for (int k = 0; k < m; k += L) {
                 const v_float32 d = v_add(v_mul(va6, vx), vbd);
                 const v_float32 nz = v_ne(d, vzf);
@@ -372,15 +394,15 @@ static inline void projectiveRow(const float* SRC, size_t STEP, int SW, int SH,
                 vx = v_add(vx, vL);
             }
             for (int k = 0; k < m; k += L) {
-                const v_float32 u = v_load_aligned(fu + k), v = v_load_aligned(fv + k);
+                const v_float32 u = vx_load_aligned(fu + k), v = vx_load_aligned(fv + k);
                 const v_float32 omu = v_sub(vone, u), omv = v_sub(vone, v);
                 const v_float32 w00 = v_mul(omu, omv), w01 = v_mul(u, omv);
                 const v_float32 w10 = v_mul(omu, v),   w11 = v_mul(u, v);
-                const v_float32 t00 = v_lut(SRC, idx + k),        t01 = v_lut(SRC + 1, idx + k);
-                const v_float32 t10 = v_lut(SRC + STEP, idx + k), t11 = v_lut(SRC + STEP + 1, idx + k);
+                const v_float32 t00 = vx_lut(SRC, idx + k),        t01 = vx_lut(SRC + 1, idx + k);
+                const v_float32 t10 = vx_lut(SRC + STEP, idx + k), t11 = vx_lut(SRC + STEP + 1, idx + k);
                 const v_float32 res = v_add(v_add(v_mul(t00, w00), v_mul(t01, w01)),
                                             v_add(v_mul(t10, w10), v_mul(t11, w11)));
-                v_store(out + x + k, v_select(v_reinterpret_as_f32(v_load_aligned(ok + k)), res, vzf));
+                v_store(out + x + k, v_select(v_reinterpret_as_f32(vx_load_aligned(ok + k)), res, vzf));
             }
             x += m;
         }
@@ -805,26 +827,26 @@ double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
 #if FASTECC_SIMD
                         {
                             const int VL = VTraits<v_float32>::vlanes();
-                            const v_float32 vmI = v_setall_f32(mI), vmT = v_setall_f32(mT);
-                            const v_float32 c8 = v_setall_f32(8.f), c12 = v_setall_f32(1.f / 12);
-                            const v_float32 c4 = v_setall_f32(4.f), ch = v_setall_f32(0.5f);
-                            v_float32 vsd = v_setzero_f32(), vsdd = v_setzero_f32(), vse = v_setzero_f32();
-                            v_float32 vsee = v_setzero_f32(), vsde = v_setzero_f32();
+                            const v_float32 vmI = vx_setall_f32(mI), vmT = vx_setall_f32(mT);
+                            const v_float32 c8 = vx_setall_f32(8.f), c12 = vx_setall_f32(1.f / 12);
+                            const v_float32 c4 = vx_setall_f32(4.f), ch = vx_setall_f32(0.5f);
+                            v_float32 vsd = vx_setzero_f32(), vsdd = vx_setzero_f32(), vse = vx_setzero_f32();
+                            v_float32 vsee = vx_setzero_f32(), vsde = vx_setzero_f32();
                             for (; x + VL <= x1; x += VL) {
-                                const v_float32 c = v_load(r0 + x), l1 = v_load(r0 + x - 1), r1 = v_load(r0 + x + 1);
-                                const v_float32 u1 = v_load(rm1 + x), d1 = v_load(rp1 + x);
+                                const v_float32 c = vx_load(r0 + x), l1 = vx_load(r0 + x - 1), r1 = vx_load(r0 + x + 1);
+                                const v_float32 u1 = vx_load(rm1 + x), d1 = vx_load(rp1 + x);
                                 if (useGrad5) {
-                                    v_store(gx + x, v_mul(v_sub(v_add(v_sub(v_load(r0 + x - 2), v_mul(c8, l1)),
-                                                                      v_mul(c8, r1)), v_load(r0 + x + 2)), c12));
-                                    v_store(gy + x, v_mul(v_sub(v_add(v_sub(v_load(rm2 + x), v_mul(c8, u1)),
-                                                                      v_mul(c8, d1)), v_load(rp2 + x)), c12));
+                                    v_store(gx + x, v_mul(v_sub(v_add(v_sub(vx_load(r0 + x - 2), v_mul(c8, l1)),
+                                                                      v_mul(c8, r1)), vx_load(r0 + x + 2)), c12));
+                                    v_store(gy + x, v_mul(v_sub(v_add(v_sub(vx_load(rm2 + x), v_mul(c8, u1)),
+                                                                      v_mul(c8, d1)), vx_load(rp2 + x)), c12));
                                 } else {
                                     v_store(gx + x, v_mul(ch, v_sub(r1, l1)));
                                     v_store(gy + x, v_mul(ch, v_sub(d1, u1)));
                                 }
                                 if (useLap)
                                     v_store(lp + x, v_sub(v_add(v_add(v_add(l1, r1), u1), d1), v_mul(c4, c)));
-                                const v_float32 d = v_sub(c, vmI), e = v_sub(v_load(tm + x), vmT);
+                                const v_float32 d = v_sub(c, vmI), e = v_sub(vx_load(tm + x), vmT);
                                 vsd = v_add(vsd, d);  vsdd = v_fma(d, d, vsdd);
                                 vse = v_add(vse, e);  vsee = v_fma(e, e, vsee);  vsde = v_fma(d, e, vsde);
                             }
