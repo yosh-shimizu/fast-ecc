@@ -138,11 +138,12 @@ int main() {
     const TermCriteria crit(TermCriteria::COUNT + TermCriteria::EPS, 100, 1e-6);
 
     const FlagSet flagSets[] = {
-        {fastecc::FASTECC_DEFAULT_FLAGS, 1, "default (laplacian column + 5-tap)"},
-        {0,                              1, "plain"},
+        {fastecc::FASTECC_DEFAULT_FLAGS, 3, "default (laplacian column + 5-tap, 3 levels)"},
+        {fastecc::FASTECC_DEFAULT_FLAGS, 1, "default flags, single scale"},
+        {0,                              1, "plain, single scale"},
         {fastecc::FASTECC_LAPLACIAN_COLUMN, 1, "laplacian column"},
         {fastecc::FASTECC_GRAD5,         1, "5-tap"},
-        {fastecc::FASTECC_DEFAULT_FLAGS, 3, "default, 3-level pyramid"},
+        {fastecc::FASTECC_DEFAULT_FLAGS | fastecc::FASTECC_LEGACY_PIPELINE, 1, "default flags, multi-pass pipeline"},
     };
 
     const MotionCase cases[] = {
@@ -158,7 +159,7 @@ int main() {
     const int kNGauss = 3;
 
     int failures = 0;
-    for (int fi = 0; fi < 5; ++fi) {
+    for (int fi = 0; fi < 6; ++fi) {
     const int flags = flagSets[fi].flags;
     const int levels = flagSets[fi].levels;
     std::printf("\n== flags = %d, nlevels = %d: %s ==\n", flags, levels, flagSets[fi].name);

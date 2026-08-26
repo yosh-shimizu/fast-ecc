@@ -31,11 +31,18 @@ enum {
     // 3-tap: the error contracts by ~0.06 per iteration instead of ~0.17, so
     // the accuracy floor takes 3 iterations instead of 4-5.
     FASTECC_GRAD5 = 2,
+    // Force the multi-pass iteration (OpenCV warp, full-size gradient planes,
+    // separate moment and Gauss-Newton passes) instead of the single-pass
+    // one.  The two agree to the accuracy floor; the single pass samples with
+    // exact bilinear weights where OpenCV's warp rounds to 1/32 px, and does
+    // an iteration in one parallel region.  Kept for comparison.
+    FASTECC_LEGACY_PIPELINE = 4,
     // what `flags` defaults to
     FASTECC_DEFAULT_FLAGS = FASTECC_LAPLACIAN_COLUMN | FASTECC_GRAD5
 };
 #define FASTECC_HAS_FLAGS 1
 #define FASTECC_HAS_PYRAMID 1
+#define FASTECC_HAS_SINGLE_PASS 1
 
 // Estimates the geometric transform `warpMatrix` (CV_32FC1, 2x3 or 3x3 for
 // homography) that aligns `templateImage` to `inputImage`.  `motionType` is one
@@ -52,8 +59,8 @@ enum {
 // iteration (pre-filter, border ring, flags, stop criterion) on the
 // downsampled images and hands its warp to the next finer level.  The
 // coarsest level keeps at least 16 px on the template's shorter side, so
-// `nlevels` is reduced for small templates.  1 (the default) is the
-// single-scale iteration exactly as before.
+// `nlevels` is reduced for small templates, and a coarse level that gives up
+// is skipped.  The default is 3; 1 is the single-scale iteration.
 double findTransformECC(
     cv::InputArray templateImage,
     cv::InputArray inputImage,
@@ -64,6 +71,6 @@ double findTransformECC(
     cv::InputArray inputMask = cv::noArray(),
     int gaussFiltSize = 5,
     int flags = FASTECC_DEFAULT_FLAGS,
-    int nlevels = 1);
+    int nlevels = 3);
 
 } // namespace fastecc
