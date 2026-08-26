@@ -62,6 +62,21 @@
 #include <type_traits>
 #include <vector>
 
+// The sampler's vector path is written with OpenCV's universal intrinsics in
+// their function form (v_add, v_lut, ...), which exist from OpenCV 4.7 --
+// as wrappers over the operators until 4.10, native from 4.11, where the
+// operators went away.  An older OpenCV, or -DFASTECC_NO_SIMD, gets the
+// scalar loops; the two agree bit for bit on the affine path.
+#if !defined(FASTECC_NO_SIMD) && (CV_VERSION_MAJOR > 4 || (CV_VERSION_MAJOR == 4 && CV_VERSION_MINOR >= 7))
+#  include <opencv2/core/hal/intrin.hpp>
+#  if CV_SIMD
+#    define FASTECC_SIMD_SAMPLER 1
+#  endif
+#endif
+#ifndef FASTECC_SIMD_SAMPLER
+#  define FASTECC_SIMD_SAMPLER 0
+#endif
+
 using namespace cv;
 
 namespace {
@@ -234,6 +249,148 @@ static bool analyticMask(Mat& mask, const Mat& map, int motionType, int wd, int 
     return true;
 }
 
+// The bilinear combination of the four taps at index k (top-left) with the
+// fractions u, v, as one expression shared by the vector and the scalar code
+// so that the two agree bit for bit and a row does not depend on where the
+// vector part ends.  Weighted-sum form rather than two lerps: the weights
+// depend only on (u, v) and are ready before the taps arrive, so the chain
+// after the gathers is a multiply and two adds.
+#define FASTECC_BILINEAR(T00, T01, T10, T11, W00, W01, W10, W11) \
+    (((T00) * (W00) + (T01) * (W01)) + ((T10) * (W10) + (T11) * (W11)))
+
+// Bilinear taps of one span of n pixels whose four taps are all inside the
+// source, at (a0*i + bx, a3*i + by) for i = 0..n-1.
+//
+// The vector path runs two passes over chunks of CH pixels: the coordinates,
+// truncated and split into tap index and fractions, are streamed into small
+// buffers first, then gathered and combined.  Nothing but the gathers and
+// the weighting is on the second pass's dependency chain, which is what the
+// out-of-order window ends up waiting on.
+static inline void bilinearSpan(const float* SRC, size_t STEP,
+                                float a0, float a3, float bx, float by, float* out, int n)
+{
+    int i = 0;
+#if FASTECC_SIMD_SAMPLER
+    {
+        enum { CH = 64 };
+        const int L = VTraits<v_float32>::vlanes();
+        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];
+        int   CV_DECL_ALIGNED(64) idx[CH];
+        float CV_DECL_ALIGNED(64) fu[CH], fv[CH];
+        for (int k = 0; k < L; ++k) lane[k] = (float)k;
+        const v_float32 vL = v_setall_f32((float)L), vone = v_setall_f32(1.f);
+        const v_float32 va0 = v_setall_f32(a0), va3 = v_setall_f32(a3);
+        const v_float32 vbx = v_setall_f32(bx), vby = v_setall_f32(by);
+        const v_int32 vstep = v_setall_s32((int)STEP);
+        const int nv = n - n % L;
+        while (i < nv) {
+            const int m = std::min((int)CH, nv - i);
+            v_float32 vi = v_add(v_load_aligned(lane), v_setall_f32((float)i));
+            for (int k = 0; k < m; k += L) {
+                const v_float32 sx = v_add(v_mul(va0, vi), vbx), sy = v_add(v_mul(va3, vi), vby);
+                const v_int32 ix = v_trunc(sx), iy = v_trunc(sy);    // both >= 0 here
+                v_store_aligned(idx + k, v_add(v_mul(iy, vstep), ix));
+                v_store_aligned(fu + k, v_sub(sx, v_cvt_f32(ix)));
+                v_store_aligned(fv + k, v_sub(sy, v_cvt_f32(iy)));
+                vi = v_add(vi, vL);
+            }
+            for (int k = 0; k < m; k += L) {
+                const v_float32 u = v_load_aligned(fu + k), v = v_load_aligned(fv + k);
+                const v_float32 omu = v_sub(vone, u), omv = v_sub(vone, v);
+                const v_float32 w00 = v_mul(omu, omv), w01 = v_mul(u, omv);
+                const v_float32 w10 = v_mul(omu, v),   w11 = v_mul(u, v);
+                const v_float32 t00 = v_lut(SRC, idx + k),        t01 = v_lut(SRC + 1, idx + k);
+                const v_float32 t10 = v_lut(SRC + STEP, idx + k), t11 = v_lut(SRC + STEP + 1, idx + k);
+                v_store(out + i + k, v_add(v_add(v_mul(t00, w00), v_mul(t01, w01)),
+                                           v_add(v_mul(t10, w10), v_mul(t11, w11))));
+            }
+            i += m;
+        }
+    }
+#endif
+    for (; i < n; ++i) {
+        const float sx = a0 * (float)i + bx, sy = a3 * (float)i + by;
+        const int x0 = (int)sx, y0 = (int)sy;
+        const float u = sx - (float)x0, v = sy - (float)y0;
+        const float omu = 1.f - u, omv = 1.f - v;
+        const float* r0 = SRC + (size_t)y0 * STEP + x0;
+        const float* r1 = r0 + STEP;
+        out[i] = FASTECC_BILINEAR(r0[0], r0[1], r1[0], r1[1], omu * omv, u * omv, omu * v, u * v);
+    }
+}
+
+// One row of a projective warp: (a0*x + bx, a3*x + by) / (a6*x + bd), x =
+// 0..ws-1, zero where the denominator vanishes or any tap is outside the
+// source.  Same two passes; the first clamps the tap index into the source
+// so the gathers stay in bounds and records which lanes were inside, the
+// second zeroes the rest.  The scalar tail tests first.
+static inline void projectiveRow(const float* SRC, size_t STEP, int SW, int SH,
+                                 float a0, float a3, float a6, float bx, float by, float bd,
+                                 float* out, int ws)
+{
+    int x = 0;
+#if FASTECC_SIMD_SAMPLER
+    {
+        enum { CH = 64 };
+        const int L = VTraits<v_float32>::vlanes();
+        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];
+        int   CV_DECL_ALIGNED(64) idx[CH], ok[CH];
+        float CV_DECL_ALIGNED(64) fu[CH], fv[CH];
+        for (int k = 0; k < L; ++k) lane[k] = (float)k;
+        const v_float32 vL = v_setall_f32((float)L), vone = v_setall_f32(1.f), vzf = v_setzero_f32();
+        const v_float32 va0 = v_setall_f32(a0), va3 = v_setall_f32(a3), va6 = v_setall_f32(a6);
+        const v_float32 vbx = v_setall_f32(bx), vby = v_setall_f32(by), vbd = v_setall_f32(bd);
+        const v_int32 vstep = v_setall_s32((int)STEP), vzi = v_setzero_s32();
+        const v_int32 vxmax = v_setall_s32(SW - 2), vymax = v_setall_s32(SH - 2);
+        const int nv = ws - ws % L;
+        while (x < nv) {
+            const int m = std::min((int)CH, nv - x);
+            v_float32 vx = v_add(v_load_aligned(lane), v_setall_f32((float)x));
+            for (int k = 0; k < m; k += L) {
+                const v_float32 d = v_add(v_mul(va6, vx), vbd);
+                const v_float32 nz = v_ne(d, vzf);
+                const v_float32 dd = v_select(nz, d, vone);
+                const v_float32 sx = v_div(v_add(v_mul(va0, vx), vbx), dd);
+                const v_float32 sy = v_div(v_add(v_mul(va3, vx), vby), dd);
+                const v_int32 ix = v_floor(sx), iy = v_floor(sy);
+                const v_int32 in = v_and(v_and(v_ge(ix, vzi), v_ge(iy, vzi)),
+                                         v_and(v_le(ix, vxmax), v_le(iy, vymax)));
+                const v_int32 cx = v_min(v_max(ix, vzi), vxmax), cy = v_min(v_max(iy, vzi), vymax);
+                v_store_aligned(idx + k, v_add(v_mul(cy, vstep), cx));
+                v_store_aligned(ok + k, v_and(in, v_reinterpret_as_s32(nz)));
+                v_store_aligned(fu + k, v_sub(sx, v_cvt_f32(ix)));
+                v_store_aligned(fv + k, v_sub(sy, v_cvt_f32(iy)));
+                vx = v_add(vx, vL);
+            }
+            for (int k = 0; k < m; k += L) {
+                const v_float32 u = v_load_aligned(fu + k), v = v_load_aligned(fv + k);
+                const v_float32 omu = v_sub(vone, u), omv = v_sub(vone, v);
+                const v_float32 w00 = v_mul(omu, omv), w01 = v_mul(u, omv);
+                const v_float32 w10 = v_mul(omu, v),   w11 = v_mul(u, v);
+                const v_float32 t00 = v_lut(SRC, idx + k),        t01 = v_lut(SRC + 1, idx + k);
+                const v_float32 t10 = v_lut(SRC + STEP, idx + k), t11 = v_lut(SRC + STEP + 1, idx + k);
+                const v_float32 res = v_add(v_add(v_mul(t00, w00), v_mul(t01, w01)),
+                                            v_add(v_mul(t10, w10), v_mul(t11, w11)));
+                v_store(out + x + k, v_select(v_reinterpret_as_f32(v_load_aligned(ok + k)), res, vzf));
+            }
+            x += m;
+        }
+    }
+#endif
+    for (; x < ws; ++x) {
+        const float d = a6 * (float)x + bd;
+        if (d == 0.f) { out[x] = 0.f; continue; }
+        const float sx = (a0 * (float)x + bx) / d, sy = (a3 * (float)x + by) / d;
+        const int x0 = (int)std::floor(sx), y0 = (int)std::floor(sy);
+        if (x0 < 0 || y0 < 0 || x0 + 1 >= SW || y0 + 1 >= SH) { out[x] = 0.f; continue; }
+        const float u = sx - (float)x0, v = sy - (float)y0;
+        const float omu = 1.f - u, omv = 1.f - v;
+        const float* r0 = SRC + (size_t)y0 * STEP + x0;
+        const float* r1 = r0 + STEP;
+        out[x] = FASTECC_BILINEAR(r0[0], r0[1], r1[0], r1[1], omu * omv, u * omv, omu * v, u * v);
+    }
+}
+
 // One row of the warped image, sampled straight from the blurred input with
 // exact bilinear weights (OpenCV's warp rounds the coordinate to 1/32 px).
 // Zero where any of the four taps is outside the source, like
@@ -267,35 +424,13 @@ static void sampleRow(const Mat& src, const WarpCoef& c, int y, int hs, float* o
         while (xhi > xlo && (c.a0 * xlo + bx < 0.0 || c.a3 * xlo + by < 0.0)) ++xlo;
         for (int x = 0; x < xlo; ++x) out[x] = 0.f;
         for (int x = xhi; x < ws; ++x) out[x] = 0.f;
-        const float a0f = (float)c.a0, a3f = (float)c.a3;
-        const float bxf = (float)(bx + c.a0 * xlo), byf = (float)(by + c.a3 * xlo);
-        for (int x = xlo; x < xhi; ++x) {
-            // the coordinate is formed from the row start in float: 24 bits
-            // over a few hundred pixels is 1e-5 px, below anything measured
-            const float sx = a0f * (float)(x - xlo) + bxf, sy = a3f * (float)(x - xlo) + byf;
-            const int x0 = (int)sx, y0 = (int)sy;          // both >= 0 here
-            const float u = sx - (float)x0, v = sy - (float)y0;
-            const float* r0 = SRC + (size_t)y0 * STEP + x0;
-            const float* r1 = r0 + STEP;
-            const float top = r0[0] + u * (r0[1] - r0[0]);
-            const float bot = r1[0] + u * (r1[1] - r1[0]);
-            out[x] = top + v * (bot - top);
-        }
+        // the coordinate is formed from the row start in float: 24 bits
+        // over a few hundred pixels is 1e-5 px, below anything measured
+        bilinearSpan(SRC, STEP, (float)c.a0, (float)c.a3,
+                     (float)(bx + c.a0 * xlo), (float)(by + c.a3 * xlo), out + xlo, xhi - xlo);
     } else {
-        for (int x = 0; x < ws; ++x) {
-            const double d = c.a6 * x + bd;
-            if (d == 0.0) { out[x] = 0.f; continue; }
-            const double inv = 1.0 / d;
-            const double sx = (c.a0 * x + bx) * inv, sy = (c.a3 * x + by) * inv;
-            const int x0 = (int)std::floor(sx), y0 = (int)std::floor(sy);
-            if (x0 < 0 || y0 < 0 || x0 + 1 >= SW || y0 + 1 >= SH) { out[x] = 0.f; continue; }
-            const float u = (float)(sx - x0), v = (float)(sy - y0);
-            const float* r0 = SRC + (size_t)y0 * STEP + x0;
-            const float* r1 = r0 + STEP;
-            const float top = r0[0] + u * (r0[1] - r0[0]);
-            const float bot = r1[0] + u * (r1[1] - r1[0]);
-            out[x] = top + v * (bot - top);
-        }
+        projectiveRow(SRC, STEP, SW, SH, (float)c.a0, (float)c.a3, (float)c.a6,
+                      (float)bx, (float)by, (float)bd, out, ws);
     }
 }
 

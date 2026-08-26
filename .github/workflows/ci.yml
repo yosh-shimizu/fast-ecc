@@ -8,11 +8,20 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 24.04 ships OpenCV 4.6 (the sampler's scalar loops), 26.04 ships 4.10
+        # (its universal-intrinsics path); both must build and pass
+        image: [ "ubuntu:24.04", "ubuntu:26.04" ]
+    container: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install OpenCV
-        run: sudo apt-get update && sudo apt-get install -y libopencv-dev
+      - name: Install toolchain and OpenCV
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake python3 libopencv-dev
 
       - name: Kernels match their generator
         run: python3 tools/gen_gn_kernels.py --check
