@@ -54,7 +54,7 @@ the numbers below are taken against a corrected OpenCV baseline.
 | Coarse-to-fine pyramid (`nlevels`), like `findTransformECCMultiScale` | landed, default 3 levels |
 | One parallel pass per iteration, exact bilinear sampling (no 1/32 px rounding) | landed |
 | The whole stripe vectorised — sampler, derivatives, moments, Gauss–Newton kernels (OpenCV universal intrinsics; scalar loops below OpenCV 4.7) | landed |
-| AVX2 + FMA build (`-DFAST_ECC_AVX2=ON`): eight lanes, gathers, fused multiply-adds | landed, off by default |
+| AVX2 + FMA instance — eight lanes, gathers, fused multiply-adds — picked at run time on CPUs that have it | landed, default on x86 |
 
 ### What was wrong, and how it is guarded now
 
@@ -112,7 +112,8 @@ rounding induced — affine biasX t = −12, euclidean −4.4 — is gone (t = �
 ### Speed
 
 Cost of one iteration, affine, analytic scene, fixed 20 iterations, best of 3 runs,
-default flags, single scale, against a border-fixed OpenCV:
+default flags, single scale, against a border-fixed OpenCV. First the 128-bit instance
+(what a CPU without AVX2 runs, or `FASTECC_NO_AVX2=1`):
 
 | window | 4 threads | 2 threads | 1 thread |
 |---:|---:|---:|---:|
@@ -122,8 +123,7 @@ default flags, single scale, against a border-fixed OpenCV:
 
 (Homography at 512: 7.2× on one thread, 14.1× on four.)
 
-With the AVX2 build (`-DFAST_ECC_AVX2=ON`: eight lanes and fused multiply-adds; the
-binary then needs an AVX2 CPU):
+On a CPU with AVX2, where the default build picks its eight-lane instance at run time:
 
 | window | 4 threads | 2 threads | 1 thread |
 |---:|---:|---:|---:|
@@ -146,13 +146,16 @@ and four 1.6–2.1× over the multi-pass layout. And the **vectorised stripe** �
 the derivative and moment loops and the Gauss–Newton kernels, all in OpenCV's universal
 intrinsics — takes 2.4–2.8× off the single-thread iteration and, being the whole stripe
 rather than one stage competing with the thread pool, 1.9× off the four-thread one. The
-AVX2 build (below) takes another 1.3–1.6× off the single-thread iteration and 1.1–1.9×
-off the four-thread one.
+AVX2 instance, which the default build picks at run time on CPUs that have it (below),
+takes another 1.3–1.6× off the single-thread iteration and 1.1–1.9× off the four-thread
+one.
 
 The bundled `./build/bench` (512×512, best of 20 calls, the start 3 px and a few
 percent off) shows the per-motion spread against both OpenCV implementations —
 `findTransformECC` (ecc.cpp) and `findTransformECCMultiScale` (eccms.cpp, OpenCV ≥ 4.12,
-with its default 4-level pyramid and single-scale):
+with its default 4-level pyramid and single-scale). The first three tables are the 128-bit
+instance (`FASTECC_NO_AVX2=1`), the fourth the AVX2 instance the default build picks on this
+CPU:
 
 | one thread | cv | eccms, 4 levels | fast, 1 level | fast, 3 levels (default) | fast 3 vs cv | fast 3 vs eccms | fast 1 vs eccms |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -179,10 +182,10 @@ with its default 4-level pyramid and single-scale):
 <fastLevels>` to reproduce. Corner errors in this bench: eccms 0.006–0.022 px, fast-ecc
 0.0002–0.005.)
 
-With `-DFAST_ECC_AVX2=ON`, fast-ecc's 3 levels against the same two (ms per call, then the
-ratio to `findTransformECC` and to eccms with its 4 levels):
+On the AVX2 instance, fast-ecc's 3 levels against the same two (ms per call, then the ratio
+to `findTransformECC` and to eccms with its 4 levels):
 
-| AVX2 build | one thread | two threads | four threads |
+| AVX2 instance | one thread | two threads | four threads |
 |---|---:|---:|---:|
 | TRANSLATION | 8.2 ms — 5.5×, 1.33× | 8.0 ms — 5.0×, 1.26× | 7.0 ms — 5.1×, 1.15× |
 | EUCLIDEAN | 10.0 ms — 6.5×, 1.33× | 8.7 ms — 6.7×, 1.21× | 7.4 ms — 7.7×, 1.06× |
@@ -204,7 +207,7 @@ implementation.
 - **Single-scale, fast-ecc is well ahead.** With `nlevels = 1` on both, fast-ecc is
   2.1–3.5× faster than eccms on one thread, 1.7–2.7× on two and 1.6–2.9× on four
   (bench, 512²; eccms itself is 1.9–2.9× faster than ecc.cpp single-scale on one thread);
-  with the AVX2 build 2.3–5.9× on one thread and 2.4–5.0× on four.
+  with the AVX2 instance 2.3–5.9× on one thread and 2.4–5.0× on four.
 - **The pyramid is what made eccms faster** in this bench, whose start is 3 px and a few
   percent off so that the coarse levels take most of the iterations at 1/16 to 1/64 of
   the pixels: 2–3× against the scalar single-scale fast-ecc, and still 0.8–1.1× against
@@ -212,12 +215,12 @@ implementation.
   vectorised stripe fast-ecc is ahead of eccms on affine and homography — 1.50× and
   1.87× on one thread, 1.41× and 1.56× on four — and level on translation and euclidean
   (0.92–1.14×; these 6–9 ms calls of three levels vary by ±15 % between runs on four
-  threads), with an exact sampler where eccms's is fixed-point. The AVX2 build is ahead
+  threads), with an exact sampler where eccms's is fixed-point. The AVX2 instance is ahead
   in every row: 1.33–2.65× on one thread, 1.21–2.21× on two, 1.06–1.90× on four.
 - **On the real image the gap is wider.** At window 384 with the start 1–6 px off,
   fast-ecc with its default 3 levels takes 6.3–7.1 ms on one thread, 5.3–5.7 on two and
   4.3–4.6 on four, against 16.5–17.2 / 11.5–12.5 / 9.3–9.8 ms for eccms with four levels —
-  2.0–2.7× faster (the AVX2 build 6.1–6.6 / 5.2–5.6 / 4.5–4.9 ms, 2.1–2.9×) — and its basin
+  2.0–2.7× faster (the AVX2 instance 6.1–6.6 / 5.2–5.6 / 4.5–4.9 ms, 2.1–2.9×) — and its basin
   matches eccms's (99–100 % at ×4 the default deformation).
 - **Accuracy on the real image:** eccms 0.0078 px, ecc.cpp 0.0072 px, fast-ecc 0.0025 px
   (affine, window 200, started at the truth); the pyramid does not change the floor.
@@ -437,20 +440,25 @@ the scalar loops, and CI runs the equivalence test on both.
 - **Four stripes per thread, on one thread too**: a stripe's planes then stay in L2
   between the sampler, the derivative loop and the kernel, and the kernel pass shrinks
   by up to a third.
-- **Eight lanes, on request.** Outside OpenCV's own build its headers enable SSE2 alone,
-  whatever the compiler was given, so the default build's vectors are four floats wide
-  with separate multiplies and adds — and the kernel's inner loop is then issue-bound:
-  181 instructions per four pixels, 76 of them floating-point, 56 of them spills of the
-  lane accumulators over 16 registers. `-DFAST_ECC_AVX2=ON` compiles with `/arch:AVX2`
-  (or `-mavx2 -mfma`) and defines the feature macros OpenCV's own dispatch would
-  (`CV_AVX2`, `CV_FMA3`, …) ahead of its headers, so the same source — written
-  width-agnostically, `vx_load` and `vlanes()` — runs at eight lanes with fused
-  multiply-adds and hardware gathers. The binary then needs an AVX2 CPU (2013 on).
+- **Eight lanes, at run time.** Outside OpenCV's own build its headers enable SSE2 alone,
+  whatever the compiler was given, so the vectors are four floats wide with separate
+  multiplies and adds — and the kernel's inner loop is then issue-bound: 181 instructions
+  per four pixels, 76 of them floating-point, 56 of them spills of the lane accumulators
+  over 16 registers. So the library carries two instances, the way OpenCV itself does:
+  `src/fast_ecc_avx2.cpp` is the same source compiled again with `/arch:AVX2` (or
+  `-mavx2 -mfma`) and with the feature macros OpenCV's own dispatch would set (`CV_AVX2`,
+  `CV_FMA3`, …) defined ahead of its headers, so that the same width-agnostic code —
+  `vx_load`, `vlanes()` — runs at eight lanes with fused multiply-adds and hardware
+  gathers; `findTransformECC` picks it once per process when `cv::checkHardwareSupport`
+  reports AVX2 and FMA. `fastecc::vectorPath()` says which instance runs,
+  `FASTECC_NO_AVX2=1` in the environment forces the 128-bit one, `-DFAST_ECC_DISPATCH=OFF`
+  leaves the second instance out, and `-DFAST_ECC_AVX2=ON` builds it alone (the binary
+  then needs an AVX2 CPU).
 
 The vector lanes and the scalar tails share their arithmetic, so a row does not depend
 on where the vector part ends, and the fixed points are unchanged to four digits. The
 single-pass stage profile (`eval/spbench.cpp`, one thread, window 512, ms per iteration,
-scalar → default build → AVX2 build, same run):
+scalar → 128-bit instance → AVX2 instance, same run):
 
 | motion | sampler | derivatives + moments | Gauss–Newton | iteration |
 |---|---:|---:|---:|---:|
@@ -516,14 +524,17 @@ ctest --test-dir build --output-on-failure   # accuracy vs ground truth
 Requires OpenCV `core`, `imgproc` and `video` (plus `imgcodecs` for the example) — any
 4.x.  On Debian/Ubuntu: `sudo apt-get install libopencv-dev`.
 
-Add `-DFAST_ECC_AVX2=ON` to the configure line for the AVX2 + FMA build: eight-lane
-vectors, about 1.5× faster per iteration, and the binary then needs an AVX2 CPU. If you
-compile `src/fast_ecc.cpp` yourself, that is `-DFASTECC_AVX2=1` together with `/arch:AVX2`
-or `-mavx2 -mfma`. Below OpenCV 4.7 the vector paths fall back to scalar loops either way.
+On x86 the default build also compiles `src/fast_ecc_avx2.cpp` — the same source with
+`/arch:AVX2` (`-mavx2 -mfma`) — and picks that instance at run time on CPUs with AVX2 and
+FMA, about 1.5× faster per iteration; `-DFAST_ECC_DISPATCH=OFF` leaves it out, and
+`-DFAST_ECC_AVX2=ON` builds it alone (the binary then needs an AVX2 CPU). If you compile the
+sources yourself, `fast_ecc_avx2.cpp` is optional and needs those flags plus
+`-DFASTECC_HAVE_AVX2_TU=1` on `fast_ecc.cpp`; `fastecc::vectorPath()` reports which instance
+runs. Below OpenCV 4.7 the vector paths fall back to scalar loops either way.
 
 ### Use it in your project
 
-The library is a single `.cpp` + header. Either add this repo via CMake
+The library is a single `.cpp` + header (plus the optional AVX2 instance). Either add this repo via CMake
 `add_subdirectory(fast-ecc)` and link `fast_ecc`, or drop `include/fast_ecc.hpp` and
 `src/fast_ecc.cpp` into your build.
 
