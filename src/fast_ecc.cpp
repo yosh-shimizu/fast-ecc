@@ -52,14 +52,21 @@
 // Not bit-identical to cv::findTransformECC (resampling and differentiation do
 // not commute), but equally accurate against ground truth — see README.md.
 
-// Opt-in AVX2.  FASTECC_AVX2 (set by the FAST_ECC_AVX2 CMake option, which
-// also passes /arch:AVX2 or -mavx2 -mfma) tells OpenCV's headers that the
-// 256-bit universal intrinsics may be used in this translation unit.  Outside
-// OpenCV's own build the headers enable SSE2 alone, whatever the compiler was
-// given; these are the feature macros its own dispatch would set.  The vector
-// code below is written width-agnostically (vx_load, vlanes()), so nothing
-// else changes: eight lanes and fused multiply-adds instead of four lanes and
-// separate ones.  The library then needs an AVX2 CPU (2013 on).
+// AVX2 + FMA.  FASTECC_AVX2 makes this translation unit the eight-lane
+// instance: it needs AVX2 code generation (/arch:AVX2 or -mavx2 -mfma) and
+// tells OpenCV's headers that the 256-bit universal intrinsics may be used.
+// Outside OpenCV's own build the headers enable SSE2 alone, whatever the
+// compiler was given; these are the feature macros its own dispatch would
+// set.  The vector code below is written width-agnostically (vx_load,
+// vlanes()), so nothing else changes: eight lanes and fused multiply-adds
+// instead of four lanes and separate ones.
+//
+// Two ways to get it.  FAST_ECC_AVX2=ON compiles the whole library this way,
+// and it then needs an AVX2 CPU (2013 on).  The default build instead
+// compiles src/fast_ecc_avx2.cpp -- this file again, with FASTECC_AVX2_TU --
+// as a second instance next to the 128-bit one, and findTransformECC() at
+// the end of this file picks it at run time when the CPU has AVX2 and FMA
+// (FASTECC_HAVE_AVX2_TU tells the first instance that the second exists).
 #if defined(FASTECC_AVX2) && FASTECC_AVX2
 #  if !defined(__AVX2__)
 #    error "FASTECC_AVX2 needs AVX2 code generation: /arch:AVX2 (MSVC) or -mavx2 -mfma"
@@ -1005,15 +1012,15 @@ void scaleWarp(Mat& map, double s)
 
 }  // namespace
 
-double findTransformECC(InputArray templateImage,
-                        InputArray inputImage,
-                        InputOutputArray warpMatrix,
-                        int motionType,
-                        TermCriteria criteria,
-                        InputArray inputMask,
-                        int gaussFiltSize,
-                        int flags,
-                        int nlevels)
+static double findTransformECCImpl(InputArray templateImage,
+                                   InputArray inputImage,
+                                   InputOutputArray warpMatrix,
+                                   int motionType,
+                                   TermCriteria criteria,
+                                   InputArray inputMask,
+                                   int gaussFiltSize,
+                                   int flags,
+                                   int nlevels)
 {
     Mat src = templateImage.getMat();//template image
     Mat dst = inputImage.getMat();  //input image (to be warped)
@@ -1112,5 +1119,68 @@ double findTransformECC(InputArray templateImage,
     mapL.copyTo(map);
     return rho;
 }
+
+#if FASTECC_AVX2_TU
+// The eight-lane instance exports its entry point under another name; the
+// first instance below reaches it through the dispatch.
+namespace detail {
+double findTransformECC_avx2(InputArray templateImage, InputArray inputImage,
+                             InputOutputArray warpMatrix, int motionType,
+                             TermCriteria criteria, InputArray inputMask,
+                             int gaussFiltSize, int flags, int nlevels)
+{
+    return findTransformECCImpl(templateImage, inputImage, warpMatrix, motionType, criteria,
+                                inputMask, gaussFiltSize, flags, nlevels);
+}
+}  // namespace detail
+#else
+
+#if FASTECC_HAVE_AVX2_TU
+namespace detail {
+double findTransformECC_avx2(InputArray, InputArray, InputOutputArray, int, TermCriteria,
+                             InputArray, int, int, int);
+}
+// Decided once per process: the CPU must have AVX2 and FMA3, and
+// FASTECC_NO_AVX2 in the environment keeps the run on this instance, so the
+// two can be compared in one binary.
+static bool useAvx2()
+{
+    static const bool ok = checkHardwareSupport(CV_CPU_AVX2) && checkHardwareSupport(CV_CPU_FMA3)
+                           && std::getenv("FASTECC_NO_AVX2") == nullptr;
+    return ok;
+}
+#endif
+
+const char* vectorPath()
+{
+#if FASTECC_AVX2
+    return "avx2";
+#else
+#if FASTECC_HAVE_AVX2_TU
+    if (useAvx2()) return "avx2";
+#endif
+    return FASTECC_SIMD ? "simd128" : "scalar";
+#endif
+}
+
+double findTransformECC(InputArray templateImage,
+                        InputArray inputImage,
+                        InputOutputArray warpMatrix,
+                        int motionType,
+                        TermCriteria criteria,
+                        InputArray inputMask,
+                        int gaussFiltSize,
+                        int flags,
+                        int nlevels)
+{
+#if FASTECC_HAVE_AVX2_TU
+    if (useAvx2())
+        return detail::findTransformECC_avx2(templateImage, inputImage, warpMatrix, motionType,
+                                             criteria, inputMask, gaussFiltSize, flags, nlevels);
+#endif
+    return findTransformECCImpl(templateImage, inputImage, warpMatrix, motionType, criteria,
+                                inputMask, gaussFiltSize, flags, nlevels);
+}
+#endif  // FASTECC_AVX2_TU
 
 } // namespace fastecc

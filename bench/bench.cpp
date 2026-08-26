@@ -104,8 +104,8 @@ int main(int argc, char** argv) {
         return std::sqrt(se / 4.0);
     };
 
-    std::printf("image %dx%d, %d repeats, %d thread(s), eccms nlevels %d, fastN nlevels %d%s\n",
-                n, n, repeats, cv::getNumThreads(), eccmsLevels, fastLevels,
+    std::printf("image %dx%d, %d repeats, %d thread(s), eccms nlevels %d, fastN nlevels %d, fast-ecc on %s%s\n",
+                n, n, repeats, cv::getNumThreads(), eccmsLevels, fastLevels, fastecc::vectorPath(),
                 BENCH_HAS_ECCMS ? "" : "  (this OpenCV has no findTransformECCMultiScale)");
     std::printf("%-12s %8s %9s %8s %9s %8s %8s %8s %9s %9s %9s %9s\n",
                 "motion", "cv(ms)", "eccms(ms)", "fast(ms)", "fastN(ms)",
