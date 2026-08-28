@@ -130,21 +130,27 @@ Mat groundTruth(int motion, double shiftX, double shiftY) {
 
 }  // namespace
 
-struct FlagSet { int flags; int levels; const char* name; };
+// `inputMask`: the call gets an all-valid mask on the input, which takes the
+// general path (OpenCV's warp of the image and of the mask) instead of the
+// fused sampler -- the same answer is expected from both, to the tolerance.
+struct FlagSet { int flags; int levels; bool inputMask; const char* name; };
 
 int main() {
     const Mat source = syntheticImage(kSize + 2 * kMargin);
     const Mat templ  = source(Rect(kMargin, kMargin, kSize, kSize)).clone();
     const TermCriteria crit(TermCriteria::COUNT + TermCriteria::EPS, 100, 1e-6);
+    const Mat fullMask(source.size(), CV_8U, Scalar(255));
 
     const FlagSet flagSets[] = {
-        {fastecc::FASTECC_DEFAULT_FLAGS, 3, "default (laplacian column + 5-tap, 3 levels)"},
-        {fastecc::FASTECC_DEFAULT_FLAGS, 1, "default flags, single scale"},
-        {0,                              1, "plain, single scale"},
-        {fastecc::FASTECC_LAPLACIAN_COLUMN, 1, "laplacian column"},
-        {fastecc::FASTECC_GRAD5,         1, "5-tap"},
-        {fastecc::FASTECC_DEFAULT_FLAGS | fastecc::FASTECC_LEGACY_PIPELINE, 1, "default flags, multi-pass pipeline"},
+        {fastecc::FASTECC_DEFAULT_FLAGS, 3, false, "default (laplacian column + 5-tap, 3 levels)"},
+        {fastecc::FASTECC_DEFAULT_FLAGS, 1, false, "default flags, single scale"},
+        {0,                              1, false, "plain, single scale"},
+        {fastecc::FASTECC_LAPLACIAN_COLUMN, 1, false, "laplacian column"},
+        {fastecc::FASTECC_GRAD5,         1, false, "5-tap"},
+        {fastecc::FASTECC_DEFAULT_FLAGS | fastecc::FASTECC_LEGACY_PIPELINE, 1, false, "default flags, multi-pass pipeline"},
+        {fastecc::FASTECC_DEFAULT_FLAGS, 3, true,  "default flags, 3 levels, input mask (general path)"},
     };
+    const int kNFlagSets = (int)(sizeof(flagSets) / sizeof(flagSets[0]));
 
     const MotionCase cases[] = {
         // ~3x what the margin test measures (0.016 / 0.002 / 0.0036 / 0.005 px
@@ -159,9 +165,10 @@ int main() {
     const int kNGauss = 3;
 
     int failures = 0;
-    for (int fi = 0; fi < 6; ++fi) {
+    for (int fi = 0; fi < kNFlagSets; ++fi) {
     const int flags = flagSets[fi].flags;
     const int levels = flagSets[fi].levels;
+    const bool useMask = flagSets[fi].inputMask;
     std::printf("\n== flags = %d, nlevels = %d: %s ==\n", flags, levels, flagSets[fi].name);
     std::printf("%-12s %6s %11s %11s %9s %8s   %s\n",
                 "motion", "gauss", "errCv px", "errFast px", "rho", "tol px", "verdict");
@@ -207,7 +214,8 @@ int main() {
                 try {
                     cv::findTransformECC(templ, input, Wcv, c.motion, crit, noArray(), gauss);
                     rho = fastecc::findTransformECC(templ, input, Wfast, c.motion, crit,
-                                                    noArray(), gauss, flags, levels);
+                                                    useMask ? InputArray(fullMask) : noArray(),
+                                                    gauss, flags, levels);
                 } catch (const cv::Exception& e) {
                     std::printf("%-12s %6d   EXCEPTION: %s\n", c.name, gauss, e.what());
                     ++failures;
