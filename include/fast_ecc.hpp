@@ -81,4 +81,11 @@ double findTransformECC(
 // environment keeps a run on the 128-bit instance, for comparison.
 const char* vectorPath();
 
+// The scratch of a call (the pyramid, the per-level planes, the stripe
+// buffers) is kept per thread between calls and re-used whenever the sizes
+// repeat -- touching fresh pages costs more than filling them, and from
+// inside a parallel region it serialises the workers.  It grows to the
+// largest call seen on the thread; this frees it.
+void releaseWorkspace();
+
 } // namespace fastecc

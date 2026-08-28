@@ -510,6 +510,137 @@ struct StripePool {
     }
 };
 
+// Scratch kept between calls, per thread.  A fresh plane costs more to touch
+// for the first time than to fill (a 384^2 float plane: 0.18 ms of page
+// faults against 0.015 ms of writes, and 0.9 ms against 0.1 ms at 1024^2),
+// and the first touch from inside a parallel region serialises the workers
+// -- which is what kept the set-up of a level from scaling with the threads.
+// So the pyramid, the per-level planes and the stripe pool live here and
+// are re-used whenever the sizes repeat (Mat::create is a no-op then); the
+// workspace grows to the largest call seen on the thread and is freed by
+// releaseWorkspace().
+struct LevelScratch {
+    Mat templ, image, warped, mask;        // the blurred pair, the warped image and its mask
+    Mat gx, gy, lp;                        // the warped image's derivative planes (multi-pass path)
+    Mat preMask, tmp;
+    StripePool pool;
+};
+struct Workspace {
+    std::vector<Mat> srcPyr, dstPyr, maskPyr;
+    std::vector<LevelScratch> level;
+    LevelScratch& at(int l) { if ((int)level.size() <= l) level.resize(l + 1); return level[l]; }
+};
+static Workspace& workspace() { static thread_local Workspace w; return w; }
+
+// GaussianBlur(src, dst, Size(k, k), 0, 0) -- the same kernel (getGaussianKernel
+// with the sigma derived from k) and the same BORDER_REFLECT_101 -- as one
+// parallel pass over row stripes, columns first, into a kept plane: OpenCV's
+// does not scale with the threads at these sizes, and blurring in place
+// allocates.  `src` is CV_8U or CV_32F (a CV_8U source goes through `tmp`).
+static inline int reflect101(int i, int n) { return i < 0 ? -i : (i >= n ? 2 * n - 2 - i : i); }
+// R is the radius as a compile-time constant where it is small (the tap
+// loops unroll and the coefficients stay in registers), 0 for the generic
+// loop with the runtime radius `r`.
+template <int R>
+static void blurStripesR(const Mat& S, Mat& dst, const float* kf, int r)
+{
+    const int h = S.rows, w = S.cols;
+    const int T = std::max(1, getNumThreads());
+    const int nstripes = std::max(1, std::min(T * 4, h / 16));
+    const int rowsPer = (h + nstripes - 1) / nstripes;
+    parallel_for_(Range(0, nstripes), [&](const Range& rg) {
+        std::vector<float> tbuf(w);
+        std::vector<const float*> rows(2 * r + 1);
+        float* t = tbuf.data();
+#if FASTECC_SIMD
+        const int VL = VTraits<v_float32>::vlanes();
+        // kv[j] = the coefficient of the taps at distance j, as a vector.  A
+        // local array, not a std::vector: the vector type needs its own
+        // alignment (32 bytes for the AVX2 instance), which operator new does
+        // not promise and GCC's aligned loads do not forgive.  The generic
+        // radius broadcasts in the loop instead.
+        v_float32 kv[R > 0 ? R + 1 : 1];
+        for (int j = 0; j <= (R > 0 ? R : 0); ++j) kv[j] = vx_setall_f32(kf[r - j]);
+#endif
+        for (int si = rg.start; si < rg.end; ++si) {
+            const int y0 = si * rowsPer, y1 = std::min(h, y0 + rowsPer);
+            for (int y = y0; y < y1; ++y) {
+                // columns: rows y-r .. y+r (reflected) into t
+                for (int j = -r; j <= r; ++j) rows[j + r] = S.ptr<float>(reflect101(y + j, h));
+                const float* const* rm = rows.data() + r;   // rm[-j], rm[j]
+                int x = 0;
+#if FASTECC_SIMD
+                for (; x + VL <= w; x += VL) {
+                    v_float32 acc = v_mul(kv[0], vx_load(rm[0] + x));
+                    if (R > 0) {
+                        for (int j = 1; j <= R; ++j)
+                            acc = v_fma(kv[j], v_add(vx_load(rm[-j] + x), vx_load(rm[j] + x)), acc);
+                    } else {
+                        for (int j = 1; j <= r; ++j)
+                            acc = v_fma(vx_setall_f32(kf[r - j]), v_add(vx_load(rm[-j] + x), vx_load(rm[j] + x)), acc);
+                    }
+                    v_store(t + x, acc);
+                }
+#endif
+                for (; x < w; ++x) {
+                    float acc = kf[r] * rm[0][x];
+                    for (int j = 1; j <= r; ++j) acc += kf[r - j] * (rm[-j][x] + rm[j][x]);
+                    t[x] = acc;
+                }
+                // rows: t into dst row y, the r columns at each edge by reflection
+                float* d = dst.ptr<float>(y);
+                for (int xx = 0; xx < r; ++xx) {
+                    float a = kf[r] * t[xx], b = kf[r] * t[w - 1 - xx];
+                    for (int j = 1; j <= r; ++j) {
+                        a += kf[r - j] * (t[reflect101(xx - j, w)] + t[reflect101(xx + j, w)]);
+                        b += kf[r - j] * (t[reflect101(w - 1 - xx - j, w)] + t[reflect101(w - 1 - xx + j, w)]);
+                    }
+                    d[xx] = a; d[w - 1 - xx] = b;
+                }
+                x = r;
+#if FASTECC_SIMD
+                for (; x + VL <= w - r; x += VL) {
+                    v_float32 acc = v_mul(kv[0], vx_load(t + x));
+                    if (R > 0) {
+                        for (int j = 1; j <= R; ++j)
+                            acc = v_fma(kv[j], v_add(vx_load(t + x - j), vx_load(t + x + j)), acc);
+                    } else {
+                        for (int j = 1; j <= r; ++j)
+                            acc = v_fma(vx_setall_f32(kf[r - j]), v_add(vx_load(t + x - j), vx_load(t + x + j)), acc);
+                    }
+                    v_store(d + x, acc);
+                }
+#endif
+                for (; x < w - r; ++x) {
+                    float acc = kf[r] * t[x];
+                    for (int j = 1; j <= r; ++j) acc += kf[r - j] * (t[x - j] + t[x + j]);
+                    d[x] = acc;
+                }
+            }
+        }
+    }, (double)nstripes);
+}
+static void blurStripes(const Mat& src, Mat& dst, int ksize, Mat& tmp)
+{
+    const int r = ksize / 2, h = src.rows, w = src.cols;
+    dst.create(h, w, CV_32F);
+    const Mat* s = &src;
+    if (src.type() != CV_32F) { src.convertTo(tmp, CV_32F); s = &tmp; }
+    if (h <= r || w <= r) {   // smaller than one reflection: leave the border cases to OpenCV
+        GaussianBlur(*s, dst, Size(ksize, ksize), 0, 0);
+        return;
+    }
+    const Mat kernel = getGaussianKernel(ksize, 0, CV_32F);
+    const float* kf = kernel.ptr<float>(0);   // symmetric, kf[r] the centre
+    switch (r) {
+    case 1:  blurStripesR<1>(*s, dst, kf, r); break;
+    case 2:  blurStripesR<2>(*s, dst, kf, r); break;
+    case 3:  blurStripesR<3>(*s, dst, kf, r); break;
+    case 4:  blurStripesR<4>(*s, dst, kf, r); break;
+    default: blurStripesR<0>(*s, dst, kf, r); break;
+    }
+}
+
 // Masked moments of one stripe, centred on the previous iteration's means.
 struct StripeStats {
     double n = 0, sd = 0, sdd = 0, se = 0, see = 0, sde = 0;
@@ -589,7 +720,7 @@ namespace {
 // pyramid wrapper below calls it once per level, coarsest first.
 double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
                       int numberOfIterations, double termination_eps,
-                      const Mat& inputMaskMat, int gaussFiltSize, int flags)
+                      const Mat& inputMaskMat, int gaussFiltSize, int flags, LevelScratch& S)
 {
     const bool useLap   = (flags & FASTECC_LAPLACIAN_COLUMN) != 0;
     const bool useGrad5 = (flags & FASTECC_GRAD5) != 0;
@@ -615,21 +746,21 @@ double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
     const int wd = dst.cols;
     const int hd = dst.rows;
 
-    Mat templateFloat = Mat(hs, ws, CV_32F);// to store the (smoothed) template
-    Mat imageFloat    = Mat(hd, wd, CV_32F);// to store the (smoothed) input image
-    Mat imageWarped   = Mat(hs, ws, CV_32F);// to store the warped input image
-    Mat imageMask     = Mat(hs, ws, CV_8U); // to store the final mask
+    // the level's kept planes (see Workspace)
+    Mat& templateFloat = S.templ;                             // the (smoothed) template
+    Mat& imageFloat    = S.image;                             // the (smoothed) input image
+    Mat& imageWarped   = S.warped; imageWarped.create(hs, ws, CV_32F);  // the warped input image
+    Mat& imageMask     = S.mask;   imageMask.create(hs, ws, CV_8U);     // the final mask
 
     //gaussian filtering is optional (sigma=0 -> derived from gaussFiltSize, matching cv::findTransformECC)
-    src.convertTo(templateFloat, templateFloat.type());
-    GaussianBlur(templateFloat, templateFloat, Size(gaussFiltSize, gaussFiltSize), 0, 0);
+    blurStripes(src, templateFloat, gaussFiltSize, S.tmp);
 
     // The mask to warp, as upstream builds it: the user mask (or all ones)
     // blurred like the images and thresholded, with a two-pixel border.
     // Only the warp path needs it -- a user mask, or a row on which the
     // analytic mask gives up -- so it is built on first use rather than
     // costing a full-size blur on every call.
-    Mat preMask;
+    Mat& preMask = S.preMask; preMask.release();
     auto ensurePreMask = [&]() {
         if (!preMask.empty()) return;
         if(inputMaskMat.empty())
@@ -649,15 +780,14 @@ double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
         preMask.col(1).setTo(0); preMask.col(preMask.cols - 2).setTo(0);
     };
 
-    dst.convertTo(imageFloat, imageFloat.type());
-    GaussianBlur(imageFloat, imageFloat, Size(gaussFiltSize, gaussFiltSize), 0, 0);
+    blurStripes(dst, imageFloat, gaussFiltSize, S.tmp);
 
     // gradients (and, optionally, the laplacian) of the warped image; raw,
     // masked per pixel in the fused pass
-    Mat imageWarpedGradientX = Mat(hs, ws, CV_32FC1);
-    Mat imageWarpedGradientY = Mat(hs, ws, CV_32FC1);
-    Mat imageWarpedLaplacian;
-    if (useLap) imageWarpedLaplacian = Mat(hs, ws, CV_32FC1);
+    Mat& imageWarpedGradientX = S.gx; imageWarpedGradientX.create(hs, ws, CV_32FC1);
+    Mat& imageWarpedGradientY = S.gy; imageWarpedGradientY.create(hs, ws, CV_32FC1);
+    Mat& imageWarpedLaplacian = S.lp;
+    if (useLap) imageWarpedLaplacian.create(hs, ws, CV_32FC1);
 
     // first order image derivatives: 3-tap central difference, or the 4th-order
     // 5-tap.  The forward-additive step is the exact maximiser of the paper's
@@ -696,7 +826,7 @@ double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
     const bool canFuse = (flags & FASTECC_LEGACY_PIPELINE) == 0 && inputMaskMat.empty();
     double muPrevI = 0, muPrevT = 0;
     if (canFuse) { const Scalar m0 = mean(templateFloat); muPrevI = muPrevT = m0[0]; }
-    StripePool pool;
+    StripePool& pool = S.pool;
 
     // iteratively update map_matrix
     double rho      = -1;
@@ -1066,9 +1196,10 @@ static double findTransformECCImpl(InputArray templateImage,
     CV_Assert (nlevels >= 1);
 
     Mat inputMaskMat = inputMask.getMat();
+    Workspace& W = workspace();
     if (nlevels == 1)
         return runSingleScale(src, dst, map, motionType, numberOfIterations, termination_eps,
-                              inputMaskMat, gaussFiltSize, flags);
+                              inputMaskMat, gaussFiltSize, flags, W.at(0));
 
     // Coarse to fine.  The levels are pyrDown of the images (a 5-tap Gaussian
     // centred on the even pixels, so level-L coordinates are exactly the
@@ -1079,11 +1210,18 @@ static double findTransformECCImpl(InputArray templateImage,
     int levels = nlevels;
     while (levels > 1 && (std::min(src.rows, src.cols) >> (levels - 1)) < 16) --levels;
 
-    std::vector<Mat> srcPyr(levels), dstPyr(levels), maskPyr(levels);
+    // the pyramid lives in the workspace: convertTo and pyrDown re-use a
+    // plane of the right size
+    if ((int)W.srcPyr.size() < levels) { W.srcPyr.resize(levels); W.dstPyr.resize(levels); W.maskPyr.resize(levels); }
+    std::vector<Mat>& srcPyr = W.srcPyr;
+    std::vector<Mat>& dstPyr = W.dstPyr;
+    std::vector<Mat>& maskPyr = W.maskPyr;
     src.convertTo(srcPyr[0], CV_32F);
     dst.convertTo(dstPyr[0], CV_32F);
     if (!inputMaskMat.empty())
         threshold(inputMaskMat, maskPyr[0], 0, 255, THRESH_BINARY);
+    else
+        maskPyr[0].release();
     for (int l = 1; l < levels; ++l) {
         pyrDown(srcPyr[l - 1], srcPyr[l]);
         pyrDown(dstPyr[l - 1], dstPyr[l]);
@@ -1091,6 +1229,8 @@ static double findTransformECCImpl(InputArray templateImage,
             // a coarse pixel is valid only if everything under it was
             pyrDown(maskPyr[l - 1], maskPyr[l]);
             threshold(maskPyr[l], maskPyr[l], 254, 255, THRESH_BINARY);
+        } else {
+            maskPyr[l].release();
         }
     }
 
@@ -1107,13 +1247,13 @@ static double findTransformECCImpl(InputArray templateImage,
             Mat before = mapL.clone();
             try {
                 rho = runSingleScale(srcPyr[l], dstPyr[l], mapL, motionType, numberOfIterations,
-                                     termination_eps, maskPyr[l], gaussFiltSize, flags);
+                                     termination_eps, maskPyr[l], gaussFiltSize, flags, W.at(l));
             } catch (const cv::Exception&) {
                 before.copyTo(mapL);
             }
         } else {
             rho = runSingleScale(srcPyr[l], dstPyr[l], mapL, motionType, numberOfIterations,
-                                 termination_eps, maskPyr[l], gaussFiltSize, flags);
+                                 termination_eps, maskPyr[l], gaussFiltSize, flags, W.at(l));
         }
     }
     mapL.copyTo(map);
@@ -1132,6 +1272,7 @@ double findTransformECC_avx2(InputArray templateImage, InputArray inputImage,
     return findTransformECCImpl(templateImage, inputImage, warpMatrix, motionType, criteria,
                                 inputMask, gaussFiltSize, flags, nlevels);
 }
+void releaseWorkspace_avx2() { workspace() = Workspace(); }
 }  // namespace detail
 #else
 
@@ -1139,7 +1280,19 @@ double findTransformECC_avx2(InputArray templateImage, InputArray inputImage,
 namespace detail {
 double findTransformECC_avx2(InputArray, InputArray, InputOutputArray, int, TermCriteria,
                              InputArray, int, int, int);
+void releaseWorkspace_avx2();
 }
+#endif
+
+void releaseWorkspace()
+{
+    workspace() = Workspace();
+#if FASTECC_HAVE_AVX2_TU
+    detail::releaseWorkspace_avx2();
+#endif
+}
+
+#if FASTECC_HAVE_AVX2_TU
 // Decided once per process: the CPU must have AVX2 and FMA3, and
 // FASTECC_NO_AVX2 in the environment keeps the run on this instance, so the
 // two can be compared in one binary.

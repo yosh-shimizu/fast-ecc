@@ -55,6 +55,7 @@ the numbers below are taken against a corrected OpenCV baseline.
 | One parallel pass per iteration, exact bilinear sampling (no 1/32 px rounding) | landed |
 | The whole stripe vectorised — sampler, derivatives, moments, Gauss–Newton kernels (OpenCV universal intrinsics; scalar loops below OpenCV 4.7) | landed |
 | AVX2 + FMA instance — eight lanes, gathers, fused multiply-adds — picked at run time on CPUs that have it | landed, default on x86 |
+| Scratch kept between calls — the set-up was page faults, not arithmetic; the call is 0.3–0.8× of what it was, results unchanged | landed |
 
 ### What was wrong, and how it is guarded now
 
@@ -471,6 +472,28 @@ Unlike a vectorised kernel on its own, which competed with the thread pool for t
 same headroom (1.04–1.14× at four threads in an earlier experiment), the whole stripe
 in vectors keeps its gain with threads: per iteration at window 512, 2.06× on one
 thread and 1.92× on four.
+
+### The scratch is kept between calls
+
+What was left of a call after the single pass was mostly not arithmetic. A level
+allocates its blurred template and input, the warped image and its mask, and the stripe
+buffers; a fresh 384² float plane costs 0.18 ms to touch for the first time against
+0.015 ms to fill (0.9 against 0.1 ms at 1024²), and when the first touch happens inside a
+parallel region the page faults serialise the workers — which is why the set-up of a
+level did not scale with the threads while the iteration did. The pyramid, the per-level
+planes and the stripe pools now live in a per-thread workspace and are re-used whenever
+the sizes repeat; it grows to the largest call seen on the thread, and
+`fastecc::releaseWorkspace()` frees it. The Gaussian pre-filter is done in the same
+stripes (same kernel, same border; OpenCV's `GaussianBlur` does not scale with the
+threads at these sizes, and in place it allocates). Results are unchanged.
+
+| call under the default criterion, 3 levels, noise 10, before → after | 1 thread | 4 threads | 12 threads |
+|---|---:|---:|---:|
+| 384², homography | 6.3 → 4.9 ms | 3.7 → 2.2 ms | 4.7 → 2.2 ms |
+| 1024², homography | 39 → 27 ms | 34 → 15 ms | 32 → 14 ms |
+| ratio, over windows 128–1024 and both motions | 0.57–0.78 | 0.30–0.58 | 0.34–0.51 |
+
+The timings in the sections above predate this and stand as measured.
 
 ### Coarse to fine: `nlevels`
 
