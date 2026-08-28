@@ -141,6 +141,7 @@ int main() {
     const TermCriteria crit(TermCriteria::COUNT + TermCriteria::EPS, 100, 1e-6);
     const Mat fullMask(source.size(), CV_8U, Scalar(255));
 
+    const int IC = fastecc::FASTECC_INVERSE_COMPOSITIONAL;
     const FlagSet flagSets[] = {
         {fastecc::FASTECC_DEFAULT_FLAGS, 3, false, "default (laplacian column + 5-tap, 3 levels)"},
         {fastecc::FASTECC_DEFAULT_FLAGS, 1, false, "default flags, single scale"},
@@ -149,6 +150,10 @@ int main() {
         {fastecc::FASTECC_GRAD5,         1, false, "5-tap"},
         {fastecc::FASTECC_DEFAULT_FLAGS | fastecc::FASTECC_LEGACY_PIPELINE, 1, false, "default flags, multi-pass pipeline"},
         {fastecc::FASTECC_DEFAULT_FLAGS, 3, true,  "default flags, 3 levels, input mask (general path)"},
+        {fastecc::FASTECC_DEFAULT_FLAGS | IC, 3, false, "inverse compositional, default flags, 3 levels"},
+        {fastecc::FASTECC_DEFAULT_FLAGS | IC, 1, false, "inverse compositional, default flags, single scale"},
+        {IC,                                  1, false, "inverse compositional, plain"},
+        {fastecc::FASTECC_DEFAULT_FLAGS | IC, 3, true,  "inverse compositional, 3 levels, input mask (general path)"},
     };
     const int kNFlagSets = (int)(sizeof(flagSets) / sizeof(flagSets[0]));
 
