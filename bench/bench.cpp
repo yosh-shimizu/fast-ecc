@@ -15,7 +15,8 @@
 //   eccmsLevels  nlevels for findTransformECCMultiScale (its default is 4;
 //                1 makes it single-scale)
 //   fastLevels   nlevels for the second fast-ecc column (default 4); the
-//                first fast-ecc column is always single-scale
+//                first fast-ecc column is always single-scale, the third
+//                (fastIC) is the inverse compositional iteration at fastLevels
 #include "fast_ecc.hpp"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/core.hpp>
@@ -107,10 +108,10 @@ int main(int argc, char** argv) {
     std::printf("image %dx%d, %d repeats, %d thread(s), eccms nlevels %d, fastN nlevels %d, fast-ecc on %s%s\n",
                 n, n, repeats, cv::getNumThreads(), eccmsLevels, fastLevels, fastecc::vectorPath(),
                 BENCH_HAS_ECCMS ? "" : "  (this OpenCV has no findTransformECCMultiScale)");
-    std::printf("%-12s %8s %9s %8s %9s %8s %8s %8s %9s %9s %9s %9s\n",
-                "motion", "cv(ms)", "eccms(ms)", "fast(ms)", "fastN(ms)",
-                "fast/cv", "fastN/cv", "fastN/ms",
-                "errCv", "errEccms", "errFast", "errFastN");
+    std::printf("%-12s %8s %9s %8s %9s %10s %8s %8s %8s %9s %9s %9s %9s %9s %9s\n",
+                "motion", "cv(ms)", "eccms(ms)", "fast(ms)", "fastN(ms)", "fastIC(ms)",
+                "fast/cv", "fastN/cv", "fastN/ms", "IC/fastN",
+                "errCv", "errEccms", "errFast", "errFastN", "errFastIC");
 
     for (int m = 0; m < 4; ++m) {
         Mat Wgt = groundTruth(motions[m]);
@@ -121,14 +122,14 @@ int main(int argc, char** argv) {
         else
             warpPerspective(templ, input, Wgt, templ.size(), INTER_LINEAR);
 
-        auto timeIt = [&](int fastLv, Mat& outW, double& outRho) {   // 0 = cv, >= 1 = fast-ecc with that many levels
+        auto timeIt = [&](int fastLv, int flags, Mat& outW, double& outRho) {   // 0 = cv, >= 1 = fast-ecc with that many levels
             double best = 1e30;
             for (int r = 0; r < repeats; ++r) {
                 Mat W = Mat::eye(motions[m] == MOTION_HOMOGRAPHY ? 3 : 2, 3, CV_32F);
                 auto t0 = clock_type::now();
                 double rho = fastLv > 0
                     ? fastecc::findTransformECC(templ, input, W, motions[m], crit, noArray(), 5,
-                                                fastecc::FASTECC_DEFAULT_FLAGS, fastLv)
+                                                flags, fastLv)
                     : cv::findTransformECC(templ, input, W, motions[m], crit);
                 auto t1 = clock_type::now();
                 double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -137,13 +138,17 @@ int main(int argc, char** argv) {
             return best;
         };
 
-        Mat Wcv, Wfast, WfastN; double rhoCv = 0, rhoFast = 0, rhoFastN = 0;
-        double tcv    = timeIt(0,          Wcv,    rhoCv);
-        double tfast  = timeIt(1,          Wfast,  rhoFast);
-        double tfastN = timeIt(fastLevels, WfastN, rhoFastN);
-        double errCv    = cornerRMS(Wcv,    Wgt);
-        double errFast  = cornerRMS(Wfast,  Wgt);
-        double errFastN = cornerRMS(WfastN, Wgt);
+        Mat Wcv, Wfast, WfastN, WfastIC; double rhoCv = 0, rhoFast = 0, rhoFastN = 0, rhoFastIC = 0;
+        const int flagsFA = fastecc::FASTECC_DEFAULT_FLAGS;
+        const int flagsIC = fastecc::FASTECC_DEFAULT_FLAGS | fastecc::FASTECC_INVERSE_COMPOSITIONAL;
+        double tcv     = timeIt(0,          flagsFA, Wcv,     rhoCv);
+        double tfast   = timeIt(1,          flagsFA, Wfast,   rhoFast);
+        double tfastN  = timeIt(fastLevels, flagsFA, WfastN,  rhoFastN);
+        double tfastIC = timeIt(fastLevels, flagsIC, WfastIC, rhoFastIC);
+        double errCv     = cornerRMS(Wcv,     Wgt);
+        double errFast   = cornerRMS(Wfast,   Wgt);
+        double errFastN  = cornerRMS(WfastN,  Wgt);
+        double errFastIC = cornerRMS(WfastIC, Wgt);
 
         // eccms: default parameters (nlevels 4, gaussFiltSize 5), the same stop
         double teccms = -1, errEccms = -1;
@@ -178,13 +183,13 @@ int main(int argc, char** argv) {
 #endif
 
         if (teccms > 0)
-            std::printf("%-12s %8.2f %9.2f %8.2f %9.2f %7.2fx %7.2fx %7.2fx %9.4f %9.4f %9.4f %9.4f\n",
-                        names[m], tcv, teccms, tfast, tfastN, tcv / tfast, tcv / tfastN, teccms / tfastN,
-                        errCv, errEccms, errFast, errFastN);
+            std::printf("%-12s %8.2f %9.2f %8.2f %9.2f %10.2f %7.2fx %7.2fx %7.2fx %8.2f %9.4f %9.4f %9.4f %9.4f %9.4f\n",
+                        names[m], tcv, teccms, tfast, tfastN, tfastIC, tcv / tfast, tcv / tfastN, teccms / tfastN,
+                        tfastIC / tfastN, errCv, errEccms, errFast, errFastN, errFastIC);
         else
-            std::printf("%-12s %8.2f %9s %8.2f %9.2f %7.2fx %7.2fx %8s %9.4f %9s %9.4f %9.4f\n",
-                        names[m], tcv, "-", tfast, tfastN, tcv / tfast, tcv / tfastN, "-",
-                        errCv, "-", errFast, errFastN);
+            std::printf("%-12s %8.2f %9s %8.2f %9.2f %10.2f %7.2fx %7.2fx %8s %8.2f %9.4f %9s %9.4f %9.4f %9.4f\n",
+                        names[m], tcv, "-", tfast, tfastN, tfastIC, tcv / tfast, tcv / tfastN, "-",
+                        tfastIC / tfastN, errCv, "-", errFast, errFastN, errFastIC);
     }
     return 0;
 }
