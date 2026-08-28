@@ -37,10 +37,22 @@ enum {
     // exact bilinear weights where OpenCV's warp rounds to 1/32 px, and does
     // an iteration in one parallel region.  Kept for comparison.
     FASTECC_LEGACY_PIPELINE = 4,
+    // Inverse compositional iteration (Baker & Matthews): the template side
+    // is linearised instead of the warped image, so the jacobian rows, their
+    // Gram matrix and their projection onto the template are computed once
+    // per level from the template's gradient; an iteration then samples the
+    // input once per pixel and projects it onto the fixed rows -- no
+    // derivative of the warped image, no Gram matrix -- and updates the warp
+    // by composition, W <- W o W(dp)^-1.  Same maximiser of rho as the
+    // forward-additive iteration (the fixed point agrees to the accuracy
+    // floor); the laplacian column, if any, is left out of the first
+    // iteration of a level, where it spoils the first step.
+    FASTECC_INVERSE_COMPOSITIONAL = 8,
     // what `flags` defaults to
     FASTECC_DEFAULT_FLAGS = FASTECC_LAPLACIAN_COLUMN | FASTECC_GRAD5
 };
 #define FASTECC_HAS_FLAGS 1
+#define FASTECC_HAS_IC 1
 #define FASTECC_HAS_PYRAMID 1
 #define FASTECC_HAS_SINGLE_PASS 1
 

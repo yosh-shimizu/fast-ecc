@@ -476,7 +476,7 @@ static void sampleRow(const Mat& src, const WarpCoef& c, int y, int hs, float* o
 // derivative halo of R rows above and below, the derivative planes and the
 // mask rows.  One set per stripe, reused across iterations and levels of the
 // same size.
-struct StripeBuffers { Mat im, gx, gy, lp, mk; };
+struct StripeBuffers { Mat im, gx, gy, lp, mk, mko; };
 struct StripePool {
     int nstripes = 0, rowsPer = 0, R = 0, ws = 0;
     bool lap = false;
@@ -504,6 +504,7 @@ struct StripePool {
                 buf[i].gy.create(rows, ws, CV_32F);
                 if (lap) buf[i].lp.create(rows, ws, CV_32F);
                 buf[i].mk.create(rows, ws, CV_8U);
+                buf[i].mko.create(rows, ws, CV_8U);   // the inverse compositional path's outside set
             }
         }
         return nstripes;
@@ -515,15 +516,16 @@ struct StripePool {
 // faults against 0.015 ms of writes, and 0.9 ms against 0.1 ms at 1024^2),
 // and the first touch from inside a parallel region serialises the workers
 // -- which is what kept the set-up of a level from scaling with the threads.
-// So the pyramid, the per-level planes and the stripe pool live here and
+// So the pyramid, the per-level planes and the stripe pools live here and
 // are re-used whenever the sizes repeat (Mat::create is a no-op then); the
 // workspace grows to the largest call seen on the thread and is freed by
 // releaseWorkspace().
 struct LevelScratch {
-    Mat templ, image, warped, mask;        // the blurred pair, the warped image and its mask
-    Mat gx, gy, lp;                        // the warped image's derivative planes (multi-pass path)
+    Mat templ, image, warped, mask;        // both paths
+    Mat gx, gy, lp;                        // forward additive: the warped image's derivative planes
+    Mat tx, ty, tl;                        // inverse compositional: the template's
     Mat preMask, tmp;
-    StripePool pool;
+    StripePool pool, poolIC;               // the two paths halo their stripes differently
 };
 struct Workspace {
     std::vector<Mat> srcPyr, dstPyr, maskPyr;
@@ -713,6 +715,549 @@ namespace fastecc {
 
 namespace {
 
+// --------------------------------------------------------------------------
+// Inverse compositional iteration (FASTECC_INVERSE_COMPOSITIONAL)
+//
+// The forward-additive iteration above linearises the warped image: every
+// iteration differentiates it, forms the Gram matrix of the jacobian rows
+// and projects the two planes onto them.  The inverse compositional one
+// (Baker & Matthews) linearises the template instead.  Its jacobian rows are
+// those of the identity warp, built from the template's gradient, so their
+// Gram matrix H0, their projection onto the template VT0 and their column
+// sums VJ0 are computed once per level -- with the same fused kernels, at
+// the identity.  An iteration then samples the warped image (the same
+// sampler as the single-pass path, without the derivative halo), takes the
+// masked moments, and projects the sampled plane onto the fixed rows: P
+// multiply-adds per pixel, and no Gram matrix.  The template pixels whose
+// warped coordinate leaves the input are not in the sums; their rows are
+// taken back out of H0, VT0 and VJ0 with the same kernels run on that
+// (usually thin) outside set.  The closed form of the ECC step is the
+// paper's with the two sides swapped, and the warp is updated by
+// composition, W <- W o W(dp)^-1.
+//
+// Same maximiser of rho as the forward-additive iteration; the two agree at
+// the fixed point to the accuracy floor.  The laplacian column, if any, is
+// the template's laplacian here, and is left out of the first iteration of
+// a level, where it spoils the first step (from the second on it sets the
+// fixed point as before).
+// --------------------------------------------------------------------------
+
+// W <- W o W(dp)^-1, W(dp) being the warp the forward-additive update builds
+// from dp on the identity (update_warping_matrix_ECC's parametrisation).
+// Done in double; the stored map stays float.
+static void composeInverseWarp(Mat& map, const double* u, int motionType)
+{
+    const bool homo = motionType == MOTION_HOMOGRAPHY;
+    Matx33d M = Matx33d::eye();
+    for (int r = 0; r < map.rows; ++r)
+        for (int c = 0; c < 3; ++c) M(r, c) = map.at<float>(r, c);
+    Matx33d D = Matx33d::eye();
+    switch (motionType) {
+    case MOTION_TRANSLATION:
+        D(0, 2) = u[0]; D(1, 2) = u[1];
+        break;
+    case MOTION_EUCLIDEAN: {
+        const double c = std::cos(u[0]), s = std::sin(u[0]);
+        D(0, 0) = c; D(0, 1) = -s; D(0, 2) = u[1];
+        D(1, 0) = s; D(1, 1) =  c; D(1, 2) = u[2];
+        break;
+    }
+    case MOTION_AFFINE:
+        D(0, 0) = 1 + u[0]; D(0, 1) = u[2];     D(0, 2) = u[4];
+        D(1, 0) = u[1];     D(1, 1) = 1 + u[3]; D(1, 2) = u[5];
+        break;
+    default:
+        D(0, 0) = 1 + u[0]; D(0, 1) = u[3];     D(0, 2) = u[6];
+        D(1, 0) = u[1];     D(1, 1) = 1 + u[4]; D(1, 2) = u[7];
+        D(2, 0) = u[2];     D(2, 1) = u[5];     D(2, 2) = 1;
+        break;
+    }
+    Matx33d N = M * D.inv();
+    if (homo) {
+        if (std::fabs(N(2, 2)) > 1e-12) N = N * (1.0 / N(2, 2));
+    } else if (motionType == MOTION_EUCLIDEAN) {
+        // keep the stored linear part an exact rotation (the kernels and the
+        // update read cos, sin)
+        const double th = std::atan2(N(1, 0), N(0, 0)), c = std::cos(th), s = std::sin(th);
+        N(0, 0) = c; N(0, 1) = -s; N(1, 0) = s; N(1, 1) = c;
+    }
+    for (int r = 0; r < map.rows; ++r)
+        for (int c = 0; c < 3; ++c) map.at<float>(r, c) = (float)N(r, c);
+}
+
+// The projection of one row: the identity-warp jacobian rows against
+// d = I_w - muI over [x0, x1), as the row sums
+//   a = sum tx d,  b = sum ty d,  xa = sum x tx d,  xb = sum x ty d,
+//   xxa = sum x^2 tx d,  l = sum tl d
+// -- y is constant along the row, so every column of every motion type is a
+// combination of these (icRowToColumns).  Float within the row, double
+// across rows, as the Gauss-Newton kernels.  A mask row (nullable) takes
+// the scalar loop.
+struct ICRowSums { float a, b, xa, xb, xxa, l; };
+
+template <bool NX, bool NXX, bool NL>
+static inline void icProjectRow(const float* im, const float* tx, const float* ty, const float* tl,
+                                const uchar* mk, float muI, int x0, int x1, ICRowSums& s)
+{
+    float a = 0, b = 0, xa = 0, xb = 0, xxa = 0, l = 0;
+    int x = x0;
+#if FASTECC_SIMD
+    if (!mk) {
+        const int VL = VTraits<v_float32>::vlanes();
+        float CV_DECL_ALIGNED(64) lane[VTraits<v_float32>::max_nlanes];
+        for (int k = 0; k < VL; ++k) lane[k] = (float)k;
+        const v_float32 vVL = vx_setall_f32((float)VL), vmu = vx_setall_f32(muI);
+        v_float32 vx = v_add(vx_load_aligned(lane), vx_setall_f32((float)x0));
+        v_float32 va = vx_setzero_f32(), vb = vx_setzero_f32(), vxa = vx_setzero_f32();
+        v_float32 vxb = vx_setzero_f32(), vxxa = vx_setzero_f32(), vl = vx_setzero_f32();
+        for (; x + VL <= x1; x += VL) {
+            const v_float32 d = v_sub(vx_load(im + x), vmu);
+            const v_float32 ad = v_mul(vx_load(tx + x), d), bd = v_mul(vx_load(ty + x), d);
+            va = v_add(va, ad); vb = v_add(vb, bd);
+            if (NX)  { vxa = v_fma(vx, ad, vxa); vxb = v_fma(vx, bd, vxb); }
+            if (NXX) { vxxa = v_fma(v_mul(vx, vx), ad, vxxa); }
+            if (NL)  { vl = v_fma(vx_load(tl + x), d, vl); }
+            vx = v_add(vx, vVL);
+        }
+        a = v_reduce_sum(va); b = v_reduce_sum(vb);
+        if (NX)  { xa = v_reduce_sum(vxa); xb = v_reduce_sum(vxb); }
+        if (NXX) { xxa = v_reduce_sum(vxxa); }
+        if (NL)  { l = v_reduce_sum(vl); }
+    }
+#endif
+    for (; x < x1; ++x) {
+        if (mk && !mk[x]) continue;
+        const float d = im[x] - muI, fx = (float)x, ad = tx[x] * d, bd = ty[x] * d;
+        a += ad; b += bd;
+        if (NX)  { xa += fx * ad; xb += fx * bd; }
+        if (NXX) { xxa += fx * fx * ad; }
+        if (NL)  { l += tl[x] * d; }
+    }
+    s.a = a; s.b = b; s.xa = xa; s.xb = xb; s.xxa = xxa; s.l = l;
+}
+
+// the row sums into the columns of the motion type (y the row), same column
+// order as the kernels and update_warping_matrix_ECC; the laplacian column,
+// if any, is column P
+static inline void icRowToColumns(int motionType, int P, double y, const ICRowSums& s,
+                                  bool lap, float lsc, double* VI)
+{
+    switch (motionType) {
+    case MOTION_TRANSLATION:
+        VI[0] += s.a; VI[1] += s.b;
+        break;
+    case MOTION_EUCLIDEAN:
+        VI[0] += -y * s.a + s.xb; VI[1] += s.a; VI[2] += s.b;
+        break;
+    case MOTION_AFFINE:
+        VI[0] += s.xa; VI[1] += s.xb; VI[2] += y * s.a; VI[3] += y * s.b; VI[4] += s.a; VI[5] += s.b;
+        break;
+    default:
+        // at the identity den = 1, a = tx, b = ty, e = -(x a + y b)
+        VI[0] += s.xa; VI[1] += s.xb; VI[2] += -s.xxa - y * s.xb;
+        VI[3] += y * s.a; VI[4] += y * s.b; VI[5] += y * (-s.xa - y * s.b);
+        VI[6] += s.a; VI[7] += s.b;
+        break;
+    }
+    if (lap) VI[P] += lsc * s.l;
+}
+
+// per-stripe sums of an IC iteration: the masked moments and the projection
+struct ICStripeSums {
+    StripeStats st;
+    double VI[10];
+    ICStripeSums() { std::fill(VI, VI + 10, 0.0); }
+};
+
+// One scale of the inverse compositional iteration; same contract as
+// runSingleScale below, which hands over to it under the flag.
+double runSingleScaleIC(const Mat& src, const Mat& dst, Mat& map, int motionType,
+                        int numberOfIterations, double termination_eps,
+                        const Mat& inputMaskMat, int gaussFiltSize, int flags, LevelScratch& S)
+{
+    const bool useLap   = (flags & FASTECC_LAPLACIAN_COLUMN) != 0;
+    const bool useGrad5 = (flags & FASTECC_GRAD5) != 0;
+
+    int P = 6;
+    switch (motionType) {
+      case MOTION_TRANSLATION: P = 2; break;
+      case MOTION_EUCLIDEAN:   P = 3; break;
+      case MOTION_HOMOGRAPHY:  P = 8; break;
+    }
+    const int PL = P + (useLap ? 1 : 0);
+
+    const int ws = src.cols, hs = src.rows, wd = dst.cols, hd = dst.rows;
+
+    // FASTECC_IC_PROFILE in the environment: the set-up and the iterations of
+    // every level, in ms, on stderr
+    static const bool profile = std::getenv("FASTECC_IC_PROFILE") != nullptr;
+    const double tickMs = 1000.0 / getTickFrequency();
+    int64 tp0 = profile ? getTickCount() : 0;
+    double tAlloc = 0, tBlurT = 0, tBlurI = 0, tSystem = 0, tIter = 0, tSolve = 0;
+    int nIter = 0;
+
+    // the blurred template and input, one parallel pass each into the
+    // level's kept planes
+    Mat& templateFloat = S.templ;
+    Mat& imageFloat    = S.image;
+    if (profile) { const int64 t = getTickCount(); tAlloc = (t - tp0) * tickMs; tp0 = t; }
+    blurStripes(src, templateFloat, gaussFiltSize, S.tmp);
+    if (profile) { const int64 t = getTickCount(); tBlurT = (t - tp0) * tickMs; tp0 = t; }
+    blurStripes(dst, imageFloat, gaussFiltSize, S.tmp);
+    if (profile) { const int64 t = getTickCount(); tBlurI = (t - tp0) * tickMs; tp0 = t; }
+
+    // the template's derivative planes, filled once per level below: the
+    // jacobian rows are built from these at the identity
+    Mat& Tx = S.tx; Mat& Ty = S.ty; Mat& Tl = S.tl;
+    Tx.create(hs, ws, CV_32F); Ty.create(hs, ws, CV_32F);
+    if (useLap) Tl.create(hs, ws, CV_32F);
+    const float lapScale = (float)std::max(0.8, 0.3 * ((gaussFiltSize - 1) * 0.5 - 1) + 0.8);
+
+    // the ring of the template border that is dropped (see runSingleScale)
+    int ring = (hs > gaussFiltSize && ws > gaussFiltSize) ? std::max(1, gaussFiltSize / 2) : 1;
+    if (useGrad5 && hs > 4 && ws > 4) ring = std::max(ring, 2);
+    // the 5-tap stencil needs two real rows on each side
+    const bool grad5 = useGrad5 && ring >= 2;
+
+    // the warp path's mask, built on first use (a user mask, or a projective
+    // denominator that changes sign over the template)
+    Mat& preMask = S.preMask; preMask.release();
+    Mat& imageWarped = S.warped; imageWarped.create(hs, ws, CV_32F);
+    Mat& imageMask = S.mask;     imageMask.create(hs, ws, CV_8U);
+    auto ensurePreMask = [&]() {
+        if (!preMask.empty()) return;
+        if (inputMaskMat.empty())
+            preMask = Mat::ones(hd, wd, CV_8U);
+        else
+            threshold(inputMaskMat, preMask, 0, 1, THRESH_BINARY);
+        Mat preMaskFloat;
+        preMask.convertTo(preMaskFloat, CV_32F);
+        GaussianBlur(preMaskFloat, preMaskFloat, Size(gaussFiltSize, gaussFiltSize), 0, 0);
+        preMaskFloat *= (0.5/0.95);
+        preMaskFloat.convertTo(preMask, preMask.type());
+        preMask.row(0).setTo(0); preMask.row(preMask.rows - 1).setTo(0);
+        preMask.col(0).setTo(0); preMask.col(preMask.cols - 1).setTo(0);
+        preMask.row(1).setTo(0); preMask.row(preMask.rows - 2).setTo(0);
+        preMask.col(1).setTo(0); preMask.col(preMask.cols - 2).setTo(0);
+    };
+    const int imageFlags = INTER_LINEAR  + WARP_INVERSE_MAP;
+    const int maskFlags  = INTER_NEAREST + WARP_INVERSE_MAP;
+
+    // the kernels at the identity warp, raw sums (means zero)
+    auto dispatch = [&](auto&& fn) {
+        if (motionType == MOTION_AFFINE) {
+            auto setup = [&](auto& a) { a.r00 = 1.f; a.r01 = 0.f; a.r10 = 0.f; a.r11 = 1.f; a.muI = a.muT = 0.f; };
+            if (useLap) { GNAffineL a; setup(a); a.lsc = lapScale; fn(a); }
+            else        { GNAffine a;  setup(a); fn(a); }
+        } else if (motionType == MOTION_TRANSLATION) {
+            if (useLap) { GNTranslationL a; a.muI = a.muT = 0.f; a.lsc = lapScale; fn(a); }
+            else        { GNTranslation a;  a.muI = a.muT = 0.f; fn(a); }
+        } else if (motionType == MOTION_EUCLIDEAN) {
+            auto setup = [&](auto& a) { a.r00 = 1.f; a.r01 = 0.f; a.r10 = 0.f; a.r11 = 1.f; a.muI = a.muT = 0.f; a.h0 = 1.f; a.h1 = 0.f; };
+            if (useLap) { GNEuclideanL a; setup(a); a.lsc = lapScale; fn(a); }
+            else        { GNEuclidean a;  setup(a); fn(a); }
+        } else {
+            auto setup = [&](auto& a) {
+                a.r00 = 1.f; a.r01 = 0.f; a.r10 = 0.f; a.r11 = 1.f; a.muI = a.muT = 0.f;
+                a.h0 = 1.f; a.h1 = 0.f; a.h2 = 0.f; a.h3 = 0.f; a.h4 = 1.f; a.h5 = 0.f; a.h6 = 0.f; a.h7 = 0.f;
+            };
+            if (useLap) { GNHomographyL a; setup(a); a.lsc = lapScale; fn(a); }
+            else        { GNHomography a;  setup(a); fn(a); }
+        }
+    };
+
+    // The template's derivatives and the template system in one pass over
+    // stripes, the same region an iteration uses: per row of the ring
+    // interior the gradient (5-tap or 3-tap) and the laplacian of the
+    // template, then the kernels at the identity warp on the stripe --
+    // H0 = sum g g^T, VT0 = sum g T, VJ0 = sum g.  The derivative planes are
+    // kept for the projection; outside the ring they are zero and never read.
+    StripePool& pool = S.poolIC;
+    Mat H0(PL, PL, CV_64F), VT0(PL, 1, CV_64F), scratch(PL, 1, CV_64F);
+    std::vector<double> VJ0(PL, 0.0);
+    dispatch([&](auto& proto) {
+        using Acc = typename std::decay<decltype(proto)>::type;
+        const int nstripes = pool.prepare(hs, ws, 0, false);
+        std::vector<Acc> parts(nstripes, proto);
+        parallel_for_(Range(0, nstripes), [&](const Range& rg) {
+            for (int si = rg.start; si < rg.end; ++si) {
+                StripeBuffers& B = pool.buf[si];
+                const int y0 = si * pool.rowsPer, y1 = std::min(hs, y0 + pool.rowsPer);
+                if (y0 >= y1) continue;
+                const int hsub = y1 - y0;
+                bool any = false;
+                for (int y = y0; y < y1; ++y) {
+                    uchar* mk = B.mk.ptr<uchar>(y - y0);
+                    float* gx = Tx.ptr<float>(y);
+                    float* gy = Ty.ptr<float>(y);
+                    float* lp = useLap ? Tl.ptr<float>(y) : nullptr;
+                    if (!(y >= ring && y < hs - ring && ws > 2 * ring)) {
+                        std::memset(mk, 0, ws);
+                        std::memset(gx, 0, ws * sizeof(float));
+                        std::memset(gy, 0, ws * sizeof(float));
+                        if (lp) std::memset(lp, 0, ws * sizeof(float));
+                        continue;
+                    }
+                    any = true;
+                    std::memset(mk, 0, ws);
+                    std::memset(mk + ring, 1, ws - 2 * ring);
+                    for (int x = 0; x < ring; ++x) {
+                        gx[x] = gy[x] = gx[ws - 1 - x] = gy[ws - 1 - x] = 0.f;
+                        if (lp) lp[x] = lp[ws - 1 - x] = 0.f;
+                    }
+                    const float* r0  = templateFloat.ptr<float>(y);
+                    const float* rm1 = templateFloat.ptr<float>(y - 1);
+                    const float* rp1 = templateFloat.ptr<float>(y + 1);
+                    const float* rm2 = grad5 ? templateFloat.ptr<float>(y - 2) : rm1;
+                    const float* rp2 = grad5 ? templateFloat.ptr<float>(y + 2) : rp1;
+                    const int x1 = ws - ring;
+                    int x = ring;
+#if FASTECC_SIMD
+                    {
+                        const int VL = VTraits<v_float32>::vlanes();
+                        const v_float32 c8 = vx_setall_f32(8.f), c12 = vx_setall_f32(1.f / 12);
+                        const v_float32 c4 = vx_setall_f32(4.f), ch = vx_setall_f32(0.5f);
+                        for (; x + VL <= x1; x += VL) {
+                            const v_float32 c = vx_load(r0 + x), l1 = vx_load(r0 + x - 1), r1 = vx_load(r0 + x + 1);
+                            const v_float32 u1 = vx_load(rm1 + x), d1 = vx_load(rp1 + x);
+                            if (grad5) {
+                                v_store(gx + x, v_mul(v_sub(v_add(v_sub(vx_load(r0 + x - 2), v_mul(c8, l1)),
+                                                                  v_mul(c8, r1)), vx_load(r0 + x + 2)), c12));
+                                v_store(gy + x, v_mul(v_sub(v_add(v_sub(vx_load(rm2 + x), v_mul(c8, u1)),
+                                                                  v_mul(c8, d1)), vx_load(rp2 + x)), c12));
+                            } else {
+                                v_store(gx + x, v_mul(ch, v_sub(r1, l1)));
+                                v_store(gy + x, v_mul(ch, v_sub(d1, u1)));
+                            }
+                            if (lp)
+                                v_store(lp + x, v_sub(v_add(v_add(v_add(l1, r1), u1), d1), v_mul(c4, c)));
+                        }
+                    }
+#endif
+                    if (grad5) {
+                        for (int xt = x; xt < x1; ++xt) {
+                            gx[xt] = (r0[xt - 2] - 8.f * r0[xt - 1] + 8.f * r0[xt + 1] - r0[xt + 2]) * (1.f / 12);
+                            gy[xt] = (rm2[xt] - 8.f * rm1[xt] + 8.f * rp1[xt] - rp2[xt]) * (1.f / 12);
+                        }
+                    } else {
+                        for (int xt = x; xt < x1; ++xt) {
+                            gx[xt] = 0.5f * (r0[xt + 1] - r0[xt - 1]);
+                            gy[xt] = 0.5f * (rp1[xt] - rm1[xt]);
+                        }
+                    }
+                    if (lp)
+                        for (int xt = x; xt < x1; ++xt)
+                            lp[xt] = r0[xt - 1] + r0[xt + 1] + rm1[xt] + rp1[xt] - 4.f * r0[xt];
+                }
+                if (any)
+                    parts[si].rows(Tx.rowRange(y0, y1), Ty.rowRange(y0, y1), templateFloat.rowRange(y0, y1),
+                                   templateFloat, useLap ? Tl.rowRange(y0, y1) : Mat(),
+                                   B.mk.rowRange(0, hsub), y0, y1, y0);
+            }
+        }, (double)nstripes);
+        Acc total = proto;
+        for (int si = 0; si < nstripes; ++si) total.add(parts[si]);
+        storeSystem(total, H0, scratch, VT0);
+        for (int q = 0; q < PL; ++q) VJ0[q] = total.VJ[q];
+    });
+    if (profile) { const int64 t = getTickCount(); tSystem = (t - tp0) * tickMs; tp0 = t; }
+
+    // the per-row projector for this motion type
+    typedef void (*RowProj)(const float*, const float*, const float*, const float*, const uchar*, float, int, int, ICRowSums&);
+    RowProj project;
+    switch (motionType) {
+    case MOTION_TRANSLATION: project = useLap ? &icProjectRow<false, false, true> : &icProjectRow<false, false, false>; break;
+    case MOTION_HOMOGRAPHY:  project = useLap ? &icProjectRow<true, true, true>   : &icProjectRow<true, true, false>;   break;
+    default:                 project = useLap ? &icProjectRow<true, false, true>  : &icProjectRow<true, false, false>;  break;
+    }
+
+    double muPrevI, muPrevT;
+    { const Scalar m0 = mean(templateFloat); muPrevI = muPrevT = m0[0]; }
+
+    Mat Hd(PL, PL, CV_64F), VTd(PL, 1, CV_64F);
+    std::vector<double> VJd(PL), VI(PL), VT(PL);
+
+    double rho = -1, last_rho = -termination_eps;
+    for (int i = 1; (i <= numberOfIterations) && (fabs(rho - last_rho) >= termination_eps); i++)
+    {
+        const WarpCoef coef(map, motionType);
+        const bool fusedSample = inputMaskMat.empty() && coef.denominatorPositive(ws, hs);
+        if (!fusedSample) {
+            // the warp path: the image and the mask through OpenCV
+            if (motionType != MOTION_HOMOGRAPHY)
+                warpAffine(imageFloat, imageWarped, map, imageWarped.size(), imageFlags);
+            else
+                warpPerspective(imageFloat, imageWarped, map, imageWarped.size(), imageFlags);
+            if (!(inputMaskMat.empty() && analyticMask(imageMask, map, motionType, wd, hd, ring))) {
+                ensurePreMask();
+                if (motionType != MOTION_HOMOGRAPHY)
+                    warpAffine(preMask, imageMask, map, imageMask.size(), maskFlags);
+                else
+                    warpPerspective(preMask, imageMask, map, imageMask.size(), maskFlags);
+                imageMask.rowRange(0, ring).setTo(0);
+                imageMask.rowRange(imageMask.rows - ring, imageMask.rows).setTo(0);
+                imageMask.colRange(0, ring).setTo(0);
+                imageMask.colRange(imageMask.cols - ring, imageMask.cols).setTo(0);
+            }
+        }
+
+        const int nstripes = pool.prepare(hs, ws, 0, false);
+        std::vector<ICStripeSums> sums(nstripes);
+        const float mI = (float)muPrevI, mT = (float)muPrevT;
+        std::fill(VJd.begin(), VJd.end(), 0.0);
+        Hd.setTo(0.0); VTd.setTo(0.0);
+
+        dispatch([&](auto& proto) {
+            using Acc = typename std::decay<decltype(proto)>::type;
+            std::vector<Acc> parts(nstripes, proto);
+            parallel_for_(Range(0, nstripes), [&](const Range& rg) {
+                for (int si = rg.start; si < rg.end; ++si) {
+                    StripeBuffers& B = pool.buf[si];
+                    const int y0 = si * pool.rowsPer, y1 = std::min(hs, y0 + pool.rowsPer);
+                    if (y0 >= y1) continue;
+                    const int hsub = y1 - y0;
+                    ICStripeSums& S = sums[si];
+                    int nout = 0;
+                    for (int y = y0; y < y1; ++y) {
+                        const int k = y - y0;
+                        uchar* mko = B.mko.ptr<uchar>(k);
+                        std::memset(mko, 0, ws);
+                        const bool inRing = y >= ring && y < hs - ring;
+                        const float* imrow;
+                        const uchar* mkin = nullptr;
+                        int x0 = ws, x1 = ws;
+                        if (fusedSample) {
+                            float* dstrow = B.im.ptr<float>(k);
+                            sampleRow(imageFloat, coef, y, hs, dstrow, ws);
+                            imrow = dstrow;
+                            if (inRing && !rowInterval(coef, y, ws, wd, hd, ring, x0, x1)) { x0 = x1 = ws; }
+                        } else {
+                            imrow = imageWarped.ptr<float>(y);
+                            mkin = imageMask.ptr<uchar>(y);
+                            if (inRing) { x0 = ring; x1 = ws - ring; }
+                        }
+                        if (!inRing) continue;
+                        // the outside set of this row: the ring interior less the inside set
+                        if (mkin) {
+                            for (int x = ring; x < ws - ring; ++x) { mko[x] = mkin[x] ? 0 : 1; nout += mko[x]; }
+                        } else {
+                            const int lo = std::max(ring, std::min(ws - ring, x0));
+                            const int hi = std::max(lo, std::min(ws - ring, x1));
+                            if (lo > ring) { std::memset(mko + ring, 1, lo - ring); nout += lo - ring; }
+                            if (hi < ws - ring) { std::memset(mko + hi, 1, ws - ring - hi); nout += ws - ring - hi; }
+                        }
+                        if (x1 <= x0) continue;
+                        // the masked moments about the previous means
+                        const float* tm = templateFloat.ptr<float>(y);
+                        double sd = 0, sdd = 0, se = 0, see = 0, sde = 0;
+                        int n = 0, x = x0;
+                        if (!mkin) {
+#if FASTECC_SIMD
+                            const int VL = VTraits<v_float32>::vlanes();
+                            const v_float32 vmI = vx_setall_f32(mI), vmT = vx_setall_f32(mT);
+                            v_float32 vsd = vx_setzero_f32(), vsdd = vx_setzero_f32(), vse = vx_setzero_f32();
+                            v_float32 vsee = vx_setzero_f32(), vsde = vx_setzero_f32();
+                            for (; x + VL <= x1; x += VL) {
+                                const v_float32 d = v_sub(vx_load(imrow + x), vmI), e = v_sub(vx_load(tm + x), vmT);
+                                vsd = v_add(vsd, d);  vsdd = v_fma(d, d, vsdd);
+                                vse = v_add(vse, e);  vsee = v_fma(e, e, vsee);  vsde = v_fma(d, e, vsde);
+                            }
+                            sd = v_reduce_sum(vsd); sdd = v_reduce_sum(vsdd);
+                            se = v_reduce_sum(vse); see = v_reduce_sum(vsee); sde = v_reduce_sum(vsde);
+#endif
+                            for (; x < x1; ++x) {
+                                const float d = imrow[x] - mI, e = tm[x] - mT;
+                                sd += d; sdd += d * d; se += e; see += e * e; sde += d * e;
+                            }
+                            n = x1 - x0;
+                        } else {
+                            for (; x < x1; ++x) {
+                                if (!mkin[x]) continue;
+                                const float d = imrow[x] - mI, e = tm[x] - mT;
+                                sd += d; sdd += d * d; se += e; see += e * e; sde += d * e;
+                                ++n;
+                            }
+                        }
+                        S.st.n += n; S.st.sd += sd; S.st.sdd += sdd; S.st.se += se; S.st.see += see; S.st.sde += sde;
+                        // the projection
+                        ICRowSums rs;
+                        project(imrow, Tx.ptr<float>(y), Ty.ptr<float>(y), useLap ? Tl.ptr<float>(y) : nullptr,
+                                mkin, mI, x0, x1, rs);
+                        icRowToColumns(motionType, P, (double)y, rs, useLap, lapScale, S.VI);
+                    }
+                    // the outside set's rows, taken out of the template system
+                    if (nout > 0)
+                        parts[si].rows(Tx.rowRange(y0, y1), Ty.rowRange(y0, y1), templateFloat.rowRange(y0, y1),
+                                       templateFloat, useLap ? Tl.rowRange(y0, y1) : Mat(),
+                                       B.mko.rowRange(0, hsub), y0, y1, y0);
+                }
+            }, (double)nstripes);
+            Acc out = proto;
+            for (int si = 0; si < nstripes; ++si) out.add(parts[si]);
+            storeSystem(out, Hd, scratch, VTd);
+            for (int q = 0; q < PL; ++q) VJd[q] = out.VJ[q];
+        });
+
+        StripeStats st;
+        std::fill(VI.begin(), VI.end(), 0.0);
+        for (int si = 0; si < nstripes; ++si) {
+            st.add(sums[si].st);
+            for (int q = 0; q < PL; ++q) VI[q] += sums[si].VI[q];
+        }
+        if (profile) { const int64 t = getTickCount(); tIter += (t - tp0) * tickMs; tp0 = t; ++nIter; }
+        if (st.n == 0) {
+          CV_Error(Error::StsNoConv, "NaN encountered.");
+        }
+        const double meanI = muPrevI + st.sd / st.n;
+        const double meanT = muPrevT + st.se / st.n;
+        const double imgNorm = std::sqrt(std::max(st.sdd - st.sd * st.sd / st.n, 0.0));
+        const double tmpNorm = std::sqrt(std::max(st.see - st.se * st.se / st.n, 0.0));
+        const double correlation = st.sde - st.sd * st.se / st.n;
+        // the projections onto the centred planes, over the inside set
+        for (int q = 0; q < PL; ++q) {
+            const double VJin = VJ0[q] - VJd[q];
+            VI[q] -= (meanI - muPrevI) * VJin;
+            VT[q]  = (VT0.at<double>(q, 0) - VTd.at<double>(q, 0)) - meanT * VJin;
+        }
+        muPrevI = meanI; muPrevT = meanT;
+
+        last_rho = rho;
+        rho = correlation / (imgNorm * tmpNorm);
+        if (cvIsNaN(rho)) {
+          CV_Error(Error::StsNoConv, "NaN encountered.");
+        }
+
+        // the closed form with the sides swapped: the template is the
+        // linearised side, the sampled image the fixed one.  The laplacian
+        // column sits out the first iteration of the level.
+        const int PS = (useLap && i == 1) ? P : PL;
+        Mat Hm(PS, PS, CV_64F), ip(PS, 1, CV_64F), tp(PS, 1, CV_64F);
+        for (int p = 0; p < PS; ++p) {
+            for (int q = 0; q < PS; ++q)
+                Hm.at<double>(p, q) = H0.at<double>(p, q) - Hd.at<double>(p, q);
+            ip.at<double>(p, 0) = VI[p];
+            tp.at<double>(p, 0) = VT[p];
+        }
+        const Mat Hi = Hm.inv();
+        const Mat tph = Hi * tp;
+        const double lambda_n = tmpNorm * tmpNorm - tp.dot(tph);
+        const double lambda_d = correlation - ip.dot(tph);
+        if (lambda_d <= 0.0)
+        {
+            rho = -1;
+            CV_Error(Error::StsNoConv, "The algorithm stopped before its convergence. The correlation is going to be minimized. Images may be uncorrelated or non-overlapped");
+        }
+        const double lambda = lambda_n / lambda_d;
+        const Mat dp = Hi * (lambda * ip - tp);
+        composeInverseWarp(map, dp.ptr<double>(0), motionType);
+        if (profile) { const int64 t = getTickCount(); tSolve += (t - tp0) * tickMs; tp0 = t; }
+    }
+    if (profile)
+        std::fprintf(stderr, "[ic level %dx%d] alloc %.3f  blurT %.3f  blurI %.3f  system %.3f  |  iter %.3f x%d  solve %.3f x%d\n",
+                     ws, hs, tAlloc, tBlurT, tBlurI, tSystem, nIter ? tIter / nIter : 0.0, nIter, nIter ? tSolve / nIter : 0.0, nIter);
+    return rho;
+}
+
 // One scale of the iteration.  `src` and `dst` are single-channel CV_8U or
 // CV_32F images, `inputMaskMat` an optional CV_8U mask on `dst` (empty for
 // none), `map` the warp in the coordinates of these images.  Everything
@@ -722,6 +1267,10 @@ double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
                       int numberOfIterations, double termination_eps,
                       const Mat& inputMaskMat, int gaussFiltSize, int flags, LevelScratch& S)
 {
+    if (flags & FASTECC_INVERSE_COMPOSITIONAL)
+        return runSingleScaleIC(src, dst, map, motionType, numberOfIterations, termination_eps,
+                                inputMaskMat, gaussFiltSize, flags, S);
+
     const bool useLap   = (flags & FASTECC_LAPLACIAN_COLUMN) != 0;
     const bool useGrad5 = (flags & FASTECC_GRAD5) != 0;
 
@@ -831,7 +1380,11 @@ double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
     // iteratively update map_matrix
     double rho      = -1;
     double last_rho = - termination_eps;
-    for (int i = 1; (i <= numberOfIterations) && (fabs(rho-last_rho)>= termination_eps); i++)
+    // FASTECC_IC_PROFILE in the environment: the iteration count of every
+    // level on stderr, the counterpart of the IC path's profile line
+    static const bool profileIters = std::getenv("FASTECC_IC_PROFILE") != nullptr;
+    int itersDone = 0;
+    for (int i = 1; (i <= numberOfIterations) && (fabs(rho-last_rho)>= termination_eps); i++, ++itersDone)
     {
         // The Gaussian pre-filter above extrapolated the template border
         // (BORDER_REFLECT_101), so a ring of gaussFiltSize/2 px of
@@ -1120,6 +1673,8 @@ double runSingleScale(const Mat& src, const Mat& dst, Mat& map, int motionType,
         // motion parameter and is simply discarded)
         update_warping_matrix_ECC( map, deltaP.rowRange(0, numberOfParameters), motionType);
     }
+    if (profileIters)
+        std::fprintf(stderr, "[fa level %dx%d] iter x%d\n", ws, hs, itersDone);
 
     // return final correlation coefficient
     return rho;
