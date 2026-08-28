@@ -56,6 +56,7 @@ the numbers below are taken against a corrected OpenCV baseline.
 | The whole stripe vectorised — sampler, derivatives, moments, Gauss–Newton kernels (OpenCV universal intrinsics; scalar loops below OpenCV 4.7) | landed |
 | AVX2 + FMA instance — eight lanes, gathers, fused multiply-adds — picked at run time on CPUs that have it | landed, default on x86 |
 | Scratch kept between calls — the set-up was page faults, not arithmetic; the call is 0.3–0.8× of what it was, results unchanged | landed |
+| Inverse compositional iteration (`FASTECC_INVERSE_COMPOSITIONAL`) — an iteration at 0.45–0.55 of the single pass, same fixed point, floor and basin | landed, off by default |
 
 ### What was wrong, and how it is guarded now
 
@@ -380,6 +381,49 @@ the sections above (OpenCV's warp, full-size gradient planes, separate moment an
 Gauss–Newton passes) instead of the [single pass](#one-parallel-pass-per-iteration). It is
 what a user mask, or a projective warp whose denominator changes sign over the template,
 takes anyway; it is kept for comparison, and it reproduces the previous fixed points.
+
+### Inverse compositional iteration: `FASTECC_INVERSE_COMPOSITIONAL`
+
+A fourth flag, off by default, linearises the *template* side instead of the warped image
+(Baker & Matthews). The Jacobian rows, their Gram matrix and their projection onto the
+template are then fixed for a level and built once, in the same stripe pass as the
+template's derivative planes; an iteration samples the input once per pixel, projects it
+onto the fixed rows, solves the paper's closed form with the two sides swapped, and updates
+the warp by composition, W ← W ∘ W(Δp)⁻¹. Nothing is differentiated per iteration and no
+Gram matrix is accumulated; pixels that fall outside the input are subtracted from the
+precomputed sums. The laplacian column, if on, sits out the first iteration of a level,
+where it spoils the first step.
+
+It is the same maximiser of ρ. On fruits and twelve DIV2K images the fixed point, the
+accuracy floor (0.98–1.0 of the forward-additive one), the invariance to gain and offset
+and the basin all agree, and under the default stop criterion the two take the same number
+of iterations per level. What differs is the cost of an iteration and the shape of the first
+steps:
+
+| IC / forward-additive (single pass, 3 levels, noise 10, DIV2K 0867, stop at 50 iterations or Δρ < 10⁻⁶) | 1 thread | 4 threads | 12 threads |
+|---|---:|---:|---:|
+| one iteration, affine / homography, 384² | 0.55 / 0.53 | 0.55 / 0.45 | 0.55 / 0.53 |
+| call, homography, windows 128–1024 | 0.77–0.92 | 0.76–0.94 | 0.74–0.98 |
+| call, affine | 0.82–1.00 | 0.82–1.07 | 0.81–1.11 |
+| call at a fixed 12 iterations | 0.5–0.6 | 0.5–0.6 | 0.5–0.6 |
+
+The call gains less than the iteration because the levels stop after two to four
+iterations and the template's system costs about one of them; with a looser stop the
+levels take two, and the system is not paid back. At Δρ < 10⁻³ or 10⁻⁴ on fruits (384²,
+four threads) the call is 0.83–0.97 of the forward-additive one and the floor is 4–6 %
+higher, since the stop catches the shorter first steps earlier; on `bench`'s smooth
+synthetic scene (512², four levels, Δρ < 10⁻⁴, four threads) the call is 1.05–1.18× the
+forward-additive one. Why it is not the default, then: from a large offset the first
+steps of the inverse compositional iteration are shorter (the template's gradient is
+sharper than the sensitivity of the bilinearly resampled image it is matched against —
+at `gaussFiltSize` 5 the step is 0.87 of the forward one), so a caller that fixes the
+iteration count, or stops loosely, sees one more iteration to the same floor; from a
+large offset with a single level the basin is narrower (window 256, 20 px: 26 of 30 trials
+against 29), while with the pyramid it is wider (60 px: 24 against 20). Subtracting the
+outside pixels from the precomputed sums raises no numerical trouble at these fractions.
+The general path (a user mask, a projective warp whose denominator changes sign) takes
+OpenCV's warp of the image and of the mask, and is covered by the equivalence test along
+with the flag itself.
 
 ### One parallel pass per iteration
 
